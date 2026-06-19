@@ -46,7 +46,10 @@ app = FastAPI(title="Trading Dashboard API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # Must stay False while allow_origins is "*": browsers reject a wildcard
+    # origin combined with credentials. The frontend uses no cookies/auth, so
+    # this lets any origin (Vercel, localhost) call the API cleanly.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
