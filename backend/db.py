@@ -8,8 +8,13 @@ DB_PATH = os.path.join(os.path.dirname(__file__), "optimizer.db")
 
 
 def get_conn():
-    conn = sqlite3.connect(DB_PATH)
+    # timeout lets concurrent writers (the ProcessPoolExecutor children all log
+    # to this same DB) wait on the lock instead of erroring with "database is
+    # locked". WAL mode further improves concurrent read/write throughput.
+    conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
     return conn
 
 

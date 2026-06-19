@@ -89,6 +89,7 @@ class OptimizationSettings(BaseModel):
     stability_weight: float = 0.5
     use_trade_balance_filter: bool = False
     max_trade_ratio: float = 3.0
+    executor_type: str = "process"  # "process" (all cores) or "thread" (fallback)
 
 
 # ---------------------------------------------------------------------------

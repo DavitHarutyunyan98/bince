@@ -26,6 +26,7 @@ const DEFAULTS = {
   weight_trades: 0.2,
   use_stability: false,
   stability_weight: 0.5,
+  executor_type: "process",
 };
 
 const STRATEGIES = [
@@ -149,6 +150,13 @@ export default function Optimizer({ jobId, setJobId }) {
           <div>
             <label>Min trades</label>
             <input type="number" value={form.min_trades} onChange={(e) => set("min_trades", e.target.value)} />
+          </div>
+          <div>
+            <label>Parallelism</label>
+            <select value={form.executor_type} onChange={(e) => set("executor_type", e.target.value)}>
+              <option value="process">Process (all cores)</option>
+              <option value="thread">Thread (fallback)</option>
+            </select>
           </div>
         </div>
 

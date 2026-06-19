@@ -37,11 +37,26 @@ class _RedisEvent:
     """
     Drop-in replacement for threading.Event that reads its state from Redis.
     This lets the stop/pause signal cross process boundaries.
+
+    The live redis connection holds an RLock and is not picklable, so we store
+    only the URL and (re)connect lazily. This makes the event picklable, which
+    is required for it to be passed into ProcessPoolExecutor workers.
     """
 
-    def __init__(self, key: str, r: redis.Redis):
+    def __init__(self, key: str, url: str):
         self._key = key
-        self._r = r
+        self._url = url
+        self._conn = None
+
+    @property
+    def _r(self):
+        if self._conn is None:
+            self._conn = redis.from_url(self._url)
+        return self._conn
+
+    def __getstate__(self):
+        # Drop the live connection; children reconnect from the URL.
+        return {"_key": self._key, "_url": self._url, "_conn": None}
 
     def is_set(self):
         return self._r.exists(self._key) > 0
@@ -72,8 +87,8 @@ def run_optimization(job_id: str, settings: dict):
     update_job_status(job_id, "running")
     log = _SqliteLogger(job_id)
 
-    stop_event = _RedisEvent(_stop_key(job_id), _r)
-    pause_event = _RedisEvent(_pause_key(job_id), _r)
+    stop_event = _RedisEvent(_stop_key(job_id), REDIS_URL)
+    pause_event = _RedisEvent(_pause_key(job_id), REDIS_URL)
 
     # Clean up any stale stop/pause signals from a previous run
     stop_event.clear()
@@ -146,6 +161,11 @@ def run_optimization(job_id: str, settings: dict):
             optimization_mode=optimization_mode,
             strategy_name=strategy_name,
         )
+
+        # ProcessPoolExecutor uses all cores for the per-pair fan-out; 'thread'
+        # is the safe fallback. Only the standard path supports it.
+        if not use_stability:
+            common_kwargs["executor_type"] = settings.get("executor_type", "process")
 
         if use_stability:
             df_results = trader.optimize_trading_pairs_with_stability(
