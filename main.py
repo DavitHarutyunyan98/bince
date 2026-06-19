@@ -10,7 +10,7 @@ import json
 import io
 import os
 import random
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import re
 import telegram
 import asyncio
@@ -107,6 +107,22 @@ class FuturesTrader:
         self.max_workers = os.cpu_count() or 4
         # Dynamic strategy selection based on parameters
         self.optimizer_strategy = CandlestickStrategy()  # Default strategy
+
+    def __getstate__(self):
+        """
+        Make FuturesTrader picklable so per-symbol studies can run in a
+        ProcessPoolExecutor. The Binance client is not picklable (and the
+        worker processes don't need it — historical data is fetched up front
+        and passed in), so we drop it. The data_cache can be large, so we drop
+        it too; children only need their own pre-fetched DataFrame.
+        """
+        state = self.__dict__.copy()
+        state["client"] = None
+        state["data_cache"] = {}
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
 
     def _get_strategy_for_params(self, selected_params):
         """Determine which strategy to use based on selected parameters."""
@@ -1497,7 +1513,8 @@ class FuturesTrader:
 
     def optimize_trading_pairs(self, trading_pairs, param_ranges, selected_params, is_start_date, is_end_date,
                                oos1_start_date, oos1_end_date, oos2_start_date, oos2_end_date, timeframe, min_trades, n_trials, weights, min_candles,
-                               stop_event, pause_event, optimization_mode='efficient', strategy_name=None):
+                               stop_event, pause_event, optimization_mode='efficient', strategy_name=None,
+                               executor_type='process'):
         pair_data = {}
         add_optimization_log(
             f"Fetching full-range data for {len(trading_pairs)} pairs...")
@@ -1529,8 +1546,22 @@ class FuturesTrader:
         else:  # efficient (default)
             optimization_method = self._run_single_optimization_study
             
-        # Use ThreadPoolExecutor for stable optimization (multiprocessing causes deadlocks)
-        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        # Per-symbol studies are CPU-bound, so a ProcessPoolExecutor uses all
+        # cores for a real speedup. This is safe now that stop/pause events are
+        # _RedisEvent (picklable, cross-process) rather than threading.Event,
+        # which was the original cause of the multiprocessing deadlock. The
+        # 'thread' option remains as a fallback for environments where forking
+        # misbehaves (e.g. some Windows/Numba combinations).
+        if executor_type == 'process':
+            ExecutorCls = ProcessPoolExecutor
+            add_optimization_log(
+                f"Using ProcessPoolExecutor ({self.max_workers} cores) for parallel optimization.")
+        else:
+            ExecutorCls = ThreadPoolExecutor
+            add_optimization_log(
+                f"Using ThreadPoolExecutor ({self.max_workers} workers) for parallel optimization.")
+
+        with ExecutorCls(max_workers=self.max_workers) as executor:
             futures = {executor.submit(optimization_method, symbol, data, param_ranges,
                                        selected_params, timeframe, min_trades, n_trials, weights,
                                        is_start_date, is_end_date, oos1_start_date, oos1_end_date, oos2_start_date, oos2_end_date,

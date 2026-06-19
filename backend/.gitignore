@@ -1,0 +1,6 @@
+optimizer.db
+bot.pid
+bot.out.log
+__pycache__/
+*.pyc
+.venv/
