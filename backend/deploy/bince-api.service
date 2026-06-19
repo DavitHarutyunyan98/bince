@@ -1,0 +1,17 @@
+[Unit]
+Description=Bince Trading Dashboard API (FastAPI + Uvicorn)
+After=network.target redis-server.service
+Wants=redis-server.service
+
+[Service]
+Type=simple
+User=bince
+WorkingDirectory=/opt/bince/backend
+Environment=REDIS_URL=redis://localhost:6379/0
+Environment=PYTHONPATH=/opt/bince:/opt/bince/backend
+ExecStart=/opt/bince/.venv/bin/uvicorn app:app --host 0.0.0.0 --port 8000
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

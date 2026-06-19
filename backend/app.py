@@ -22,7 +22,8 @@ ROOT = os.path.dirname(os.path.dirname(__file__))
 sys.path.insert(0, ROOT)
 
 import redis
-from fastapi import FastAPI, HTTPException
+from typing import Union
+from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from rq import Queue
@@ -187,7 +188,7 @@ def get_trade_config():
 
 
 @app.put("/config/trade")
-def save_trade_config(body: list | dict):
+def save_trade_config(body: Union[list, dict] = Body(...)):
     with open(TRADE_CONFIG_PATH, "w") as f:
         json.dump(body, f, indent=2)
     return {"saved": True}
@@ -228,6 +229,28 @@ def list_usdt_futures():
         return {"count": len(pairs), "pairs": pairs}
     except Exception as e:
         raise HTTPException(500, str(e))
+
+
+# ---------------------------------------------------------------------------
+# Bot control endpoints (Phase 3)
+# ---------------------------------------------------------------------------
+
+@app.get("/bot/status")
+def bot_status():
+    import bot_service
+    return bot_service.status()
+
+
+@app.post("/bot/start")
+def bot_start():
+    import bot_service
+    return bot_service.start()
+
+
+@app.post("/bot/stop")
+def bot_stop():
+    import bot_service
+    return bot_service.stop()
 
 
 if __name__ == "__main__":
