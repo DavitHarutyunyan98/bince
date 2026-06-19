@@ -1,0 +1,9 @@
+{
+    "symbol": "BTCUSDT",
+    "bar_length": "15m",
+    "max_data_points": 4000,
+    "api_key": "aj65Chcx2cnOWO38WalgRd0Bk9v90y7pAGLQkbiIdfauZmrHNQAeE4R0rovL5hst",
+    "secret_key": "lYiKajCcLwbVGjSrkh4Ua8WGQ2HLnCvsUdchHscqO7hr7RQ8jjS4mA1nv16xgG22",
+    "telegram_bot_token": "7752387173:AAE7rx0cJP-QYV1jvGhp5adpvo4X4Fw0j4o",
+    "telegram_chat_id": "1197218758"
+}

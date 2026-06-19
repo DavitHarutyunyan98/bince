@@ -1,0 +1,12 @@
+{
+    "strategy_name": "Candlestick Patterns",
+    "symbol": "BTCUSDT",
+    "bar_length": "15m",
+    "start_date": "2025-12-11",
+    "units_usdt": 10.0,
+    "leverage": 5,
+    "buy_signal_window": 11,
+    "buy_pattern_lookback": 2,
+    "sell_signal_window": 11,
+    "sell_pattern_lookback": 5
+}
