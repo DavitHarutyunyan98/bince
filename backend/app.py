@@ -54,6 +54,17 @@ app.add_middleware(
 init_db()
 
 
+@app.get("/health")
+def health():
+    """Lightweight readiness probe for the frontend connection indicator."""
+    redis_ok = False
+    try:
+        redis_ok = _r.ping()
+    except Exception:
+        redis_ok = False
+    return {"status": "ok", "redis": bool(redis_ok)}
+
+
 # ---------------------------------------------------------------------------
 # Request / Response models
 # ---------------------------------------------------------------------------
