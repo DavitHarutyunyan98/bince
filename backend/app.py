@@ -46,12 +46,26 @@ app = FastAPI(title="Trading Dashboard API", version="1.0.0")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # Must stay False while allow_origins is "*": browsers reject a wildcard
+    # origin combined with credentials. The frontend uses no cookies/auth, so
+    # this lets any origin (Vercel, localhost) call the API cleanly.
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 init_db()
+
+
+@app.get("/health")
+def health():
+    """Lightweight readiness probe for the frontend connection indicator."""
+    redis_ok = False
+    try:
+        redis_ok = _r.ping()
+    except Exception:
+        redis_ok = False
+    return {"status": "ok", "redis": bool(redis_ok)}
 
 
 # ---------------------------------------------------------------------------

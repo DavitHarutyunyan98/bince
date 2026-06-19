@@ -1,19 +1,19 @@
 import React, { useState, useEffect } from "react";
 import { api } from "../api/client.js";
+import { AsyncButton } from "./ui.jsx";
+import { toast } from "./Toast.jsx";
 
 // Phase 3: start/stop/status for the 24/7 hybrid trader.
 export default function BotControl() {
   const [status, setStatus] = useState(null);
-  const [error, setError] = useState(null);
-  const [busy, setBusy] = useState(false);
+  const [offline, setOffline] = useState(false);
 
   const refresh = async () => {
     try {
-      const s = await api.getBotStatus();
-      setStatus(s);
-      setError(null);
-    } catch (e) {
-      setError(e.message);
+      setStatus(await api.getBotStatus());
+      setOffline(false);
+    } catch {
+      setOffline(true);
     }
   };
 
@@ -24,41 +24,57 @@ export default function BotControl() {
   }, []);
 
   const doStart = async () => {
-    setBusy(true);
-    try { await api.startBot(); await refresh(); }
-    catch (e) { setError(e.message); }
-    setBusy(false);
+    try {
+      const r = await api.startBot();
+      await refresh();
+      toast(r.running ? r.message : `Bot did not start: ${r.message}`, r.running ? "success" : "error");
+    } catch (e) { toast(`Start failed: ${e.message}`, "error"); }
   };
   const doStop = async () => {
-    setBusy(true);
-    try { await api.stopBot(); await refresh(); }
-    catch (e) { setError(e.message); }
-    setBusy(false);
+    try {
+      const r = await api.stopBot();
+      await refresh();
+      toast(r.message || "Bot stopped", "info");
+    } catch (e) { toast(`Stop failed: ${e.message}`, "error"); }
   };
 
   const running = status?.running;
-  const state = running ? "running" : "stopped";
 
   return (
     <div className="panel">
-      <h2>Bot Control (24/7 Hybrid Trader)</h2>
-      <div className="row">
-        <span className={`badge ${state}`}>{running ? "RUNNING" : "STOPPED"}</span>
-        {status?.pid && <span className="muted">PID {status.pid}</span>}
-        {status?.pairs != null && <span className="muted">{status.pairs} pairs</span>}
+      <div className="panel-head">
+        <h2>🤖 Bot Control</h2>
+        <span className={`badge ${running ? "running" : "stopped"}`}>
+          {running ? "● RUNNING" : "○ STOPPED"}
+        </span>
       </div>
+
+      <div className="stat-row">
+        <div className="stat">
+          <div className="stat-label">State</div>
+          <div className="stat-value">{offline ? "—" : running ? "Running" : "Stopped"}</div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">PID</div>
+          <div className="stat-value">{status?.pid ?? "—"}</div>
+        </div>
+        <div className="stat">
+          <div className="stat-label">Enabled pairs</div>
+          <div className="stat-value">{status?.pairs ?? "—"}</div>
+        </div>
+      </div>
+
       <div className="spacer" />
       <div className="row">
-        <button className="btn" onClick={doStart} disabled={busy || running}>▶ Start Bot</button>
-        <button className="btn danger" onClick={doStop} disabled={busy || !running}>■ Stop Bot</button>
-        <button className="btn ghost" onClick={refresh} disabled={busy}>Refresh</button>
+        <AsyncButton onClick={doStart} disabled={running || offline}>▶ Start Bot</AsyncButton>
+        <AsyncButton className="btn danger" onClick={doStop} disabled={!running || offline}>■ Stop Bot</AsyncButton>
+        <button className="btn ghost" onClick={refresh}>Refresh</button>
       </div>
+
       {status?.message && <p className="muted">{status.message}</p>}
-      {error && <p style={{ color: "var(--red)" }}>{error}</p>}
-      <p className="muted">
-        The bot runs the enabled pairs from <code>trade_config.json</code>. Edit those in the
-        Trade Config tab, then start the bot here. For production, run it under systemd/NSSM
-        so it survives restarts (see backend/README).
+      <p className="muted hint">
+        The bot trades the enabled pairs from <b>Trade Config</b>. Edit those first, then start here.
+        For production, run it under systemd/NSSM so it survives reboots (see backend/deploy).
       </p>
     </div>
   );

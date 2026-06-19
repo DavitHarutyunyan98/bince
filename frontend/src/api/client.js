@@ -16,6 +16,9 @@ async function req(path, opts = {}) {
 }
 
 export const api = {
+  // Health
+  getHealth: () => req("/health"),
+
   // Optimization
   startOptimization: (settings) =>
     req("/optimization/start", { method: "POST", body: JSON.stringify(settings) }),
