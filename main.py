@@ -3697,6 +3697,28 @@ h1, h2, h3, h4 {
     display: inline-block;
     margin-right: 15px;
 }
+/* --- Date Pickers (make selected dates visible on dark theme) --- */
+.DateInput, .DateInput_input,
+.DateRangePickerInput, .SingleDatePickerInput {
+    background-color: #2c2c2c !important;
+    color: #f0f0f0 !important;
+}
+.DateInput_input {
+    border: 1px solid #555 !important;
+    font-weight: bold;
+    text-align: center;
+}
+.DateInput_input__focused {
+    border-color: #00BFFF !important;
+}
+.DateRangePickerInput_arrow svg,
+.DateRangePickerInput_arrow {
+    fill: #f0f0f0 !important;
+    color: #f0f0f0 !important;
+}
+.DateInput_input::placeholder {
+    color: #999 !important;
+}
     """
     with open("assets/style.css", "w") as f:
         f.write(style_css_content)
