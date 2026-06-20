@@ -16,7 +16,6 @@ import telegram
 import asyncio
 from dash.dependencies import Input, Output, State, ALL, MATCH
 from strategy_utils import Backtester, STRATEGY_REGISTRY, CandlestickStrategy, SuperTrendStrategy
-from stability_metrics import StabilityAnalyzer, integrate_stability_into_optimization
 import optuna
 import threading
 import time
@@ -1588,216 +1587,6 @@ class FuturesTrader:
             return pd.DataFrame()
         return pd.concat(all_results_dfs, ignore_index=True)
 
-    def optimize_trading_pairs_with_stability(self, trading_pairs, param_ranges, selected_params, is_start_date, is_end_date,
-                                            oos1_start_date, oos1_end_date, oos2_start_date, oos2_end_date, timeframe, min_trades, n_trials, weights, min_candles,
-                                            stop_event, pause_event, stability_weight=0.5, optimization_mode='efficient', strategy_name=None):
-        """Enhanced optimization that prioritizes stability over raw returns."""
-        
-        add_optimization_log("🎯 Starting STABILITY-BASED optimization...")
-        
-        # First run the standard optimization
-        results_df = self.optimize_trading_pairs(
-            trading_pairs, param_ranges, selected_params, is_start_date, is_end_date,
-            oos1_start_date, oos1_end_date, oos2_start_date, oos2_end_date, timeframe, min_trades, n_trials, weights, 
-            min_candles, stop_event, pause_event, optimization_mode, strategy_name
-        )
-        
-        if results_df.empty:
-            return results_df
-        
-        # Now enhance with stability analysis
-        add_optimization_log("📊 Calculating stability metrics for all results...")
-        
-        # Group results by pair and calculate stability for best result per pair
-        stability_analyzer = StabilityAnalyzer()
-        pair_stability_data = {}
-        
-        for pair in results_df['Trading_Pair'].unique():
-            if stop_event.is_set():
-                break
-                
-            pair_results = results_df[results_df['Trading_Pair'] == pair]
-            best_result = pair_results.loc[pair_results['Score'].idxmax()]
-            
-            # Get the portfolio data for this best result by re-running backtest
-            try:
-                # Fetch data for this pair
-                full_data = self.get_historical_data_for_symbol(
-                    pair, timeframe, is_start_date, oos2_end_date
-                )
-                
-                if full_data is None or full_data.empty:
-                    continue
-                
-                # Split into IS and dual OOS
-                is_data = full_data.loc[is_start_date:is_end_date]
-                oos1_data = full_data.loc[oos1_start_date:oos1_end_date]
-                oos2_data = full_data.loc[oos2_start_date:oos2_end_date]
-                oos_data = full_data.loc[oos_start_date:oos_end_date]
-                
-                # Extract parameters from best result (dynamic based on strategy)
-                params = {}
-                
-                # Add candlestick parameters if they exist
-                if 'Buy_Signal_Window' in best_result:
-                    params['buy_signal_window'] = int(best_result['Buy_Signal_Window'])
-                if 'Buy_Pattern_Lookback' in best_result:
-                    params['buy_pattern_lookback'] = int(best_result['Buy_Pattern_Lookback'])
-                if 'Sell_Signal_Window' in best_result:
-                    params['sell_signal_window'] = int(best_result['Sell_Signal_Window'])
-                if 'Sell_Pattern_Lookback' in best_result:
-                    params['sell_pattern_lookback'] = int(best_result['Sell_Pattern_Lookback'])
-                
-                # Add SuperTrend parameters if they exist
-                if 'ATR_Period' in best_result:
-                    params['atr_period'] = int(best_result['ATR_Period'])
-                if 'ATR_Multiplier' in best_result:
-                    params['atr_multiplier'] = float(best_result['ATR_Multiplier'])
-                
-                # Run backtests to get portfolio values
-                def get_portfolio_values(data, params):
-                    if strategy_name:
-                        strategy_class = STRATEGY_REGISTRY.get(strategy_name)
-                        if strategy_class:
-                            strategy = strategy_class()
-                        else:
-                            strategy = self._get_strategy_for_params(selected_params)
-                    else:
-                        strategy = self._get_strategy_for_params(selected_params)
-                    df_with_signals = strategy.generate_signals(data.copy(), params)
-                    backtester = Backtester(self.initial_capital)
-                    trades_df, portfolio_df = backtester.run_backtest(df_with_signals)
-                    
-                    if portfolio_df is not None and not portfolio_df.empty:
-                        return portfolio_df['Portfolio_Value']
-                    return None
-                
-                is_portfolio_values = get_portfolio_values(is_data, params)
-                oos1_portfolio_values = get_portfolio_values(oos1_data, params)
-                oos2_portfolio_values = get_portfolio_values(oos2_data, params)
-                
-                if is_portfolio_values is not None and oos1_portfolio_values is not None and oos2_portfolio_values is not None:
-                    # Combine OOS1 and OOS2 portfolio values for stability analysis
-                    combined_oos_values = pd.concat([oos1_portfolio_values, oos2_portfolio_values])
-                    pair_stability_data[pair] = {
-                        'is_portfolio_values': is_portfolio_values,
-                        'oos_portfolio_values': combined_oos_values
-                    }
-                    
-            except Exception as e:
-                add_optimization_log(f"⚠️ Error calculating stability for {pair}: {e}")
-                continue
-        
-        if not pair_stability_data:
-            add_optimization_log("❌ No stability data could be calculated")
-            return results_df
-        
-        # Calculate stability rankings
-        add_optimization_log(f"🔍 Analyzing stability for {len(pair_stability_data)} pairs...")
-        stability_rankings = stability_analyzer.rank_pairs_by_stability(pair_stability_data)
-        
-        # Create stability lookup
-        stability_lookup = {r['pair']: r for r in stability_rankings}
-        
-        # Add stability metrics to results DataFrame
-        results_df['Stability_Score'] = results_df.apply(
-            lambda row: stability_lookup.get(row['Trading_Pair'], {}).get('combined_stability', -100), 
-            axis=1
-        )
-        
-        results_df['Weighted_Return'] = results_df.apply(
-            lambda row: stability_lookup.get(row['Trading_Pair'], {}).get('weighted_return', row['Total_Return']), 
-            axis=1
-        )
-        
-        results_df['IS_Max_Drawdown_Stability'] = results_df.apply(
-            lambda row: stability_lookup.get(row['Trading_Pair'], {}).get('is_max_drawdown', 100), 
-            axis=1
-        )
-        
-        results_df['OOS_Max_Drawdown_Stability'] = results_df.apply(
-            lambda row: stability_lookup.get(row['Trading_Pair'], {}).get('oos_max_drawdown', 100), 
-            axis=1
-        )
-        
-        # Calculate combined stability-performance score
-        results_df['Stability_Performance_Score'] = (
-            results_df['Score'] * (1 - stability_weight) + 
-            results_df['Stability_Score'] * stability_weight
-        )
-        
-        # Sort by stability-performance score
-        results_df = results_df.sort_values('Stability_Performance_Score', ascending=False)
-        
-        # Generate stability report
-        report = stability_analyzer.create_stability_report(stability_rankings, top_n=10)
-        add_optimization_log("📈 STABILITY ANALYSIS COMPLETE")
-        add_optimization_log(report)
-        
-        # Log top stable pairs
-        top_stable = results_df.head(5)
-        add_optimization_log("🏆 TOP 5 MOST STABLE PAIRS:")
-        for _, row in top_stable.iterrows():
-            add_optimization_log(
-                f"   {row['Trading_Pair']}: Stability={row['Stability_Score']:.2f}, "
-                f"Return={row['Total_Return']:.1f}%, Combined={row['Stability_Performance_Score']:.2f}"
-            )
-        
-        return results_df
-
-    def export_stable_pairs_to_config(self, results_df, top_n=5, stability_threshold=-10.0, 
-                                    units_usdt=50.0, leverage=10, timeframe='15m'):
-        """Export top stable pairs to trading configuration."""
-        try:
-            if results_df is None or results_df.empty:
-                return False
-            
-            # Filter by stability threshold first
-            stable_results = results_df[results_df['Stability_Score'] >= stability_threshold]
-            
-            if stable_results.empty:
-                add_optimization_log(f"❌ No pairs meet stability threshold of {stability_threshold}")
-                return False
-            
-            # Get best result per pair based on stability-performance score
-            best_per_pair = stable_results.loc[stable_results.groupby('Trading_Pair')['Stability_Performance_Score'].idxmax()]
-            
-            # Take top N most stable pairs
-            top_stable_pairs = best_per_pair.head(top_n)
-            
-            configs = []
-            for _, row in top_stable_pairs.iterrows():
-                config = {
-                    "enabled": True,
-                    "strategy_name": "Candlestick Patterns",
-                    "symbol": row['Trading_Pair'],
-                    "bar_length": timeframe,
-                    "units_usdt": units_usdt,
-                    "leverage": leverage,
-                    "buy_signal_window": int(row['Buy_Signal_Window']),
-                    "buy_pattern_lookback": int(row['Buy_Pattern_Lookback']),
-                    "sell_signal_window": int(row['Sell_Signal_Window']),
-                    "sell_pattern_lookback": int(row['Sell_Pattern_Lookback'])
-                }
-                configs.append(config)
-            
-            # Save to trade_config.json
-            with open('trade_config.json', 'w') as f:
-                json.dump(configs, f, indent=2)
-            
-            add_optimization_log(f"✅ Exported {len(configs)} STABLE pairs to trade_config.json")
-            add_optimization_log("📊 STABLE PAIRS EXPORTED:")
-            for _, row in top_stable_pairs.iterrows():
-                add_optimization_log(
-                    f"   {row['Trading_Pair']}: Stability={row['Stability_Score']:.2f}, "
-                    f"Return={row['Total_Return']:.1f}%, Weighted={row['Weighted_Return']:.1f}%"
-                )
-            
-            return True
-            
-        except Exception as e:
-            add_optimization_log(f"❌ Failed to export stable pairs: {e}")
-            return False
 
 
 # --- Dash Application Setup ---
@@ -2102,21 +1891,6 @@ def build_optimizer_panel():
                               dcc.Input(id='weight-trades-input', type='number', value=20, min=0,
                                         className='custom-input')], className='flex-item'),
                 ], className='flex-container'),
-                html.Div([
-                    html.Div([
-                        dcc.Checklist(
-                            id='stability-optimization-checkbox',
-                            options=[{'label': ' Enable Stability-Based Optimization (prioritizes consistent growth)', 'value': 'enabled'}],
-                            value=['enabled'],
-                            className='custom-checklist'
-                        )
-                    ], className='flex-item'),
-                    html.Div([
-                        html.Label("Stability Weight (0-1):"),
-                        dcc.Input(id='stability-weight-input', type='number', value=0.7, min=0, max=1, step=0.1,
-                                  className='custom-input', disabled=False)
-                    ], className='flex-item', style={'marginLeft': '20px'})
-                ], className='flex-container', style={'alignItems': 'center'}),
                 html.Hr(style={'margin': '15px 0'}),
                 html.H4("Trade Balance Filter", style={'textAlign': 'center'}),
                 html.Div([
@@ -2214,7 +1988,6 @@ def build_refine_panel():
                             {'label': 'Trade Balance Score', 'value': 'Trade_Balance_Score'},
                             {'label': 'Avg Profitable Trade', 'value': 'Avg_Profitable_Trade'},
                             {'label': 'Profitable Trades Count', 'value': 'Profitable_Trades'},
-                            {'label': 'Stability Performance Score', 'value': 'Stability_Performance_Score'},
                         ],
                         value='Score',
                         clearable=False,
@@ -2864,17 +2637,6 @@ def set_parameter_presets(fast, normal, deep):
     return [no_update] * 6
 
 
-# Stability optimization checkbox callback
-@app.callback(
-    Output('stability-weight-input', 'disabled'),
-    Input('stability-optimization-checkbox', 'value'),
-    prevent_initial_call=True
-)
-def toggle_stability_weight_input(checkbox_value):
-    """Enable/disable stability weight input based on checkbox."""
-    return 'enabled' not in (checkbox_value or [])
-
-
 # Trade balance filter checkbox callback
 @app.callback(
     Output('max-trade-ratio-input', 'disabled'),
@@ -3043,16 +2805,9 @@ def export_to_config(n_clicks, opt_data, export_count, sort_by, units_usdt, leve
                 tf = timeframe if timeframe else '15m'
                 sort_column = sort_by if sort_by else 'Score'
 
-                # Check if stability optimization was used
-                if 'Stability_Score' in df.columns:
-                    add_optimization_log("🎯 Using STABILITY-ENHANCED export")
-                    success = trader.export_stable_pairs_to_config(
-                        df, top_n=count, stability_threshold=-20.0,
-                        units_usdt=units, leverage=lev, timeframe=tf)
-                else:
-                    success = trader.export_best_results_to_config_enhanced(
-                        df, top_n=count, sort_by=sort_column,
-                        units_usdt=units, leverage=lev, timeframe=tf)
+                success = trader.export_best_results_to_config_enhanced(
+                    df, top_n=count, sort_by=sort_column,
+                    units_usdt=units, leverage=lev, timeframe=tf)
 
                 if success:
                     add_optimization_log(
@@ -3162,8 +2917,6 @@ def toggle_opt_buttons(status):
      State('weight-return-input', 'value'),                     # weight_return
      State('weight-winrate-input', 'value'),                    # weight_winrate
      State('weight-trades-input', 'value'),                     # weight_trades
-     State('stability-optimization-checkbox', 'value'),         # stability_checkbox
-     State('stability-weight-input', 'value'),                  # stability_weight
      State('optimization-mode-dropdown', 'value'),              # optimization_mode
      State('trade-balance-filter-checkbox', 'value'),           # trade_balance_checkbox
      State('max-trade-ratio-input', 'value')],                  # max_trade_ratio
@@ -3172,8 +2925,8 @@ def toggle_opt_buttons(status):
 def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str, sw_str, slr_str, 
                                atr_period_str, atr_mult_str, n_trials, min_trades, min_candles, 
                                strategy_name, timeframe, is_start, is_end, oos1_start, oos1_end, 
-                               oos2_start, oos2_end, weight_return, weight_winrate, weight_trades, 
-                               stability_checkbox, stability_weight, optimization_mode,
+                               oos2_start, oos2_end, weight_return, weight_winrate, weight_trades,
+                               optimization_mode,
                                trade_balance_checkbox, max_trade_ratio):
     
     # DEBUG: Add explicit debug logging to verify date alignment
@@ -3253,10 +3006,6 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
         add_optimization_log(f"⚠️ Skipped pairs: {', '.join(skipped_pairs)}")
 
     try:
-        # Check if stability optimization is enabled
-        use_stability = 'enabled' in (stability_checkbox or [])
-        stability_weight_val = float(stability_weight) if use_stability and stability_weight is not None else 0.0
-        
         # Check if trade balance filter is enabled
         use_trade_balance_filter = 'enabled' in (trade_balance_checkbox or [])
         max_trade_ratio_val = float(max_trade_ratio) if use_trade_balance_filter and max_trade_ratio is not None else 3.0
@@ -3268,7 +3017,7 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
             'is_start': is_start, 'is_end': is_end, 
             'oos1_start': oos1_start, 'oos1_end': oos1_end, 'oos2_start': oos2_start, 'oos2_end': oos2_end,
             'weight_return': weight_return, 'weight_winrate': weight_winrate,
-            'weight_trades': weight_trades, 'use_stability': use_stability, 'stability_weight': stability_weight_val,
+            'weight_trades': weight_trades,
             'optimization_mode': optimization_mode or 'efficient', 'use_trade_balance_filter': use_trade_balance_filter,
             'max_trade_ratio': max_trade_ratio_val
         }
@@ -3323,33 +3072,21 @@ def run_optimization_task(n_intervals, settings):
             f"!! CRITICAL ERROR: Failed to unpack settings. Missing key: {e}")
         return [], [], f"Error: Missing key {e} in settings.", None, None, None, 'stopped'
 
-    # Choose optimization method based on stability setting
+    # Run the standard optimization
     optimization_mode = settings.get('optimization_mode', 'efficient')
     strategy_name = settings.get('strategy_name', list(STRATEGY_REGISTRY.keys())[0])
-    
-    if settings.get('use_stability', False):
-        add_optimization_log(f"🎯 Using STABILITY-BASED optimization ({optimization_mode.upper()} mode) with {strategy_name} strategy")
-        df_results = trader.optimize_trading_pairs_with_stability(
-            trading_pairs=pairs, param_ranges=param_ranges, selected_params=settings['selected_params'],
-            is_start_date=settings['is_start'], is_end_date=settings['is_end'],
-            oos1_start_date=settings['oos1_start'], oos1_end_date=settings['oos1_end'],
-            oos2_start_date=settings['oos2_start'], oos2_end_date=settings['oos2_end'],
-            timeframe=settings['timeframe'], min_trades=settings['min_trades'], n_trials=settings['n_trials'],
-            weights=weights, min_candles=settings['min_candles'], stop_event=OPTIMIZATION_STOP_EVENT,
-            pause_event=OPTIMIZATION_PAUSE_EVENT, stability_weight=settings['stability_weight'],
-            optimization_mode=optimization_mode, strategy_name=strategy_name
-        )
-    else:
-        add_optimization_log(f"📈 Using STANDARD optimization ({optimization_mode.upper()} mode) with {strategy_name} strategy")
-        df_results = trader.optimize_trading_pairs(
-            trading_pairs=pairs, param_ranges=param_ranges, selected_params=settings['selected_params'],
-            is_start_date=settings['is_start'], is_end_date=settings['is_end'],
-            oos1_start_date=settings['oos1_start'], oos1_end_date=settings['oos1_end'],
-            oos2_start_date=settings['oos2_start'], oos2_end_date=settings['oos2_end'],
-            timeframe=settings['timeframe'], min_trades=settings['min_trades'], n_trials=settings['n_trials'],
-            weights=weights, min_candles=settings['min_candles'], stop_event=OPTIMIZATION_STOP_EVENT,
-            pause_event=OPTIMIZATION_PAUSE_EVENT, optimization_mode=optimization_mode, strategy_name=strategy_name
-        )
+
+    add_optimization_log(f"📈 Using STANDARD optimization ({optimization_mode.upper()} mode) with {strategy_name} strategy")
+    df_results = trader.optimize_trading_pairs(
+        trading_pairs=pairs, param_ranges=param_ranges, selected_params=settings['selected_params'],
+        is_start_date=settings['is_start'], is_end_date=settings['is_end'],
+        oos1_start_date=settings['oos1_start'], oos1_end_date=settings['oos1_end'],
+        oos2_start_date=settings['oos2_start'], oos2_end_date=settings['oos2_end'],
+        timeframe=settings['timeframe'], min_trades=settings['min_trades'], n_trials=settings['n_trials'],
+        weights=weights, min_candles=settings['min_candles'], stop_event=OPTIMIZATION_STOP_EVENT,
+        pause_event=OPTIMIZATION_PAUSE_EVENT, optimization_mode=optimization_mode, strategy_name=strategy_name
+    )
+
 
     add_optimization_log("Main optimizer function has completed.")
     final_status = 'finished'
@@ -3394,8 +3131,8 @@ def run_optimization_task(n_intervals, settings):
             send_telegram_notification(message)
         return [], [], [], [], "No valid results found.", None, pairs, None, final_status
 
-    # Sort by appropriate score (stability-performance score if available, otherwise regular score)
-    sort_column = 'Stability_Performance_Score' if 'Stability_Performance_Score' in df_results.columns else 'Score'
+    # Sort by score
+    sort_column = 'Score'
     df_results = df_results.sort_values(by=sort_column, ascending=False).round(2)
     
     # Use configurable priority for best results (default to sort_column if not specified)
