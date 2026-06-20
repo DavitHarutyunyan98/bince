@@ -251,26 +251,53 @@ def fetch_data(
     fetched, then down-sampled to at most `limit` candles for transport so the
     UI can preview large ranges without huge payloads.
     """
-    from datetime import datetime, timezone
+    from datetime import datetime
 
+    symbol = (symbol or "").strip().upper()
+    if not symbol:
+        raise HTTPException(400, "symbol is required")
     if not start or not end:
         raise HTTPException(400, "start and end dates (YYYY-MM-DD) are required")
     try:
-        datetime.strptime(start, "%Y-%m-%d")
-        datetime.strptime(end, "%Y-%m-%d")
+        d_start = datetime.strptime(start, "%Y-%m-%d")
+        d_end = datetime.strptime(end, "%Y-%m-%d")
     except ValueError:
         raise HTTPException(400, "start and end must be in YYYY-MM-DD format")
+    if d_start >= d_end:
+        raise HTTPException(400, "start date must be before end date")
+
+    # Load and validate credentials up front so we can give a clear message.
+    try:
+        with open(APP_CONFIG_PATH) as f:
+            cfg = json.load(f)
+    except FileNotFoundError:
+        raise HTTPException(500, "config.json not found on the server")
+    except json.JSONDecodeError as e:
+        raise HTTPException(500, f"config.json is not valid JSON: {e}")
+    if not cfg.get("api_key") or not cfg.get("secret_key"):
+        raise HTTPException(
+            400,
+            "Binance api_key/secret_key are missing in config.json. "
+            "Add them under the Trade Config / server config before fetching data.",
+        )
 
     try:
         from binance.client import Client
+        from binance.exceptions import BinanceAPIException, BinanceRequestException
         from main import FuturesTrader
-        with open(APP_CONFIG_PATH) as f:
-            cfg = json.load(f)
+
         client = Client(cfg["api_key"], cfg["secret_key"])
         trader = FuturesTrader(client, cfg)
-        df = trader.get_historical_data_for_symbol(symbol.upper(), timeframe, start, end)
+        # Call the loader directly (instead of the wrapper that swallows errors)
+        # so the real failure reason propagates to the client.
+        df = trader._get_data_by_date_range(symbol, timeframe, start, end)
         if df is None or df.empty:
-            raise HTTPException(404, f"No data returned for {symbol}")
+            raise HTTPException(
+                404,
+                f"No candles returned for {symbol} ({timeframe}) between {start} "
+                f"and {end}. Check the symbol exists on Binance USDT futures and "
+                f"that the date range contains trading data.",
+            )
 
         total = len(df)
         # Down-sample evenly if the range exceeds the requested limit.
@@ -290,7 +317,7 @@ def fetch_data(
             for idx, row in df.iterrows()
         ]
         return {
-            "symbol": symbol.upper(),
+            "symbol": symbol,
             "timeframe": timeframe,
             "start": start,
             "end": end,
@@ -300,8 +327,16 @@ def fetch_data(
         }
     except HTTPException:
         raise
+    except BinanceAPIException as e:
+        # Binance returned an API error (bad key, invalid symbol, rate limit...).
+        logger.error("Binance API error fetching %s: %s", symbol, e)
+        raise HTTPException(502, f"Binance API error (code {e.code}): {e.message}")
+    except BinanceRequestException as e:
+        logger.error("Binance request error fetching %s: %s", symbol, e)
+        raise HTTPException(502, f"Binance request error: {e}")
     except Exception as e:
-        raise HTTPException(500, str(e))
+        logger.exception("Failed to fetch data for %s", symbol)
+        raise HTTPException(500, f"Failed to fetch data: {type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------------------

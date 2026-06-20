@@ -84,7 +84,11 @@ export default function DataFetcher() {
           </span>
         )}
       </div>
-      {error && <p style={{ color: "var(--red)" }}>{error}</p>}
+      {error && (
+        <p style={{ color: "var(--red)", whiteSpace: "pre-wrap", marginTop: 8 }}>
+          ⚠ Data fetch failed: {error}
+        </p>
+      )}
 
       {candles.length > 0 && (
         <>

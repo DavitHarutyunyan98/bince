@@ -9,8 +9,19 @@ async function req(path, opts = {}) {
     ...opts,
   });
   if (!res.ok) {
+    // FastAPI returns errors as {"detail": "..."}; surface that message
+    // directly so the UI can explain *why* a request failed.
     const text = await res.text();
-    throw new Error(`${res.status}: ${text}`);
+    let detail = text;
+    try {
+      const body = JSON.parse(text);
+      detail = typeof body?.detail === "string"
+        ? body.detail
+        : JSON.stringify(body?.detail ?? body);
+    } catch {
+      // body wasn't JSON; fall back to raw text
+    }
+    throw new Error(detail || `Request failed with status ${res.status}`);
   }
   return res.json();
 }
