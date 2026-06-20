@@ -4,10 +4,23 @@
 const BASE = import.meta.env.VITE_API_BASE || "/api";
 
 async function req(path, opts = {}) {
-  const res = await fetch(`${BASE}${path}`, {
-    headers: { "Content-Type": "application/json" },
-    ...opts,
-  });
+  const url = `${BASE}${path}`;
+  let res;
+  try {
+    res = await fetch(url, {
+      headers: { "Content-Type": "application/json" },
+      ...opts,
+    });
+  } catch (e) {
+    // fetch() rejects with a TypeError ("Failed to fetch") when the backend is
+    // unreachable, blocked by CORS, or the dev proxy target is down. Turn that
+    // opaque message into something actionable.
+    throw new Error(
+      `Cannot reach the API at "${url}". Is the backend (FastAPI on ` +
+        `http://localhost:8000) running? In a deployed frontend, set ` +
+        `VITE_API_BASE to the backend URL. (${e.message})`
+    );
+  }
   if (!res.ok) {
     // FastAPI returns errors as {"detail": "..."}; surface that message
     // directly so the UI can explain *why* a request failed.
