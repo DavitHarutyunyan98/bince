@@ -3718,6 +3718,8 @@ input[id*="date"], input[id*="Date"] {
     background-color: #2c2c2c !important;
     background: #2c2c2c !important;
     color: #f0f0f0 !important;
+    -webkit-text-fill-color: #f0f0f0 !important;
+    opacity: 1 !important;
     border: 1px solid #555 !important;
     font-weight: bold;
     text-align: center;
