@@ -3655,6 +3655,24 @@ h1, h2, h3, h4 {
 .custom-input .Select-placeholder, .custom-input .Select-value-label {
     color: #ccc !important;
 }
+/* --- Global form control consistency: dark background, light text --- */
+#react-entry-point input,
+#react-entry-point select,
+#react-entry-point textarea,
+input[type="date"],
+input[type="text"],
+input[type="number"] {
+    background-color: #2c2c2c !important;
+    color: #f0f0f0 !important;
+    -webkit-text-fill-color: #f0f0f0 !important;
+    color-scheme: dark !important;
+    border: 1px solid #555 !important;
+}
+#react-entry-point input::placeholder,
+#react-entry-point textarea::placeholder {
+    color: #aaa !important;
+    -webkit-text-fill-color: #aaa !important;
+}
 /* --- Data Tables --- */
 .dash-table-container .dash-spreadsheet-container { border: 1px solid #444; }
 .dash-table-container .dash-header {
