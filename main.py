@@ -1836,6 +1836,19 @@ def generate_filename(symbol, start_date, end_date, params):
 
 
 # --- UI Builder Functions ---
+def date_range_inputs(base_id, start_default, end_default):
+    """Native HTML date range (two <input type=date>) styled by .custom-input.
+    Produces components with ids '{base_id}-start' and '{base_id}-end',
+    whose 'value' is a 'YYYY-MM-DD' string."""
+    return html.Div([
+        html.Input(id=f'{base_id}-start', type='date', value=str(start_default),
+                   className='custom-input', style={'colorScheme': 'dark'}),
+        html.Span('→', style={'margin': '0 8px'}),
+        html.Input(id=f'{base_id}-end', type='date', value=str(end_default),
+                   className='custom-input', style={'colorScheme': 'dark'}),
+    ], style={'display': 'flex', 'alignItems': 'center'})
+
+
 def build_config_panel():
     today = datetime.now(timezone.utc)
     sixty_days_ago = today - timedelta(days=60)
@@ -1863,8 +1876,8 @@ def build_config_panel():
                         )
                     ], className='flex-item'),
                     html.Div([html.Label('Date Range:'),
-                              dcc.DatePickerRange(id='date-picker-range', start_date=sixty_days_ago.date(),
-                                                  end_date=today.date())], className='flex-item'),
+                              date_range_inputs('date-range', sixty_days_ago.date(),
+                                                today.date())], className='flex-item'),
                 ], className='flex-container'),
             ], className='control-panel-group'),
             html.Div([
@@ -1908,8 +1921,9 @@ def build_live_config_panel():
     return html.Div([
         create_collapsible_container("Live Trading Config", "live-config-panel", [
             html.Div([html.Label('Live Start Date:'),
-                      dcc.DatePickerSingle(id='live-start-date-picker', date=datetime.now().date(),
-                                           display_format='YYYY-MM-DD')],
+                      html.Input(id='live-start-date-picker', type='date',
+                                 value=str(datetime.now().date()),
+                                 className='custom-input', style={'colorScheme': 'dark'})],
                      className='flex-item', style={'marginBottom': '15px'}),
             html.Div(
                 [html.Label('Trade Size (USDT):'),
@@ -2031,17 +2045,14 @@ def build_optimizer_panel():
                                                                 ['5m', '15m', '30m', '1h', '4h']], value='1h',
                                                        className='custom-input', clearable=False)],
                 className='flex-item'),
-                html.Div([html.Label("In-Sample (IS) Date Range"), dcc.DatePickerRange(id='is-date-picker',
-                                                                                       start_date=sixty_days_ago.date(),
-                                                                                       end_date=fifteen_days_ago.date())],
+                html.Div([html.Label("In-Sample (IS) Date Range"),
+                          date_range_inputs('is-date', sixty_days_ago.date(), fifteen_days_ago.date())],
                          className='flex-item'),
-                html.Div([html.Label("Out-of-Sample 1 (OOS1) Date Range"), dcc.DatePickerRange(id='oos1-date-picker',
-                                                                                            start_date=fifteen_days_ago.date(),
-                                                                                            end_date=(today - timedelta(days=7)).date())],
+                html.Div([html.Label("Out-of-Sample 1 (OOS1) Date Range"),
+                          date_range_inputs('oos1-date', fifteen_days_ago.date(), (today - timedelta(days=7)).date())],
                          className='flex-item'),
-                html.Div([html.Label("Out-of-Sample 2 (OOS2) Date Range"), dcc.DatePickerRange(id='oos2-date-picker',
-                                                                                            start_date=(today - timedelta(days=7)).date(),
-                                                                                            end_date=today.date())],
+                html.Div([html.Label("Out-of-Sample 2 (OOS2) Date Range"),
+                          date_range_inputs('oos2-date', (today - timedelta(days=7)).date(), today.date())],
                          className='flex-item'),
                 html.Div(
                     [html.Label("Number of Trials"),
@@ -2480,7 +2491,7 @@ def update_strategy_parameters_ui(strategy_name, applied_params):
      Input('live-update-interval', 'n_intervals')],
     [State('symbol-input', 'value'),
      State('timeframe-input', 'value'),
-     State('date-picker-range', 'start_date'), State('date-picker-range', 'end_date'),
+     State('date-range-start', 'value'), State('date-range-end', 'value'),
      State('strategy-selector-dropdown',
            'value'), State({'type': 'strategy-param-input', 'param': ALL}, 'value'),
      State({'type': 'strategy-param-input', 'param': ALL}, 'id')]
@@ -2607,7 +2618,7 @@ def run_backtest_callback(n_clicks, capital, strategy_name, param_values, param_
      State('strategy-selector-dropdown',
            'value'), State({'type': 'strategy-param-input', 'param': ALL}, 'value'),
      State({'type': 'strategy-param-input', 'param': ALL}, 'id'),
-     State('live-start-date-picker', 'date'), State('units-usdt-input', 'value'), State('leverage-input', 'value')],
+     State('live-start-date-picker', 'value'), State('units-usdt-input', 'value'), State('leverage-input', 'value')],
     prevent_initial_call=True
 )
 def save_trade_config(n_clicks, symbol, bar_length,
@@ -3142,12 +3153,12 @@ def toggle_opt_buttons(status):
      State('min-candles-input', 'value'),                       # min_candles
      State('optimizer-strategy-selector', 'value'),             # strategy_name
      State('opt-timeframe-dropdown', 'value'),                  # timeframe
-     State('is-date-picker', 'start_date'),                     # is_start
-     State('is-date-picker', 'end_date'),                       # is_end
-     State('oos1-date-picker', 'start_date'),                   # oos1_start
-     State('oos1-date-picker', 'end_date'),                     # oos1_end
-     State('oos2-date-picker', 'start_date'),                   # oos2_start
-     State('oos2-date-picker', 'end_date'),                     # oos2_end
+     State('is-date-start', 'value'),                     # is_start
+     State('is-date-end', 'value'),                       # is_end
+     State('oos1-date-start', 'value'),                   # oos1_start
+     State('oos1-date-end', 'value'),                     # oos1_end
+     State('oos2-date-start', 'value'),                   # oos2_start
+     State('oos2-date-end', 'value'),                     # oos2_end
      State('weight-return-input', 'value'),                     # weight_return
      State('weight-winrate-input', 'value'),                    # weight_winrate
      State('weight-trades-input', 'value'),                     # weight_trades
@@ -3450,8 +3461,8 @@ def update_logs(n): return "\n".join(OPTIMIZATION_LOGS)
 @app.callback(
     Output('download-opt-xlsx', 'data'),
     Input('export-opt-results-btn', 'n_clicks'),
-    [State('all-trials-store', 'data'), State('is-date-picker',
-                                              'start_date'), State('oos-date-picker', 'end_date')],
+    [State('all-trials-store', 'data'), State('is-date-start', 'value'),
+     State('oos2-date-end', 'value')],
     prevent_initial_call=True
 )
 def export_opt_results(n_clicks, all_trials_data, start_date, end_date):
@@ -3471,7 +3482,7 @@ def export_opt_results(n_clicks, all_trials_data, start_date, end_date):
 @app.callback(
     Output('download-all-trials-xlsx', 'data'),
     Input('export-all-trials-btn', 'n_clicks'),
-    [State('all-trials-store', 'data'), State('is-date-picker', 'start_date'), State('oos-date-picker', 'end_date')],
+    [State('all-trials-store', 'data'), State('is-date-start', 'value'), State('oos2-date-end', 'value')],
     prevent_initial_call=True
 )
 def export_all_trials_results(n_clicks, all_trials_data, start_date, end_date):
@@ -3489,8 +3500,8 @@ def export_all_trials_results(n_clicks, all_trials_data, start_date, end_date):
 @app.callback(
     Output('download-partial-opt-xlsx', 'data'),
     Input('download-partial-results-btn', 'n_clicks'),
-    [State('is-date-picker', 'start_date'),
-     State('oos-date-picker', 'end_date')],
+    [State('is-date-start', 'value'),
+     State('oos2-date-end', 'value')],
     prevent_initial_call=True
 )
 def export_partial_opt_results(n_clicks, start_date, end_date):
@@ -3697,7 +3708,22 @@ h1, h2, h3, h4 {
     display: inline-block;
     margin-right: 15px;
 }
-/* --- Date Pickers (make selected dates visible on dark theme) --- */
+/* --- Native date inputs (type=date) --- */
+input[type="date"].custom-input {
+    background-color: #2c2c2c !important;
+    color: #f0f0f0 !important;
+    -webkit-text-fill-color: #f0f0f0 !important;
+    border: 1px solid #555 !important;
+    border-radius: 4px;
+    padding: 6px 8px;
+    color-scheme: dark;
+    min-width: 140px;
+}
+input[type="date"].custom-input::-webkit-calendar-picker-indicator {
+    filter: invert(1);
+    cursor: pointer;
+}
+/* --- Legacy react-dates pickers (if any remain) --- */
 /* High-specificity, attribute-based selectors so react-dates' own injected
    styles cannot win. #react-entry-point is Dash's app root. */
 #react-entry-point [class*="DateRangePicker"],
