@@ -3698,15 +3698,25 @@ h1, h2, h3, h4 {
     margin-right: 15px;
 }
 /* --- Date Pickers (make selected dates visible on dark theme) --- */
+/* High-specificity, attribute-based selectors so react-dates' own injected
+   styles cannot win. #react-entry-point is Dash's app root. */
+#react-entry-point [class*="DateRangePicker"],
+#react-entry-point [class*="SingleDatePicker"],
+#react-entry-point [class*="DateInput"],
 .DateRangePicker, .SingleDatePicker,
 .DateRangePickerInput, .SingleDatePickerInput,
 .DateInput {
     background-color: #2c2c2c !important;
+    background: #2c2c2c !important;
 }
+#react-entry-point [class*="DateInput"] input,
+#react-entry-point [class*="DatePicker"] input,
 .DateRangePicker input,
 .SingleDatePicker input,
-.DateInput_input {
+.DateInput_input,
+input[id*="date"], input[id*="Date"] {
     background-color: #2c2c2c !important;
+    background: #2c2c2c !important;
     color: #f0f0f0 !important;
     border: 1px solid #555 !important;
     font-weight: bold;
