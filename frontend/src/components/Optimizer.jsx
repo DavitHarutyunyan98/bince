@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useRef } from "react";
-import { api } from "../api/client.js";
+import { api, logEvent } from "../api/client.js";
 
 const DEFAULTS = {
   pairs: "BTCUSDT,ETHUSDT",
@@ -96,20 +96,27 @@ export default function Optimizer({ jobId, setJobId }) {
         weight_trades: Number(form.weight_trades),
         stability_weight: Number(form.stability_weight),
       };
+      logEvent("info", `Starting optimization for ${payload.pairs.join(", ")} (${payload.strategy_name}, ${payload.optimization_mode})…`);
       const r = await api.startOptimization(payload);
       setJobId(r.job_id);
       setStatus("pending");
+      logEvent("success", `Optimization queued as job ${r.job_id}. Waiting for a worker to pick it up…`);
     } catch (e) {
       setError(e.message);
+      logEvent("error", `Failed to start optimization: ${e.message}`);
     }
   };
 
   const stop = async () => {
-    if (jobId) await api.stopOptimization(jobId);
+    if (jobId) {
+      logEvent("info", `Stopping optimization job ${jobId}…`);
+      await api.stopOptimization(jobId);
+    }
   };
   const togglePause = async () => {
     if (jobId) {
       const r = await api.togglePause(jobId);
+      logEvent("info", `Optimization job ${jobId} ${r.paused ? "paused" : "resumed"}.`);
       setPaused(r.paused);
     }
   };

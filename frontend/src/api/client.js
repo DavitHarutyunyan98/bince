@@ -3,8 +3,40 @@
 // proxies to http://localhost:8000.
 const BASE = import.meta.env.VITE_API_BASE || "/api";
 
+// ---------------------------------------------------------------------------
+// Activity log: a tiny pub/sub so the UI can show a live "terminal" of every
+// action (request, success, error) the user triggers.
+// ---------------------------------------------------------------------------
+const _logEntries = [];
+const _logListeners = new Set();
+let _logSeq = 0;
+
+export function logEvent(level, message) {
+  const entry = {
+    id: ++_logSeq,
+    ts: new Date().toISOString(),
+    level, // "info" | "success" | "error"
+    message,
+  };
+  _logEntries.push(entry);
+  if (_logEntries.length > 500) _logEntries.shift();
+  _logListeners.forEach((fn) => fn(entry));
+  return entry;
+}
+
+export function subscribeLog(fn) {
+  _logListeners.add(fn);
+  return () => _logListeners.delete(fn);
+}
+
+export function getLogEntries() {
+  return _logEntries.slice();
+}
+
 async function req(path, opts = {}) {
   const url = `${BASE}${path}`;
+  const method = opts.method || "GET";
+  logEvent("info", `→ ${method} ${path}`);
   let res;
   try {
     res = await fetch(url, {
@@ -15,11 +47,12 @@ async function req(path, opts = {}) {
     // fetch() rejects with a TypeError ("Failed to fetch") when the backend is
     // unreachable, blocked by CORS, or the dev proxy target is down. Turn that
     // opaque message into something actionable.
-    throw new Error(
+    const msg =
       `Cannot reach the API at "${url}". Is the backend (FastAPI on ` +
-        `http://localhost:8000) running? In a deployed frontend, set ` +
-        `VITE_API_BASE to the backend URL. (${e.message})`
-    );
+      `http://localhost:8000) running? In a deployed frontend, set ` +
+      `VITE_API_BASE to the backend URL. (${e.message})`;
+    logEvent("error", `✖ ${method} ${path} — ${msg}`);
+    throw new Error(msg);
   }
   if (!res.ok) {
     // FastAPI returns errors as {"detail": "..."}; surface that message
@@ -34,8 +67,11 @@ async function req(path, opts = {}) {
     } catch {
       // body wasn't JSON; fall back to raw text
     }
-    throw new Error(detail || `Request failed with status ${res.status}`);
+    const msg = detail || `Request failed with status ${res.status}`;
+    logEvent("error", `✖ ${method} ${path} [${res.status}] — ${msg}`);
+    throw new Error(msg);
   }
+  logEvent("success", `✓ ${method} ${path} [${res.status}]`);
   return res.json();
 }
 
