@@ -114,7 +114,13 @@ def calculate_supertrend_core(close, high, low, atr, multiplier, n):
 #  2. CONCRETE STRATEGY IMPLEMENTATIONS
 # ==============================================================================
 class CandlestickStrategy(BaseStrategy):
-    """Strategy based on Three White Soldiers / Three Black Crows."""
+    """Strategy based on Three White Soldiers / Three Black Crows.
+
+    Entries: pattern-frequency over a rolling window (fully configurable, no
+    hardcoded defaults). Exit: a configurable price-range expressed in percent
+    around the entry price — the position is closed (to flat) as soon as price
+    crosses outside that range.
+    """
 
     @staticmethod
     def name():
@@ -122,45 +128,63 @@ class CandlestickStrategy(BaseStrategy):
 
     @staticmethod
     def get_parameters():
+        # No hardcoded/default values: every value must be supplied by the user.
         return {
-            'buy_signal_window': {'type': 'number', 'default': 11, 'step': 1},
-            'buy_pattern_lookback': {'type': 'number', 'default': 2, 'step': 1},
-            'sell_signal_window': {'type': 'number', 'default': 11, 'step': 1},
-            'sell_pattern_lookback': {'type': 'number', 'default': 5, 'step': 1},
+            'buy_signal_window': {'type': 'number', 'step': 1},
+            'buy_pattern_lookback': {'type': 'number', 'step': 1},
+            'sell_signal_window': {'type': 'number', 'step': 1},
+            'sell_pattern_lookback': {'type': 'number', 'step': 1},
+            'exit_price_range_percent': {
+                'type': 'number', 'step': 0.1,
+                'help': ('exit range in %: close the position when price moves this '
+                         'far from the entry price in either direction. '
+                         'example: 2 → entry at 100 exits if price rises to 102 or falls to 98'),
+            },
         }
+
+    @staticmethod
+    def _require(params, key, is_float=False):
+        """Return the parameter value strictly — no silent defaults."""
+        val = params.get(key)
+        if val is None or val == '':
+            raise ValueError(f"CRITICAL: Parameter '{key}' is required (no default).")
+        try:
+            num = float(val)
+        except (ValueError, TypeError):
+            raise ValueError(f"CRITICAL: Parameter '{key}' ({val}) is not a valid number.")
+        if np.isnan(num):
+            raise ValueError(f"CRITICAL: Parameter '{key}' is NaN.")
+        return num if is_float else int(num)
 
     def _detect_pattern(self, data, is_bullish):
         """Detect candlestick patterns."""
-        try:
-            if is_bullish:
-                c1 = data['Close'] > data['Open']
-                c2 = data['Close'].shift(1) > data['Open'].shift(1)
-                c3 = data['Close'].shift(2) > data['Open'].shift(2)
-                increase = (
-                    (data['Close'] > data['Close'].shift(1)) &
-                    (data['Close'].shift(1) > data['Close'].shift(2))
-                )
-                basic_pattern = c1 & c2 & c3 & increase
-            else:  # Bearish
-                c1 = data['Close'] < data['Open']
-                c2 = data['Close'].shift(1) < data['Open'].shift(1)
-                c3 = data['Close'].shift(2) < data['Open'].shift(2)
-                decrease = (
-                    (data['Close'] < data['Close'].shift(1)) &
-                    (data['Close'].shift(1) < data['Close'].shift(2))
-                )
-                basic_pattern = c1 & c2 & c3 & decrease
+        if is_bullish:
+            c1 = data['Close'] > data['Open']
+            c2 = data['Close'].shift(1) > data['Open'].shift(1)
+            c3 = data['Close'].shift(2) > data['Open'].shift(2)
+            increase = (
+                (data['Close'] > data['Close'].shift(1)) &
+                (data['Close'].shift(1) > data['Close'].shift(2))
+            )
+            basic_pattern = c1 & c2 & c3 & increase
+        else:  # Bearish
+            c1 = data['Close'] < data['Open']
+            c2 = data['Close'].shift(1) < data['Open'].shift(1)
+            c3 = data['Close'].shift(2) < data['Open'].shift(2)
+            decrease = (
+                (data['Close'] < data['Close'].shift(1)) &
+                (data['Close'].shift(1) < data['Close'].shift(2))
+            )
+            basic_pattern = c1 & c2 & c3 & decrease
 
-            result = basic_pattern.astype(int)
-            return result
-
-        except Exception as e:
-            raise
+        return basic_pattern.astype(int)
 
     def generate_signals(self, data, params):
-        """Generate trading signals based on candlestick patterns."""
-        print(
-            f"-> CandlestickStrategy.generate_signals() ENTRY with params: {params}")
+        """Generate trading signals based on candlestick patterns.
+
+        Position is built statefully so the percent-range exit can reset the
+        position to flat (0) when price crosses outside the configured range.
+        """
         if data is None or data.empty:
             return pd.DataFrame()
 
@@ -169,26 +193,54 @@ class CandlestickStrategy(BaseStrategy):
         df['ThreeWhiteSoldiers'] = self._detect_pattern(df, is_bullish=True)
         df['ThreeBlackCrows'] = self._detect_pattern(df, is_bullish=False)
 
-        buy_window = int(params.get('buy_signal_window') or 5)
-        buy_lookback = int(params.get('buy_pattern_lookback') or 3)
-        sell_window = int(params.get('sell_signal_window') or 5)
-        sell_lookback = int(params.get('sell_pattern_lookback') or 3)
+        # Strict parameter extraction (no hardcoded fallbacks).
+        buy_window = self._require(params, 'buy_signal_window')
+        buy_lookback = self._require(params, 'buy_pattern_lookback')
+        sell_window = self._require(params, 'sell_signal_window')
+        sell_lookback = self._require(params, 'sell_pattern_lookback')
 
-        last_buy = (
-            df['ThreeWhiteSoldiers'].rolling(
-                window=buy_window).sum() >= buy_lookback
-        )
-        last_sell = (
-            df['ThreeBlackCrows'].rolling(
-                window=sell_window).sum() >= sell_lookback
-        )
+        # Exit range is optional at runtime (e.g. during optimization it is not
+        # supplied); when absent, only opposite-pattern flips close a position.
+        exit_raw = params.get('exit_price_range_percent')
+        exit_pct = None
+        if exit_raw is not None and exit_raw != '':
+            exit_pct = self._require(params, 'exit_price_range_percent', is_float=True)
 
-        df["position"] = 0
-        df.loc[last_buy, "position"] = 1
-        df.loc[last_sell, "position"] = -1
-        df["position"] = df["position"].replace(0, np.nan).ffill().fillna(0)
+        buy_raw = (
+            df['ThreeWhiteSoldiers'].rolling(window=buy_window).sum() >= buy_lookback
+        ).to_numpy()
+        sell_raw = (
+            df['ThreeBlackCrows'].rolling(window=sell_window).sum() >= sell_lookback
+        ).to_numpy()
+        close = df['Close'].to_numpy()
 
-        latest_position = df["position"].iloc[-1] if not df.empty else 0
+        n = len(df)
+        positions = np.zeros(n, dtype=int)
+        pos = 0
+        entry_price = 0.0
+
+        for i in range(n):
+            if pos == 0:
+                # Look for a fresh entry.
+                if buy_raw[i]:
+                    pos, entry_price = 1, close[i]
+                elif sell_raw[i]:
+                    pos, entry_price = -1, close[i]
+            else:
+                # 1) Opposite pattern flips the position.
+                if pos == 1 and sell_raw[i]:
+                    pos, entry_price = -1, close[i]
+                elif pos == -1 and buy_raw[i]:
+                    pos, entry_price = 1, close[i]
+                # 2) Percent-range exit: close to flat if price leaves the band.
+                elif exit_pct is not None and entry_price > 0:
+                    upper = entry_price * (1 + exit_pct / 100.0)
+                    lower = entry_price * (1 - exit_pct / 100.0)
+                    if close[i] >= upper or close[i] <= lower:
+                        pos, entry_price = 0, 0.0
+            positions[i] = pos
+
+        df["position"] = positions
         return df
 
 
@@ -423,6 +475,9 @@ class Backtester:
                     exit_triggered, exit_reason = True, 'Signal Flip'
                 elif position == -1 and current_signal == 1:
                     exit_triggered, exit_reason = True, 'Signal Flip'
+                elif current_signal == 0:
+                    # Strategy moved to flat (e.g. percent-range exit) -> close.
+                    exit_triggered, exit_reason = True, 'Exit Signal'
 
                 if exit_triggered:
                     # CRITICAL FIX: Use next candle open for exit price (same as entry logic)
