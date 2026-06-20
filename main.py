@@ -2248,13 +2248,22 @@ def update_strategy_parameters_ui(strategy_name, applied_params):
     ui_elements = []
     applied_params = applied_params if isinstance(applied_params, dict) else {}
     for param_name, config in params.items():
-        default_value = applied_params.get(param_name, config['default'])
-        ui_elements.append(html.Div([
+        # No hardcoded defaults: fall back to None (empty input) when absent.
+        default_value = applied_params.get(param_name, config.get('default'))
+        children = [
             html.Label(f"{param_name.replace('_', ' ').title()}:"),
             dcc.Input(id={'type': 'strategy-param-input', 'param': param_name}, type=config['type'],
                       value=default_value, step=config.get('step', 1), min=0 if config['type'] == 'number' else None,
-                      className='custom-input')
-        ], className='flex-item'))
+                      className='custom-input'),
+        ]
+        # Optional small-letter example/help shown under the input.
+        if config.get('help'):
+            children.append(html.Small(
+                config['help'],
+                style={'display': 'block', 'marginTop': '4px',
+                       'color': '#999', 'fontSize': '11px'}
+            ))
+        ui_elements.append(html.Div(children, className='flex-item'))
     return [html.Div(ui_elements, className='flex-container')]
 
 
