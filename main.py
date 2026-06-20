@@ -3698,12 +3698,16 @@ h1, h2, h3, h4 {
     margin-right: 15px;
 }
 /* --- Date Pickers (make selected dates visible on dark theme) --- */
-.DateInput, .DateInput_input,
-.DateRangePickerInput, .SingleDatePickerInput {
+.DateRangePicker, .SingleDatePicker,
+.DateRangePickerInput, .SingleDatePickerInput,
+.DateInput {
+    background-color: #2c2c2c !important;
+}
+.DateRangePicker input,
+.SingleDatePicker input,
+.DateInput_input {
     background-color: #2c2c2c !important;
     color: #f0f0f0 !important;
-}
-.DateInput_input {
     border: 1px solid #555 !important;
     font-weight: bold;
     text-align: center;
@@ -3712,12 +3716,30 @@ h1, h2, h3, h4 {
     border-color: #00BFFF !important;
 }
 .DateRangePickerInput_arrow svg,
-.DateRangePickerInput_arrow {
+.DateRangePickerInput_arrow,
+.SingleDatePickerInput_calendarIcon svg {
     fill: #f0f0f0 !important;
     color: #f0f0f0 !important;
 }
+.DateRangePicker input::placeholder,
+.SingleDatePicker input::placeholder,
 .DateInput_input::placeholder {
-    color: #999 !important;
+    color: #aaa !important;
+}
+/* Calendar popup */
+.CalendarMonthGrid, .CalendarMonth, .DayPicker,
+.DayPicker_weekHeader, .CalendarDay__default {
+    background-color: #2c2c2c !important;
+    color: #f0f0f0 !important;
+    border-color: #444 !important;
+}
+.CalendarDay__default:hover {
+    background-color: #00BFFF !important;
+    color: #000 !important;
+}
+.CalendarDay__selected, .CalendarDay__selected_span {
+    background-color: #00BFFF !important;
+    color: #000 !important;
 }
     """
     with open("assets/style.css", "w") as f:
