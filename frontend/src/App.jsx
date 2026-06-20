@@ -3,6 +3,7 @@ import Optimizer from "./components/Optimizer.jsx";
 import ResultsTable from "./components/ResultsTable.jsx";
 import ConfigEditor from "./components/ConfigEditor.jsx";
 import BotControl from "./components/BotControl.jsx";
+import DataFetcher from "./components/DataFetcher.jsx";
 
 const TABS = [
   { id: "optimizer", label: "Optimizer" },
@@ -36,6 +37,7 @@ export default function App() {
 
       {tab === "optimizer" && (
         <>
+          <DataFetcher />
           <Optimizer jobId={jobId} setJobId={setJobId} />
           {jobId && <ResultsTable jobId={jobId} />}
         </>
