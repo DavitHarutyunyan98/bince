@@ -1630,11 +1630,11 @@ def date_range_inputs(base_id, start_default, end_default):
     Produces components with ids '{base_id}-start' and '{base_id}-end',
     whose 'value' is a 'YYYY-MM-DD' string."""
     return html.Div([
-        html.Input(id=f'{base_id}-start', type='date', value=str(start_default),
-                   className='custom-input', style={'colorScheme': 'dark'}),
+        dcc.Input(id=f'{base_id}-start', type='date', value=str(start_default),
+                  className='custom-input', style={'colorScheme': 'dark'}),
         html.Span('→', style={'margin': '0 8px'}),
-        html.Input(id=f'{base_id}-end', type='date', value=str(end_default),
-                   className='custom-input', style={'colorScheme': 'dark'}),
+        dcc.Input(id=f'{base_id}-end', type='date', value=str(end_default),
+                  className='custom-input', style={'colorScheme': 'dark'}),
     ], style={'display': 'flex', 'alignItems': 'center'})
 
 
@@ -1710,9 +1710,9 @@ def build_live_config_panel():
     return html.Div([
         create_collapsible_container("Live Trading Config", "live-config-panel", [
             html.Div([html.Label('Live Start Date:'),
-                      html.Input(id='live-start-date-picker', type='date',
-                                 value=str(datetime.now().date()),
-                                 className='custom-input', style={'colorScheme': 'dark'})],
+                      dcc.Input(id='live-start-date-picker', type='date',
+                                value=str(datetime.now().date()),
+                                className='custom-input', style={'colorScheme': 'dark'})],
                      className='flex-item', style={'marginBottom': '15px'}),
             html.Div(
                 [html.Label('Trade Size (USDT):'),
