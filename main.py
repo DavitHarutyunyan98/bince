@@ -2269,6 +2269,10 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
     dcc.Interval(id='optimization-trigger-interval',
                  interval=500, n_intervals=0, max_intervals=0),
 
+    # Hidden no-op outputs for clientside "scroll to results" callbacks.
+    html.Div(id='scroll-backtest-dummy', style={'display': 'none'}),
+    html.Div(id='scroll-optimizer-dummy', style={'display': 'none'}),
+
     html.Div([
         html.H2("Futures Dashboard", style={'margin': '0', 'flex': '1'}),
         html.A('Manual Backtester', href='#manual-section', className='nav-link'),
@@ -2410,6 +2414,38 @@ def control_live_update_interval(checklist_value, frequency):
     is_disabled = 'ENABLED' not in checklist_value
     interval_ms = int(frequency) * 1000 if frequency else 30000
     return is_disabled, interval_ms
+
+
+# --- Auto-scroll to results after an action (runs in the browser) ---
+app.clientside_callback(
+    """
+    function(n) {
+        if (n) {
+            const el = document.getElementById('manual-results-section');
+            if (el) { el.scrollIntoView({behavior: 'smooth', block: 'start'}); }
+        }
+        return '';
+    }
+    """,
+    Output('scroll-backtest-dummy', 'children'),
+    Input('backtest-button', 'n_clicks'),
+    prevent_initial_call=True,
+)
+
+app.clientside_callback(
+    """
+    function(n) {
+        if (n) {
+            const el = document.getElementById('optimizer-results-section');
+            if (el) { el.scrollIntoView({behavior: 'smooth', block: 'start'}); }
+        }
+        return '';
+    }
+    """,
+    Output('scroll-optimizer-dummy', 'children'),
+    Input('start-opt-button', 'n_clicks'),
+    prevent_initial_call=True,
+)
 
 
 # --- Manual Backtester Callbacks ---
@@ -3536,9 +3572,6 @@ h1, h2, h3, h4 {
     display: flex;
     flex-direction: column;
     gap: 20px;
-}
-@media (min-width: 1200px) {
-    .main-container { flex-direction: row; }
 }
 .control-panel {
     flex: 1;
