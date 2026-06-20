@@ -11,6 +11,7 @@ Endpoints:
   PUT    /config/trade                 save trade_config.json
   GET    /config/app                   read config.json (credentials masked)
   GET    /pairs/usdt-futures           list all USDT futures pairs from Binance
+  GET    /data/fetch                    fetch historical OHLCV candles for a symbol
 """
 import os
 import sys
@@ -228,6 +229,77 @@ def list_usdt_futures():
             reverse=True,
         )
         return {"count": len(pairs), "pairs": pairs}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+# ---------------------------------------------------------------------------
+# Data fetching endpoint
+# ---------------------------------------------------------------------------
+
+@app.get("/data/fetch")
+def fetch_data(
+    symbol: str,
+    timeframe: str = "15m",
+    start: str = None,
+    end: str = None,
+    limit: int = 500,
+):
+    """Fetch historical OHLCV candles for a symbol over a date range.
+
+    Reuses the same Binance data loader as the optimizer. The full range is
+    fetched, then down-sampled to at most `limit` candles for transport so the
+    UI can preview large ranges without huge payloads.
+    """
+    from datetime import datetime, timezone
+
+    if not start or not end:
+        raise HTTPException(400, "start and end dates (YYYY-MM-DD) are required")
+    try:
+        datetime.strptime(start, "%Y-%m-%d")
+        datetime.strptime(end, "%Y-%m-%d")
+    except ValueError:
+        raise HTTPException(400, "start and end must be in YYYY-MM-DD format")
+
+    try:
+        from binance.client import Client
+        from main import FuturesTrader
+        with open(APP_CONFIG_PATH) as f:
+            cfg = json.load(f)
+        client = Client(cfg["api_key"], cfg["secret_key"])
+        trader = FuturesTrader(client, cfg)
+        df = trader.get_historical_data_for_symbol(symbol.upper(), timeframe, start, end)
+        if df is None or df.empty:
+            raise HTTPException(404, f"No data returned for {symbol}")
+
+        total = len(df)
+        # Down-sample evenly if the range exceeds the requested limit.
+        if limit and total > limit:
+            step = max(1, total // limit)
+            df = df.iloc[::step]
+
+        candles = [
+            {
+                "time": idx.isoformat(),
+                "open": float(row["Open"]),
+                "high": float(row["High"]),
+                "low": float(row["Low"]),
+                "close": float(row["Close"]),
+                "volume": float(row["Volume"]),
+            }
+            for idx, row in df.iterrows()
+        ]
+        return {
+            "symbol": symbol.upper(),
+            "timeframe": timeframe,
+            "start": start,
+            "end": end,
+            "total_candles": total,
+            "returned": len(candles),
+            "candles": candles,
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(500, str(e))
 

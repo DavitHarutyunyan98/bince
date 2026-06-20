@@ -37,6 +37,13 @@ export const api = {
   // Pairs
   getUsdtFutures: () => req("/pairs/usdt-futures"),
 
+  // Historical data fetching
+  fetchData: ({ symbol, timeframe, start, end, limit = 500 }) =>
+    req(
+      `/data/fetch?symbol=${encodeURIComponent(symbol)}&timeframe=${encodeURIComponent(timeframe)}` +
+        `&start=${encodeURIComponent(start)}&end=${encodeURIComponent(end)}&limit=${limit}`
+    ),
+
   // Bot (Phase 3)
   getBotStatus: () => req("/bot/status"),
   startBot: () => req("/bot/start", { method: "POST" }),
