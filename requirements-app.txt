@@ -1,0 +1,12 @@
+# Dependencies for the single-process Dash app (main.py).
+# This is all you need to run the dashboard locally — no FastAPI, Redis,
+# worker, or React build required.
+dash>=2.16.0
+plotly>=5.20.0
+python-binance>=1.0.19
+pandas>=2.0.0
+numpy>=1.26.0
+optuna>=3.6.0
+python-telegram-bot>=20.0
+openpyxl>=3.1.0
+numba>=0.59.0

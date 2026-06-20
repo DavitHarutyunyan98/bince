@@ -4268,4 +4268,8 @@ h1, h2, h3, h4 {
         logger.error(f"Failed to connect to Binance API: {e}")
 
     trader = FuturesTrader(client, config)
-    app.run(debug=True, host='127.0.0.1', port=8080)
+    # Host/port configurable via env so the app is reachable remotely.
+    # Defaults to 0.0.0.0:8080 (access via the server IP or a tunnel to 8080).
+    host = os.getenv("APP_HOST", "0.0.0.0")
+    port = int(os.getenv("APP_PORT", "8080"))
+    app.run(debug=False, host=host, port=port)
