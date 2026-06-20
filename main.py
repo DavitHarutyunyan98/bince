@@ -34,6 +34,28 @@ TELEGRAM_CHAT_ID = None
 OPTIMIZATION_STOP_EVENT = threading.Event()
 OPTIMIZATION_PAUSE_EVENT = threading.Event()  # For pausing optimization
 
+
+class _NullEvent:
+    """A picklable, do-nothing stand-in for threading.Event.
+
+    threading.Event holds a thread lock and cannot be pickled, so it cannot be
+    sent to ProcessPoolExecutor workers. Worker processes can't see the parent's
+    in-memory event anyway, so we pass this no-op instead; the parent still
+    enforces stop/pause when collecting results.
+    """
+
+    def is_set(self):
+        return False
+
+    def set(self):
+        pass
+
+    def clear(self):
+        pass
+
+    def wait(self, timeout=None):
+        return False
+
 # Robust annualization factors for Sharpe Ratio calculation across different timeframes
 TIMEFRAME_TO_ANNUALIZATION_FACTOR = {
     '1m': np.sqrt(365 * 24 * 60), '5m': np.sqrt(365 * 24 * 12), '15m': np.sqrt(365 * 24 * 4),
@@ -1546,17 +1568,20 @@ class FuturesTrader:
             optimization_method = self._run_single_optimization_study
             
         # Per-symbol studies are CPU-bound, so a ProcessPoolExecutor uses all
-        # cores for a real speedup. This is safe now that stop/pause events are
-        # _RedisEvent (picklable, cross-process) rather than threading.Event,
-        # which was the original cause of the multiprocessing deadlock. The
-        # 'thread' option remains as a fallback for environments where forking
-        # misbehaves (e.g. some Windows/Numba combinations).
+        # cores for a real speedup. threading.Event holds a thread lock and is
+        # not picklable, so for the process pool we hand workers a picklable
+        # no-op event (they run in separate processes and can't observe the
+        # parent's in-memory event anyway); the parent still enforces stop/pause
+        # when collecting results. The 'thread' option shares memory, so the
+        # real events are passed through and mid-study stop/pause works.
         if executor_type == 'process':
             ExecutorCls = ProcessPoolExecutor
+            worker_stop_event, worker_pause_event = _NullEvent(), _NullEvent()
             add_optimization_log(
                 f"Using ProcessPoolExecutor ({self.max_workers} cores) for parallel optimization.")
         else:
             ExecutorCls = ThreadPoolExecutor
+            worker_stop_event, worker_pause_event = stop_event, pause_event
             add_optimization_log(
                 f"Using ThreadPoolExecutor ({self.max_workers} workers) for parallel optimization.")
 
@@ -1564,7 +1589,7 @@ class FuturesTrader:
             futures = {executor.submit(optimization_method, symbol, data, param_ranges,
                                        selected_params, timeframe, min_trades, n_trials, weights,
                                        is_start_date, is_end_date, oos1_start_date, oos1_end_date, oos2_start_date, oos2_end_date,
-                                       stop_event, pause_event, strategy_name): symbol
+                                       worker_stop_event, worker_pause_event, strategy_name): symbol
                        for symbol, data in pair_data.items()}
             for i, future in enumerate(as_completed(futures), 1):
                 symbol = futures[future]
