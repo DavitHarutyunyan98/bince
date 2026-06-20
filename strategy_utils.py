@@ -134,11 +134,15 @@ class CandlestickStrategy(BaseStrategy):
             'buy_pattern_lookback': {'type': 'number', 'step': 1},
             'sell_signal_window': {'type': 'number', 'step': 1},
             'sell_pattern_lookback': {'type': 'number', 'step': 1},
-            'exit_price_range_percent': {
+            'exit_minus_percent': {
                 'type': 'number', 'step': 0.1,
-                'help': ('exit range in %: close the position when price moves this '
-                         'far from the entry price in either direction. '
-                         'example: 2 → entry at 100 exits if price rises to 102 or falls to 98'),
+                'help': ('lower exit bound in %: close the position if price falls this '
+                         'far below the entry price. example: 2 → entry at 100 exits if price drops to 98'),
+            },
+            'exit_plus_percent': {
+                'type': 'number', 'step': 0.1,
+                'help': ('upper exit bound in %: close the position if price rises this '
+                         'far above the entry price. example: 3 → entry at 100 exits if price rises to 103'),
             },
         }
 
@@ -199,12 +203,16 @@ class CandlestickStrategy(BaseStrategy):
         sell_window = self._require(params, 'sell_signal_window')
         sell_lookback = self._require(params, 'sell_pattern_lookback')
 
-        # Exit range is optional at runtime (e.g. during optimization it is not
-        # supplied); when absent, only opposite-pattern flips close a position.
-        exit_raw = params.get('exit_price_range_percent')
-        exit_pct = None
-        if exit_raw is not None and exit_raw != '':
-            exit_pct = self._require(params, 'exit_price_range_percent', is_float=True)
+        # Exit bounds are optional at runtime; when both are absent, only
+        # opposite-pattern flips close a position. Each bound is independent.
+        minus_raw = params.get('exit_minus_percent')
+        plus_raw = params.get('exit_plus_percent')
+        exit_minus = None
+        exit_plus = None
+        if minus_raw is not None and minus_raw != '':
+            exit_minus = self._require(params, 'exit_minus_percent', is_float=True)
+        if plus_raw is not None and plus_raw != '':
+            exit_plus = self._require(params, 'exit_plus_percent', is_float=True)
 
         buy_raw = (
             df['ThreeWhiteSoldiers'].rolling(window=buy_window).sum() >= buy_lookback
@@ -232,11 +240,12 @@ class CandlestickStrategy(BaseStrategy):
                     pos, entry_price = -1, close[i]
                 elif pos == -1 and buy_raw[i]:
                     pos, entry_price = 1, close[i]
-                # 2) Percent-range exit: close to flat if price leaves the band.
-                elif exit_pct is not None and entry_price > 0:
-                    upper = entry_price * (1 + exit_pct / 100.0)
-                    lower = entry_price * (1 - exit_pct / 100.0)
-                    if close[i] >= upper or close[i] <= lower:
+                # 2) Percent-range exit: close to flat if price leaves the band
+                #    defined by [entry - minus%, entry + plus%].
+                elif entry_price > 0:
+                    hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
+                    hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
+                    if hit_lower or hit_upper:
                         pos, entry_price = 0, 0.0
             positions[i] = pos
 

@@ -680,7 +680,7 @@ class FuturesTrader:
             param_map = {
                 'buy_signal_window': {'is_int': True}, 'buy_pattern_lookback': {'is_int': True},
                 'sell_signal_window': {'is_int': True}, 'sell_pattern_lookback': {'is_int': True},
-                'atr_period': {'is_int': True}, 'atr_multiplier': {'is_int': False}
+                'exit_minus_percent': {'is_int': False}, 'exit_plus_percent': {'is_int': False}
             }
             
             # FIXED: Only process parameters that exist in the current strategy
@@ -699,10 +699,10 @@ class FuturesTrader:
                                 low, high + step / 2, step)]
                     else:
                         # Use default value if range parsing failed
-                        param_values[p_name] = [default_params[p_name]['default']]
+                        param_values[p_name] = [default_params[p_name].get('default')]
                 else:
                     # Use default value for parameters not being optimized
-                    param_values[p_name] = [default_params[p_name]['default']]
+                    param_values[p_name] = [default_params[p_name].get('default')]
             
             # FIXED: Ensure we have at least one parameter to optimize
             if not param_values:
@@ -778,7 +778,7 @@ class FuturesTrader:
             param_map = {
                 'buy_signal_window': {'is_int': True}, 'buy_pattern_lookback': {'is_int': True},
                 'sell_signal_window': {'is_int': True}, 'sell_pattern_lookback': {'is_int': True},
-                'atr_period': {'is_int': True}, 'atr_multiplier': {'is_int': False}
+                'exit_minus_percent': {'is_int': False}, 'exit_plus_percent': {'is_int': False}
             }
             for p_name, p_config in param_map.items():
                 # SAFETY CHECK: Skip parameters not in current strategy
@@ -1205,7 +1205,7 @@ class FuturesTrader:
             param_map = {
                 'buy_signal_window': {'is_int': True}, 'buy_pattern_lookback': {'is_int': True},
                 'sell_signal_window': {'is_int': True}, 'sell_pattern_lookback': {'is_int': True},
-                'atr_period': {'is_int': True}, 'atr_multiplier': {'is_int': False}
+                'exit_minus_percent': {'is_int': False}, 'exit_plus_percent': {'is_int': False}
             }
             
             for p_name, p_config in param_map.items():
@@ -1220,9 +1220,9 @@ class FuturesTrader:
                             choices = [round(v, 4) for v in np.arange(low, high + step / 2, step)]
                             params[p_name] = trial.suggest_categorical(p_name, choices)
                     else:
-                        params[p_name] = default_params[p_name]['default']
+                        params[p_name] = default_params[p_name].get('default')
                 else:
-                    params[p_name] = default_params[p_name]['default']
+                    params[p_name] = default_params[p_name].get('default')
 
             # Check for duplicate combinations in smart sampling
             param_key = tuple(sorted(params.items()))
@@ -1781,14 +1781,13 @@ def build_optimizer_panel():
                                       'value': 'sell_signal_window'},
                                   {'label': 'Sell Pattern Lookback',
                                       'value': 'sell_pattern_lookback'},
-                                  {'label': 'ATR Period',
-                                      'value': 'atr_period'},
-                                  {'label': 'ATR Multiplier',
-                                      'value': 'atr_multiplier'},
-                                  # SL/TP removed
+                                  {'label': 'Exit Minus %',
+                                      'value': 'exit_minus_percent'},
+                                  {'label': 'Exit Plus %',
+                                      'value': 'exit_plus_percent'},
                               ],
                               value=['buy_signal_window', 'buy_pattern_lookback', 'sell_signal_window',
-                                     'sell_pattern_lookback'],
+                                     'sell_pattern_lookback', 'exit_minus_percent', 'exit_plus_percent'],
                               inline=True,
                               className='responsive-checklist',
                               style={'marginBottom': '15px'}
@@ -1810,16 +1809,12 @@ def build_optimizer_panel():
                           dcc.Input(id='sell-window-range', placeholder='Sell Window (e.g. 5,15,2)',
                                     className='custom-input'),
                           dcc.Input(id='sell-lookback-range', placeholder='Sell Lookback (e.g. 2,5,1)',
+                                    className='custom-input'),
+                          dcc.Input(id='exit-minus-range', placeholder='Exit Minus % (e.g. 1.0,5.0,0.5)',
+                                    className='custom-input'),
+                          dcc.Input(id='exit-plus-range', placeholder='Exit Plus % (e.g. 1.0,5.0,0.5)',
                                     className='custom-input')],
                                id='candlestick-params-container', className='responsive-grid'),
-                      # ATR SuperTrend Parameters Container
-                      html.Div([
-                          dcc.Input(id='atr-period-range', placeholder='ATR Period (e.g. 7,14,1)',
-                                    className='custom-input'),
-                          dcc.Input(id='atr-multiplier-range', placeholder='ATR Mult (e.g. 1.0,4.0,0.5)',
-                                    className='custom-input')],
-                               id='atr-params-container', className='responsive-grid', style={'display': 'none'}),
-                      # SL/TP inputs removed
                       ], className='control-panel-group'),
             # Post-exit actions removed (no SL/TP)
             html.Div([html.H4("Run Settings"), html.Div([html.Div(
@@ -2629,7 +2624,7 @@ def refine_pairs_for_next_run(n_clicks, all_trials_data, sort_by, top_n):
 @app.callback(
     [Output('buy-window-range', 'value'), Output('buy-lookback-range', 'value'),
      Output('sell-window-range', 'value'), Output('sell-lookback-range', 'value'),
-     Output('atr-period-range', 'value'), Output('atr-multiplier-range', 'value')],
+     Output('exit-minus-range', 'value'), Output('exit-plus-range', 'value')],
     [Input('preset-fast-btn', 'n_clicks'), Input('preset-normal-btn', 'n_clicks'),
      Input('preset-deep-btn', 'n_clicks')],
     prevent_initial_call=True
@@ -2638,11 +2633,11 @@ def set_parameter_presets(fast, normal, deep):
     ctx = callback_context
     button_id = ctx.triggered[0]['prop_id'].split('.')[0]
     if button_id == 'preset-fast-btn':
-        return '5,10,5', '2,3,1', '5,10,5', '2,3,1', '10,20,2', '2.0,4.0,0.5'
+        return '5,10,5', '2,3,1', '5,10,5', '2,3,1', '1.0,3.0,1.0', '1.0,3.0,1.0'
     if button_id == 'preset-normal-btn':
-        return '5,15,2', '2,5,1', '5,15,2', '2,5,1', '10,30,2', '3.0,6.0,0.5'
+        return '5,15,2', '2,5,1', '5,15,2', '2,5,1', '1.0,5.0,0.5', '1.0,5.0,0.5'
     if button_id == 'preset-deep-btn':
-        return '3,20,1', '1,5,1', '3,20,1', '1,5,1', '5,20,1', '1.0,4.0,0.25'
+        return '3,20,1', '1,5,1', '3,20,1', '1,5,1', '0.5,5.0,0.25', '0.5,5.0,0.25'
     return [no_update] * 6
 
 
@@ -2660,59 +2655,20 @@ def toggle_trade_ratio_input(checkbox_value):
 # Dynamic parameter visibility callback
 @app.callback(
     [Output('candlestick-params-container', 'style'),
-     Output('atr-params-container', 'style'),
      Output('param-selection-checklist', 'options'),
      Output('param-selection-checklist', 'value')],
     Input('optimizer-strategy-selector', 'value'),
     prevent_initial_call=True
 )
 def update_optimizer_parameter_visibility(selected_strategy):
-    """Show/hide parameter containers and update checklist based on selected strategy."""
-    if not selected_strategy:
-        # Default to Candlestick if no strategy selected
-        return (
-            {'display': 'block'},  # Show candlestick params
-            {'display': 'none'},   # Hide ATR params
-            [
-                {'label': 'Buy Signal Window', 'value': 'buy_signal_window'},
-                {'label': 'Buy Pattern Lookback', 'value': 'buy_pattern_lookback'},
-                {'label': 'Sell Signal Window', 'value': 'sell_signal_window'},
-                {'label': 'Sell Pattern Lookback', 'value': 'sell_pattern_lookback'},
-            ],
-            ['buy_signal_window', 'buy_pattern_lookback', 'sell_signal_window', 'sell_pattern_lookback']
-        )
-    
-    # Get strategy class and its parameters
-    strategy_class = STRATEGY_REGISTRY.get(selected_strategy)
-    if not strategy_class:
-        # Fallback to default
-        return (
-            {'display': 'block'},
-            {'display': 'none'},
-            [
-                {'label': 'Buy Signal Window', 'value': 'buy_signal_window'},
-                {'label': 'Buy Pattern Lookback', 'value': 'buy_pattern_lookback'},
-                {'label': 'Sell Signal Window', 'value': 'sell_signal_window'},
-                {'label': 'Sell Pattern Lookback', 'value': 'sell_pattern_lookback'},
-            ],
-            ['buy_signal_window', 'buy_pattern_lookback', 'sell_signal_window', 'sell_pattern_lookback']
-        )
-    
-    strategy_params = strategy_class.get_parameters()
-    param_keys = list(strategy_params.keys())
-    
-    # Create checklist options based on strategy parameters
-    checklist_options = []
-    default_values = []
-    
-    # Map parameter names to display labels
+    """Update the optimizable-parameter checklist based on the selected strategy."""
     param_labels = {
         'buy_signal_window': 'Buy Signal Window',
-        'buy_pattern_lookback': 'Buy Pattern Lookback', 
+        'buy_pattern_lookback': 'Buy Pattern Lookback',
         'sell_signal_window': 'Sell Signal Window',
         'sell_pattern_lookback': 'Sell Pattern Lookback',
-        'atr_period': 'ATR Period',
-        'atr_multiplier': 'ATR Multiplier',
+        'exit_minus_percent': 'Exit Minus %',
+        'exit_plus_percent': 'Exit Plus %',
         'rsi_period': 'RSI Period',
         'oversold_threshold': 'Oversold Threshold',
         'overbought_threshold': 'Overbought Threshold',
@@ -2721,20 +2677,20 @@ def update_optimizer_parameter_visibility(selected_strategy):
         'slow_ma_period': 'Slow MA Period',
         'ma_type': 'MA Type'
     }
-    
+
+    strategy_class = STRATEGY_REGISTRY.get(selected_strategy) if selected_strategy else None
+    if not strategy_class:
+        strategy_class = CandlestickStrategy
+    param_keys = list(strategy_class.get_parameters().keys())
+
+    checklist_options = []
+    default_values = []
     for param_key in param_keys:
         label = param_labels.get(param_key, param_key.replace('_', ' ').title())
         checklist_options.append({'label': label, 'value': param_key})
         default_values.append(param_key)
-    
-    # Determine container visibility
-    has_candlestick_params = any(p in param_keys for p in ['buy_signal_window', 'buy_pattern_lookback', 'sell_signal_window', 'sell_pattern_lookback'])
-    has_atr_params = any(p in param_keys for p in ['atr_period', 'atr_multiplier'])
-    
-    candlestick_style = {'display': 'block'} if has_candlestick_params else {'display': 'none'}
-    atr_style = {'display': 'block'} if has_atr_params else {'display': 'none'}
-    
-    return candlestick_style, atr_style, checklist_options, default_values
+
+    return {'display': 'block'}, checklist_options, default_values
 
 
 # Best results priority callback
@@ -2910,8 +2866,8 @@ def toggle_opt_buttons(status):
      State('buy-lookback-range', 'value'),                      # bl_str
      State('sell-window-range', 'value'),                       # sw_str
      State('sell-lookback-range', 'value'),                     # slr_str
-     State('atr-period-range', 'value'),                        # atr_period_str
-     State('atr-multiplier-range', 'value'),                    # atr_mult_str
+     State('exit-minus-range', 'value'),                        # exit_minus_str
+     State('exit-plus-range', 'value'),                         # exit_plus_str
      State('max-combinations-input', 'value'),                  # n_trials
      State('min-trades-input', 'value'),                        # min_trades
      State('min-candles-input', 'value'),                       # min_candles
@@ -2932,7 +2888,7 @@ def toggle_opt_buttons(status):
     prevent_initial_call=True
 )
 def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str, sw_str, slr_str, 
-                               atr_period_str, atr_mult_str, n_trials, min_trades, min_candles, 
+                               exit_minus_str, exit_plus_str, n_trials, min_trades, min_candles,
                                strategy_name, timeframe, is_start, is_end, oos1_start, oos1_end, 
                                oos2_start, oos2_end, weight_return, weight_winrate, weight_trades,
                                optimization_mode,
@@ -3021,7 +2977,7 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
         
         settings = {
             'pairs': valid_pairs, 'selected_params': selected_params, 'bw_str': bw_str, 'bl_str': bl_str,
-            'sw_str': sw_str, 'slr_str': slr_str, 'atr_period_str': atr_period_str, 'atr_mult_str': atr_mult_str, 'n_trials': int(n_trials),
+            'sw_str': sw_str, 'slr_str': slr_str, 'exit_minus_str': exit_minus_str, 'exit_plus_str': exit_plus_str, 'n_trials': int(n_trials),
             'min_trades': int(min_trades), 'min_candles': min_candles_val, 'strategy_name': strategy_name, 'timeframe': timeframe,
             'is_start': is_start, 'is_end': is_end, 
             'oos1_start': oos1_start, 'oos1_end': oos1_end, 'oos2_start': oos2_start, 'oos2_end': oos2_end,
@@ -3069,7 +3025,7 @@ def run_optimization_task(n_intervals, settings):
         param_ranges = {
             'buy_signal_window': settings['bw_str'], 'buy_pattern_lookback': settings['bl_str'],
             'sell_signal_window': settings['sw_str'], 'sell_pattern_lookback': settings['slr_str'],
-            'atr_period': settings['atr_period_str'], 'atr_multiplier': settings['atr_mult_str'],
+            'exit_minus_percent': settings['exit_minus_str'], 'exit_plus_percent': settings['exit_plus_str'],
         }
         weights = {
             'total_return': settings['weight_return'] or 0,
