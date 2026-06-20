@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { api } from "../api/client.js";
+import { api, logEvent } from "../api/client.js";
 
 const TIMEFRAMES = ["1m", "5m", "15m", "30m", "1h", "4h", "1d"];
 
@@ -23,17 +23,21 @@ export default function DataFetcher() {
     setError(null);
     setLoading(true);
     setData(null);
+    const sym = form.symbol.trim().toUpperCase();
+    logEvent("info", `Fetching ${sym} ${form.timeframe} candles ${form.start} → ${form.end}…`);
     try {
       const r = await api.fetchData({
-        symbol: form.symbol.trim().toUpperCase(),
+        symbol: sym,
         timeframe: form.timeframe,
         start: form.start,
         end: form.end,
         limit: Number(form.limit),
       });
       setData(r);
+      logEvent("success", `Fetched ${r.total_candles} ${sym} candles (showing ${r.returned}).`);
     } catch (e) {
       setError(e.message);
+      logEvent("error", `Data fetch failed for ${sym}: ${e.message}`);
     } finally {
       setLoading(false);
     }

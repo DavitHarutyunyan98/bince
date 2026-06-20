@@ -4,6 +4,7 @@ import ResultsTable from "./components/ResultsTable.jsx";
 import ConfigEditor from "./components/ConfigEditor.jsx";
 import BotControl from "./components/BotControl.jsx";
 import DataFetcher from "./components/DataFetcher.jsx";
+import Console from "./components/Console.jsx";
 
 const TABS = [
   { id: "optimizer", label: "Optimizer" },
@@ -44,6 +45,8 @@ export default function App() {
       )}
       {tab === "config" && <ConfigEditor />}
       {tab === "bot" && <BotControl />}
+
+      <Console />
     </div>
   );
 }
