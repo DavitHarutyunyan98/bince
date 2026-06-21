@@ -136,13 +136,13 @@ class CandlestickStrategy(BaseStrategy):
             'sell_pattern_lookback': {'type': 'number', 'step': 1},
             'exit_minus_percent': {
                 'type': 'number', 'step': 0.1,
-                'help': ('lower exit bound in %: close the position if price falls this '
-                         'far below the entry price. example: 2 → entry at 100 exits if price drops to 98'),
+                'help': ('lower exit bound in %: exit when the close price falls this far '
+                         'below the entry candle open price. example: 2 → open 100 exits if close ≤ 98'),
             },
             'exit_plus_percent': {
                 'type': 'number', 'step': 0.1,
-                'help': ('upper exit bound in %: close the position if price rises this '
-                         'far above the entry price. example: 3 → entry at 100 exits if price rises to 103'),
+                'help': ('upper exit bound in %: exit when the close price rises this far '
+                         'above the entry candle open price. example: 3 → open 100 exits if close ≥ 103'),
             },
         }
 
@@ -220,28 +220,30 @@ class CandlestickStrategy(BaseStrategy):
         sell_raw = (
             df['ThreeBlackCrows'].rolling(window=sell_window).sum() >= sell_lookback
         ).to_numpy()
+        open_ = df['Open'].to_numpy()
         close = df['Close'].to_numpy()
 
         n = len(df)
         positions = np.zeros(n, dtype=int)
         pos = 0
-        entry_price = 0.0
+        entry_price = 0.0  # reference = OPEN price of the candle the position opened
 
         for i in range(n):
             if pos == 0:
-                # Look for a fresh entry.
+                # Look for a fresh entry (reference = this candle's OPEN).
                 if buy_raw[i]:
-                    pos, entry_price = 1, close[i]
+                    pos, entry_price = 1, open_[i]
                 elif sell_raw[i]:
-                    pos, entry_price = -1, close[i]
+                    pos, entry_price = -1, open_[i]
             else:
                 # 1) Opposite pattern flips the position.
                 if pos == 1 and sell_raw[i]:
-                    pos, entry_price = -1, close[i]
+                    pos, entry_price = -1, open_[i]
                 elif pos == -1 and buy_raw[i]:
-                    pos, entry_price = 1, close[i]
-                # 2) Percent-range exit: close to flat if price leaves the band
-                #    defined by [entry - minus%, entry + plus%].
+                    pos, entry_price = 1, open_[i]
+                # 2) Percent-range exit: compare the entry OPEN price with the
+                #    current CLOSE; exit to flat if CLOSE crosses the band
+                #    [open - minus%, open + plus%].
                 elif entry_price > 0:
                     hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
                     hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
@@ -424,7 +426,7 @@ STRATEGY_REGISTRY = {
 
 
 # ==============================================================================
-#  4. BACKTESTER CLASS (UNCHANGED)
+#  4. BACKTESTER CLASS (fixed initial-capital sizing, no compounding)
 # ==============================================================================
 class Backtester:
     """Handles the logic for running a backtest on historical data with trading signals."""
@@ -446,28 +448,27 @@ class Backtester:
 
         self.trades = []
         self.portfolio_value = []
-        capital = self.initial_capital
+        capital = self.initial_capital   # running realized equity
+        # Fixed per-trade size: every trade is sized off the INITIAL capital,
+        # not the result of the previous trade (no compounding).
+        base = self.initial_capital
         position = 0
         entry_price = 0
         entry_date = None
-        capital_at_entry = 0
-        
+
         # Convert to list for index-based access
         df_list = list(df_with_signals.itertuples())
-        
+
         for i, row in enumerate(df_list):
             date = row.Index  # Get the date from the index
             current_price = row.Close  # Access using dot notation
             current_signal = getattr(row, 'position', 0)  # Safe access to position column
 
-            # Calculate portfolio value
+            # Portfolio value = realized equity + unrealized PnL on the fixed base
             if position == 1:
-                portfolio_val = capital_at_entry * \
-                    (current_price / entry_price)
+                portfolio_val = capital + (base * (current_price / entry_price) - base)
             elif position == -1:
-                portfolio_val = capital_at_entry * (
-                    1 + (entry_price - current_price) / entry_price
-                )
+                portfolio_val = capital + (base * (1 + (entry_price - current_price) / entry_price) - base)
             else:
                 portfolio_val = capital
             self.portfolio_value.append({
@@ -500,20 +501,16 @@ class Backtester:
                         exit_date = date
                     
                     if position == 1:
-                        position_value = capital_at_entry * \
-                            (exit_price / entry_price)
+                        position_value = base * (exit_price / entry_price)
                     else:
-                        position_value = capital_at_entry * (
+                        position_value = base * (
                             1 + (entry_price - exit_price) / entry_price
                         )
 
                     fee = self.calculate_trading_fee(position_value)
-                    new_capital = position_value - fee
-                    pnl = new_capital - capital_at_entry
-                    pnl_percent = (
-                        (pnl / capital_at_entry) *
-                        100 if capital_at_entry > 0 else 0
-                    )
+                    net_value = position_value - fee
+                    pnl = net_value - base
+                    pnl_percent = (pnl / base) * 100 if base > 0 else 0
 
                     self.trades.append({
                         'Entry_Date': entry_date,
@@ -525,7 +522,7 @@ class Backtester:
                         'PnL %': pnl_percent,
                         'Exit_Reason': exit_reason
                     })
-                    capital = new_capital
+                    capital = capital + pnl  # accumulate realized PnL (linear)
                     position = 0
 
             # Check for new position entries - FIXED: Next-candle execution
@@ -538,7 +535,6 @@ class Backtester:
                         position = current_signal
                         entry_price = getattr(next_row, 'Open', next_row.Close)  # Use next candle's OPEN price
                         entry_date = next_row.Index  # Use next candle's timestamp
-                        capital_at_entry = capital
                     # If no next candle available, skip the trade (edge case handling)
 
         # Close any open position at the end of the data
@@ -548,17 +544,16 @@ class Backtester:
             exit_date = last_row.name
             exit_reason = 'End of Data'
             if position == 1:
-                position_value = capital_at_entry * (exit_price / entry_price)
+                position_value = base * (exit_price / entry_price)
             else:
-                position_value = capital_at_entry * (
+                position_value = base * (
                     1 + (entry_price - exit_price) / entry_price
                 )
             fee = self.calculate_trading_fee(position_value)
-            new_capital = position_value - fee
-            pnl = new_capital - capital_at_entry
-            pnl_percent = (
-                (pnl / capital_at_entry) * 100 if capital_at_entry > 0 else 0
-            )
+            net_value = position_value - fee
+            pnl = net_value - base
+            pnl_percent = (pnl / base) * 100 if base > 0 else 0
+            capital = capital + pnl
             pos_type = 'Long' if position == 1 else 'Short'
             self.trades.append({
                 'Entry_Date': entry_date,
