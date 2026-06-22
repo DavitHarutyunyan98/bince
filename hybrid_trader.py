@@ -16,6 +16,30 @@ from datetime import datetime, timezone, timedelta
 from binance.client import Client
 from strategy_utils import STRATEGY_REGISTRY
 
+# Persisted reference equity for compounding. Captured once (the first time the
+# bot ever sizes a compound trade) and reused across restarts, so position size
+# genuinely scales with account growth instead of resetting to "fixed" on every
+# restart.
+COMPOUND_STATE_FILE = "compound_state.json"
+
+
+def load_compound_reference():
+    try:
+        with open(COMPOUND_STATE_FILE) as f:
+            val = float(json.load(f).get("reference_equity", 0) or 0)
+            return val if val > 0 else None
+    except Exception:
+        return None
+
+
+def save_compound_reference(value):
+    try:
+        with open(COMPOUND_STATE_FILE, "w") as f:
+            json.dump({"reference_equity": float(value)}, f)
+    except Exception:
+        pass
+
+
 # Setup logging
 
 
@@ -437,7 +461,9 @@ class HybridSymbolTrader:
                 f"[HYBRID] <b>{pos_type} Position Opened</b>\n\n"
                 f"<b>Symbol:</b> <code>{self.symbol}</code>\n"
                 f"<b>Entry Price:</b> <code>{self.entry_price:.{self.price_precision}f}</code>\n"
-                f"<b>Position Size:</b> <code>{quantity:.{self.quantity_precision}f}</code>\n"
+                f"<b>Position Size:</b> <code>{quantity:.{self.quantity_precision}f}</code> "
+                f"(<code>{quantity * self.current_price:.2f} USDT</code>)\n"
+                f"<b>Sizing:</b> <code>{self.sizing_mode}</code>\n"
                 f"<b>Method:</b> <code>REST API Polling</code>"
             )
 
@@ -506,29 +532,42 @@ class HybridSymbolTrader:
             logger.warning(f"[{self.symbol}] Could not fetch account equity: {e}")
         return None
 
-    def _get_trade_quantity(self):
-        """Calculate trade quantity.
+    def _get_effective_units(self):
+        """USDT notional to use for the next entry. Fixed = units_usdt as-is.
+        Compound = units_usdt scaled by current equity / persisted reference."""
+        if self.sizing_mode != 'compound':
+            return self.units_usdt
+        equity = self._get_account_equity()
+        if not equity or equity <= 0:
+            return self.units_usdt
+        ref = load_compound_reference()
+        if ref is None or ref <= 0:
+            ref = equity
+            save_compound_reference(ref)
+            logger.info(f"[{self.symbol}] Compounding reference equity set: {ref:.2f} USDT")
+        return self.units_usdt * (equity / ref)
 
-        Fixed: constant `units_usdt` notional. Compounding: scale the notional
-        by current equity / baseline equity so position size grows (or shrinks)
-        with the account, matching the compounding backtest.
-        """
+    def _get_trade_quantity(self):
+        """Calculate trade quantity from the effective USDT notional."""
         try:
             if self.current_price <= 0:
                 return None
-            effective_units = self.units_usdt
-            if self.sizing_mode == 'compound':
-                equity = self._get_account_equity()
-                if equity and equity > 0:
-                    if self.base_equity is None:
-                        self.base_equity = equity
-                        logger.info(f"[{self.symbol}] Compounding baseline equity: {equity:.2f} USDT")
-                    effective_units = self.units_usdt * (equity / self.base_equity)
+            effective_units = self._get_effective_units()
             quantity = effective_units / self.current_price
             return float(f"{quantity:.{self.quantity_precision}f}")
         except Exception as e:
             logger.error(f"[{self.symbol}] Error calculating quantity: {e}")
             return None
+
+    def get_position_notional_usdt(self):
+        """Current open position size expressed in USDT (size * price)."""
+        try:
+            size = self._get_position_size()
+            if size and size > 0 and self.current_price > 0:
+                return size * self.current_price
+        except Exception:
+            pass
+        return 0.0
 
     def _get_position_size(self):
         """Get current position size."""
@@ -705,7 +744,9 @@ class HybridSymbolTrader:
                             f"[HYBRID] <b>{pos_type} Position Opened</b>\n\n"
                             f"<b>Symbol:</b> <code>{self.symbol}</code>\n"
                             f"<b>Entry Price:</b> <code>{self.entry_price:.{self.price_precision}f}</code>\n"
-                            f"<b>Position Size:</b> <code>{quantity:.{self.quantity_precision}f}</code>\n"
+                            f"<b>Position Size:</b> <code>{quantity:.{self.quantity_precision}f}</code> "
+                            f"(<code>{quantity * self.current_price:.2f} USDT</code>)\n"
+                            f"<b>Sizing:</b> <code>{self.sizing_mode}</code>\n"
                             f"<b>Method:</b> <code>REST API Polling</code>\n"
                             f"<b>Attempt:</b> <code>{attempt + 1}/{max_retries}</code>"
                         )
@@ -885,8 +926,12 @@ class HybridTraderManager:
                 fix_info = f" | Fixes: {trader.position_fix_count}" if trader.position_fix_count > 0 else ""
                 miss_info = f" | Misses: {trader.consecutive_missing_positions}" if trader.consecutive_missing_positions > 0 else ""
                 
+                # Open position size in USDT (notional)
+                notional_usdt = trader.get_position_notional_usdt() if trader.position != 0 else 0.0
+
                 pair_report = (
                     f"{status_icon} {symbol}: {position_type} | Signal: {signal:+.1f} | "
+                    f"Size: {notional_usdt:.2f} USDT | "
                     f"PnL: {unrealized_pnl:+.2f} | Trades: {trader.session_trades}{fix_info}{miss_info}\n"
                     f"└─ Strategy: {trader.trade_config.get('strategy_name', 'Unknown')} | "
                     f"Params: {params_str}"
@@ -909,11 +954,22 @@ class HybridTraderManager:
             for pair_report in pair_reports:
                 report_lines.append(pair_report)
 
+            # Futures wallet balance (account-wide)
+            futures_balance = 0.0
+            try:
+                for b in self.client.futures_account_balance():
+                    if b.get('asset') == 'USDT':
+                        futures_balance = float(b.get('balance', 0.0))
+                        break
+            except Exception as e:
+                logger.warning(f"[BOT] Could not fetch futures balance: {e}")
+
             # Add session summary
             report_lines.extend([
                 "",
                 "📈 Session Summary:",
                 f"Active Positions: {active_positions}/{len(self.traders)}",
+                f"Futures Balance: {futures_balance:.2f} USDT",
                 f"Total Unrealized PnL: {total_unrealized_pnl:+.2f} USDT",
                 f"Total Session PnL: {total_session_pnl:+.2f} USDT",
                 f"Total Trades: {total_trades}"
