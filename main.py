@@ -2076,6 +2076,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
     # Hidden no-op outputs for clientside "scroll to results" callbacks.
     html.Div(id='scroll-backtest-dummy', style={'display': 'none'}),
     html.Div(id='scroll-optimizer-dummy', style={'display': 'none'}),
+    html.Div(id='scroll-optrow-dummy', style={'display': 'none'}),
 
     html.Div([
         html.H2("Futures Dashboard", style={'margin': '0', 'flex': '1'}),
@@ -2410,7 +2411,146 @@ def run_backtest_callback(n_clicks, capital, strategy_name, param_values, param_
     return fig, trades_data, trades_cols, style_data_conditional, summary_text, trades_data
 
 
-# --- Live Config and Optimizer Callbacks ---
+# --- Click an Optimization Results row -> run a manual-style backtest ---
+def _build_price_signal_figure(df, title):
+    """Candlestick chart with buy/sell + pattern markers (same look as manual)."""
+    fig = go.Figure(data=[go.Candlestick(
+        x=df.index, open=df['Open'], high=df['High'], low=df['Low'],
+        close=df['Close'], name='Candlestick')])
+    if 'position' in df.columns:
+        buy = df[df['position'] == 1]
+        sell = df[df['position'] == -1]
+        fig.add_trace(go.Scatter(x=buy.index, y=buy['Low'], mode='markers',
+                                 marker=dict(color='cyan', size=10, symbol='triangle-up'), name='Buy Signal'))
+        fig.add_trace(go.Scatter(x=sell.index, y=sell['High'], mode='markers',
+                                 marker=dict(color='yellow', size=10, symbol='triangle-down'), name='Sell Signal'))
+    if 'ThreeWhiteSoldiers' in df.columns:
+        tws = df[df['ThreeWhiteSoldiers'] == 1]
+        if not tws.empty:
+            fig.add_trace(go.Scatter(x=tws.index, y=tws['Close'], mode='markers',
+                                     marker=dict(color='lime', size=13, symbol='circle'), name='Three White Soldiers'))
+    if 'ThreeBlackCrows' in df.columns:
+        tbc = df[df['ThreeBlackCrows'] == 1]
+        if not tbc.empty:
+            fig.add_trace(go.Scatter(x=tbc.index, y=tbc['Close'], mode='markers',
+                                     marker=dict(color='red', size=13, symbol='circle'), name='Three Black Crows'))
+    fig.update_layout(title=title, template='plotly_dark', xaxis_rangeslider_visible=False)
+    return fig
+
+
+def _build_portfolio_figure_and_trades(trades_df, portfolio_df):
+    """Portfolio equity curve + trade markers, and the trades-table data/columns."""
+    fig = go.Figure()
+    if portfolio_df is not None and not portfolio_df.empty:
+        fig.add_trace(go.Scatter(x=portfolio_df['Date'], y=portfolio_df['Portfolio_Value'],
+                                 mode='lines', name='Portfolio Value', line=dict(color='#00BFFF', width=2)))
+        if trades_df is not None and not trades_df.empty:
+            for col, sym, color, label in [('Entry_Date', 'triangle-up', '#4CAF50', 'Trade Entry'),
+                                           ('Exit_Date', 'triangle-down', '#F44336', 'Trade Exit')]:
+                dates = pd.to_datetime(trades_df[col])
+                vals = [portfolio_df.loc[portfolio_df['Date'].sub(d).abs().idxmin(), 'Portfolio_Value'] for d in dates]
+                fig.add_trace(go.Scatter(x=dates, y=vals, mode='markers', name=label,
+                                         marker=dict(symbol=sym, size=10, color=color, line=dict(width=2, color='white'))))
+    fig.update_layout(title='Portfolio Value Over Time with Trade Markers', template='plotly_dark',
+                      xaxis_title='Date', yaxis_title='Portfolio Value ($)', hovermode='x unified',
+                      legend=dict(x=0.02, y=0.98))
+    trades_data, trades_cols = [], []
+    if trades_df is not None and not trades_df.empty:
+        disp = trades_df.copy()
+        for col in ['Entry_Date', 'Exit_Date']:
+            disp[col] = pd.to_datetime(disp[col]).dt.strftime('%Y-%m-%d %H:%M')
+        trades_data = disp.to_dict('records')
+        trades_cols = [{"name": i, "id": i} for i in disp.columns]
+    style = [
+        {'if': {'column_id': 'PnL', 'filter_query': '{PnL} > 0'}, 'backgroundColor': '#1e5631', 'color': '#4caf50', 'fontWeight': 'bold'},
+        {'if': {'column_id': 'PnL', 'filter_query': '{PnL} < 0'}, 'backgroundColor': '#5c1e1e', 'color': '#f44336', 'fontWeight': 'bold'},
+    ]
+    return fig, trades_data, trades_cols, style
+
+
+@app.callback(
+    [Output('crypto-candlestick-graph', 'figure', allow_duplicate=True),
+     Output('portfolio-graph', 'figure', allow_duplicate=True),
+     Output('trades-table', 'data', allow_duplicate=True),
+     Output('trades-table', 'columns', allow_duplicate=True),
+     Output('trades-table', 'style_data_conditional', allow_duplicate=True),
+     Output('backtest-summary', 'children', allow_duplicate=True),
+     Output('symbol-input', 'value', allow_duplicate=True),
+     Output('timeframe-input', 'value', allow_duplicate=True),
+     Output('strategy-selector-dropdown', 'value', allow_duplicate=True),
+     Output('applied-params-store', 'data', allow_duplicate=True)],
+    Input('opt-results-table', 'active_cell'),
+    [State('opt-results-table', 'derived_viewport_data'),
+     State('date-range-start', 'value'), State('date-range-end', 'value'),
+     State('capital-input', 'value')],
+    prevent_initial_call=True
+)
+def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, capital):
+    no = no_update
+    blank = (no,) * 10
+    if not active_cell or not table_data or trader is None:
+        return blank
+    try:
+        row = table_data[active_cell['row']]
+    except (KeyError, IndexError, TypeError):
+        return blank
+
+    pair = row.get('Trading_Pair')
+    timeframe = row.get('Timeframe') or '1h'
+    if not pair:
+        return blank
+
+    # The optimizer only produces Candlestick results now; map the row's
+    # Title_Case parameter columns back to the strategy's parameter keys.
+    strategy_name = "Candlestick Patterns"
+    strategy_class = STRATEGY_REGISTRY.get(strategy_name)
+    params = {}
+    for key in strategy_class.get_parameters():
+        col = key.replace('_', ' ').title().replace(' ', '_')
+        if col in row and row[col] not in (None, ''):
+            params[key] = row[col]
+
+    add_optimization_log(f"Backtesting {pair} ({timeframe}) from optimization results: {params}")
+    cap = float(capital) if capital else 10000.0
+
+    data = trader.get_historical_data(pair, timeframe, start_date, end_date)
+    if data is None or data.empty:
+        return (go.Figure().update_layout(title=f"No data for {pair}", template='plotly_dark'),
+                no, no, no, no, f"No data could be loaded for {pair}.", pair, timeframe, strategy_name, params)
+
+    df = strategy_class().generate_signals(data.copy(), params)
+    trades_df, portfolio_df = Backtester(initial_capital=cap).run_backtest(df)
+
+    price_fig = _build_price_signal_figure(df, f"{pair} Chart ({timeframe})")
+    pf_fig, trades_data, trades_cols, style = _build_portfolio_figure_and_trades(trades_df, portfolio_df)
+
+    summary = "No trades executed."
+    if portfolio_df is not None and not portfolio_df.empty and trades_df is not None and not trades_df.empty:
+        total_return = (portfolio_df['Portfolio_Value'].iloc[-1] / cap - 1) * 100
+        summary = f"{pair}: Total Return: {total_return:.2f}% ({len(trades_df)} trades)"
+
+    return (price_fig, pf_fig, trades_data, trades_cols, style, summary,
+            pair, timeframe, strategy_name, params)
+
+
+# Scroll to the backtest results when an optimization row is clicked.
+app.clientside_callback(
+    """
+    function(cell) {
+        if (cell) {
+            const el = document.getElementById('manual-results-section');
+            if (el) { el.scrollIntoView({behavior: 'smooth', block: 'start'}); }
+        }
+        return '';
+    }
+    """,
+    Output('scroll-optrow-dummy', 'children'),
+    Input('opt-results-table', 'active_cell'),
+    prevent_initial_call=True,
+)
+
+
+
 @app.callback(
     Output('save-config-confirmation', 'children'),
     Input('save-config-button', 'n_clicks'),
