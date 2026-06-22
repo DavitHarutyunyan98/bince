@@ -127,6 +127,57 @@ def compute_split_metrics(trades_df, portfolio_df, start, end, n_splits):
     return records
 
 
+def segment_consistency_score(seg_returns):
+    """Robustness score from per-segment returns: % of segments positive,
+    penalized by the magnitude of the worst (most negative) segment.
+    Returns a 0-100 value (higher = more consistent)."""
+    seg_returns = [r for r in seg_returns if r is not None]
+    if not seg_returns:
+        return 0.0
+    pct_positive = sum(1 for r in seg_returns if r > 0) / len(seg_returns) * 100
+    worst = min(seg_returns)
+    penalty = max(0.0, -worst)  # only negative segments are penalized
+    return round(max(0.0, pct_positive - penalty), 2)
+
+
+def _result_col(param_key):
+    """Map a snake_case strategy param to its Title_Case results-table column."""
+    return param_key.replace('_', ' ').title().replace(' ', '_')
+
+
+def _build_pair_trade_config(row, timeframe, units_usdt, leverage):
+    """Build a complete trade_config entry for one optimization-result row.
+
+    Derives the strategy generically from STRATEGY_REGISTRY so that EVERY
+    configured strategy parameter (e.g. exit_minus_percent / exit_plus_percent
+    for Candlestick) is exported — not just a hardcoded subset.
+    """
+    import pandas as pd
+    chosen_name, chosen_cls, chosen_keys = None, None, []
+    for sname, scls in STRATEGY_REGISTRY.items():
+        keys = list(scls.get_parameters().keys())
+        if keys and all(_result_col(k) in row.index and pd.notna(row[_result_col(k)]) for k in keys):
+            chosen_name, chosen_cls, chosen_keys = sname, scls, keys
+            break
+
+    config = {
+        "enabled": True,
+        "strategy_name": chosen_name or row.get('Strategy', 'Candlestick Patterns'),
+        "symbol": row['Trading_Pair'],
+        "bar_length": timeframe,
+        "units_usdt": float(units_usdt),
+        "leverage": int(leverage),
+    }
+    if chosen_cls is not None:
+        specs = chosen_cls.get_parameters()
+        for k in chosen_keys:
+            val = row[_result_col(k)]
+            step = specs.get(k, {}).get('step', 1)
+            # Integer params (step == 1) export as int; everything else as float.
+            config[k] = int(round(float(val))) if step == 1 else float(val)
+    return config
+
+
 # Robust annualization factors for Sharpe Ratio calculation across different timeframes
 TIMEFRAME_TO_ANNUALIZATION_FACTOR = {
     '1m': np.sqrt(365 * 24 * 60), '5m': np.sqrt(365 * 24 * 12), '15m': np.sqrt(365 * 24 * 4),
@@ -372,34 +423,7 @@ class FuturesTrader:
 
             configs = []
             for _, row in best_pairs.iterrows():
-                # Determine strategy type based on available columns
-                if 'ATR_Period' in row and 'ATR_Multiplier' in row:
-                    strategy_name = "ATR SuperTrend"
-                    config = {
-                        "enabled": True,
-                        "strategy_name": strategy_name,
-                        "symbol": row['Trading_Pair'],
-                        "bar_length": timeframe,  # Use the selected timeframe
-                        "units_usdt": units_usdt,  # Use the selected trade size
-                        "leverage": leverage,      # Use the selected leverage
-                        "atr_period": int(row['ATR_Period']),
-                        "atr_multiplier": float(row['ATR_Multiplier'])
-                    }
-                else:
-                    strategy_name = "Candlestick Patterns"
-                    config = {
-                        "enabled": True,
-                        "strategy_name": strategy_name,
-                        "symbol": row['Trading_Pair'],
-                        "bar_length": timeframe,  # Use the selected timeframe
-                        "units_usdt": units_usdt,  # Use the selected trade size
-                        "leverage": leverage,      # Use the selected leverage
-                        "buy_signal_window": int(row['Buy_Signal_Window']),
-                        "buy_pattern_lookback": int(row['Buy_Pattern_Lookback']),
-                        "sell_signal_window": int(row['Sell_Signal_Window']),
-                        "sell_pattern_lookback": int(row['Sell_Pattern_Lookback'])
-                    }
-                configs.append(config)
+                configs.append(_build_pair_trade_config(row, timeframe, units_usdt, leverage))
 
             # Save to trade_config.json
             with open('trade_config.json', 'w') as f:
@@ -928,17 +952,27 @@ class FuturesTrader:
                 profit_factor = gross_profit / \
                     gross_loss if gross_loss > 0 else float('inf')
 
+                # --- Per-segment split metrics + consistency score ---
+                seg_records = compute_split_metrics(
+                    trades_df_is, portfolio_df_is, is_start_date, is_end_date,
+                    getattr(self, 'split_n', 4) or 4)
+                segment_consistency = segment_consistency_score(
+                    [s['Total_Return'] for s in seg_records])
+
                 # --- Calculate IS Score ---
+                w_consistency_raw = weights.get('consistency', 0)
                 total_weight = weights['total_return'] + \
-                    weights['win_rate'] + weights['total_trades']
+                    weights['win_rate'] + weights['total_trades'] + w_consistency_raw
                 if total_weight == 0:
                     total_weight = 1
                 w_return = weights['total_return'] / total_weight
                 w_winrate = weights['win_rate'] / total_weight
                 w_trades = weights['total_trades'] / total_weight
+                w_consistency = w_consistency_raw / total_weight
                 capped_trades = min(total_trades_is, 100)
                 score = (total_return_is * w_return) + \
-                    (win_rate_is * w_winrate) + (capped_trades * w_trades)
+                    (win_rate_is * w_winrate) + (capped_trades * w_trades) + \
+                    (segment_consistency * w_consistency)
 
                 # Calculate additional priority metrics
                 # Risk-adjusted return (Calmar ratio)
@@ -1057,11 +1091,9 @@ class FuturesTrader:
                         avg_unprofitable_short = avg_unprofitable_trade if short_trades > long_trades else 0
 
                 # Optional per-segment split columns (added to the results table).
-                _split_cols = {}
+                _split_cols = {'Segment_Consistency': segment_consistency}
                 if getattr(self, 'split_columns', False):
-                    for _i, _seg in enumerate(compute_split_metrics(
-                            trades_df_is, portfolio_df_is, is_start_date, is_end_date,
-                            getattr(self, 'split_n', 4)), 1):
+                    for _i, _seg in enumerate(seg_records, 1):
                         _split_cols[f'S{_i}_Return'] = _seg['Total_Return']
                         _split_cols[f'S{_i}_WinRate'] = _seg['Win_Rate']
                         _split_cols[f'S{_i}_Trades'] = _seg['Total_Trades']
@@ -1336,15 +1368,25 @@ class FuturesTrader:
                 gross_loss = abs(trades_df_is[trades_df_is['PnL'] < 0]['PnL'].sum())
                 profit_factor = gross_profit / gross_loss if gross_loss > 0 else float('inf')
 
+                # Per-segment split metrics + consistency score
+                seg_records = compute_split_metrics(
+                    trades_df_is, portfolio_df_is, is_start_date, is_end_date,
+                    getattr(self, 'split_n', 4) or 4)
+                segment_consistency = segment_consistency_score(
+                    [s['Total_Return'] for s in seg_records])
+
                 # Calculate score
-                total_weight = weights['total_return'] + weights['win_rate'] + weights['total_trades']
+                w_consistency_raw = weights.get('consistency', 0)
+                total_weight = weights['total_return'] + weights['win_rate'] + weights['total_trades'] + w_consistency_raw
                 if total_weight == 0:
                     total_weight = 1
                 w_return = weights['total_return'] / total_weight
                 w_winrate = weights['win_rate'] / total_weight
                 w_trades = weights['total_trades'] / total_weight
+                w_consistency = w_consistency_raw / total_weight
                 capped_trades = min(total_trades_is, 100)
-                score = (total_return_is * w_return) + (win_rate_is * w_winrate) + (capped_trades * w_trades)
+                score = (total_return_is * w_return) + (win_rate_is * w_winrate) + (capped_trades * w_trades) + \
+                    (segment_consistency * w_consistency)
 
                 # Additional metrics
                 calmar_ratio = total_return_is / max_drawdown if max_drawdown > 0 else 0
@@ -1458,11 +1500,9 @@ class FuturesTrader:
 
                 composite_score = score
 
-                _split_cols = {}
+                _split_cols = {'Segment_Consistency': segment_consistency}
                 if getattr(self, 'split_columns', False):
-                    for _i, _seg in enumerate(compute_split_metrics(
-                            trades_df_is, portfolio_df_is, is_start_date, is_end_date,
-                            getattr(self, 'split_n', 4)), 1):
+                    for _i, _seg in enumerate(seg_records, 1):
                         _split_cols[f'S{_i}_Return'] = _seg['Total_Return']
                         _split_cols[f'S{_i}_WinRate'] = _seg['Win_Rate']
                         _split_cols[f'S{_i}_Trades'] = _seg['Total_Trades']
@@ -1973,7 +2013,13 @@ def build_optimizer_panel():
                     html.Div([html.Label("Total Trades Weight:"),
                               dcc.Input(id='weight-trades-input', type='number', value=20, min=0,
                                         className='custom-input')], className='flex-item'),
+                    html.Div([html.Label("Consistency Score Weight:"),
+                              dcc.Input(id='weight-consistency-input', type='number', value=0, min=0,
+                                        className='custom-input')], className='flex-item'),
                 ], className='flex-container'),
+                html.P("• Consistency Score = % of split segments profitable, penalized by the worst segment. "
+                       "Uses the Number of Date Splits above (defaults to 4 if splitting is off).",
+                       style={'fontSize': '12px', 'color': '#888', 'margin': '4px 0 0 0'}),
             ], className='control-panel-group'),
             html.Div([
                 html.Div([
@@ -3123,6 +3169,7 @@ def toggle_opt_buttons(status):
      State('weight-return-input', 'value'),                     # weight_return
      State('weight-winrate-input', 'value'),                    # weight_winrate
      State('weight-trades-input', 'value'),                     # weight_trades
+     State('weight-consistency-input', 'value'),                # weight_consistency
      State('optimization-mode-dropdown', 'value'),              # optimization_mode
      State('opt-sizing-mode', 'value'),                         # sizing_mode
      State('opt-split-mode', 'value'),                          # split_mode
@@ -3132,7 +3179,7 @@ def toggle_opt_buttons(status):
 def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str, sw_str, slr_str,
                                exit_minus_str, exit_plus_str, n_trials, min_trades, min_candles,
                                strategy_name, timeframe, is_start, is_end,
-                               weight_return, weight_winrate, weight_trades,
+                               weight_return, weight_winrate, weight_trades, weight_consistency,
                                optimization_mode, sizing_mode, split_mode, n_splits):
     
     # DEBUG: Add explicit debug logging to verify date alignment
@@ -3216,7 +3263,7 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
             'min_trades': int(min_trades), 'min_candles': min_candles_val, 'strategy_name': strategy_name, 'timeframe': timeframe,
             'is_start': is_start, 'is_end': is_end,
             'weight_return': weight_return, 'weight_winrate': weight_winrate,
-            'weight_trades': weight_trades,
+            'weight_trades': weight_trades, 'weight_consistency': weight_consistency,
             'optimization_mode': optimization_mode or 'efficient',
             'sizing_mode': sizing_mode or 'fixed',
             'split_mode': split_mode or 'onclick',
@@ -3266,7 +3313,8 @@ def run_optimization_task(n_intervals, settings):
         weights = {
             'total_return': settings['weight_return'] or 0,
             'win_rate': settings['weight_winrate'] or 0,
-            'total_trades': settings['weight_trades'] or 0
+            'total_trades': settings['weight_trades'] or 0,
+            'consistency': settings.get('weight_consistency') or 0,
         }
     except KeyError as e:
         add_optimization_log(
