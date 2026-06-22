@@ -128,6 +128,8 @@ class FuturesTrader:
         self.max_workers = os.cpu_count() or 4
         # Dynamic strategy selection based on parameters
         self.optimizer_strategy = CandlestickStrategy()  # Default strategy
+        # 'fixed' or 'compound' position sizing for optimization backtests.
+        self.backtest_sizing_mode = 'fixed'
 
     def __getstate__(self):
         """
@@ -658,7 +660,7 @@ class FuturesTrader:
 
             df_with_signals = strategy.generate_signals(
                 data_df.copy(), params_dict)
-            backtester = Backtester(self.initial_capital)
+            backtester = Backtester(self.initial_capital, sizing_mode=self.backtest_sizing_mode)
             trades_df, portfolio_df = backtester.run_backtest(df_with_signals)
 
             if trades_df is None or portfolio_df is None or trades_df.empty:
@@ -822,7 +824,7 @@ class FuturesTrader:
                 # --- IN-SAMPLE BACKTEST (for optimization score) ---
                 df_with_signals_is = strategy.generate_signals(
                     is_data.copy(), params)
-                backtester_is = Backtester(self.initial_capital)
+                backtester_is = Backtester(self.initial_capital, sizing_mode=self.backtest_sizing_mode)
                 trades_df_is, portfolio_df_is = backtester_is.run_backtest(
                     df_with_signals_is)
 
@@ -1146,7 +1148,7 @@ class FuturesTrader:
                 return {'Return': -1000, 'Trades': 0, 'Win_Rate': 0}
 
             df_with_signals = strategy.generate_signals(data_df.copy(), params_dict)
-            backtester = Backtester(self.initial_capital)
+            backtester = Backtester(self.initial_capital, sizing_mode=self.backtest_sizing_mode)
             trades_df, portfolio_df = backtester.run_backtest(df_with_signals)
 
             if trades_df is None or portfolio_df is None or trades_df.empty:
@@ -1224,7 +1226,7 @@ class FuturesTrader:
             try:
                 # IN-SAMPLE BACKTEST
                 df_with_signals_is = strategy.generate_signals(is_data.copy(), params)
-                backtester_is = Backtester(self.initial_capital)
+                backtester_is = Backtester(self.initial_capital, sizing_mode=self.backtest_sizing_mode)
                 trades_df_is, portfolio_df_is = backtester_is.run_backtest(df_with_signals_is)
 
                 if trades_df_is is None or portfolio_df_is is None or len(trades_df_is) < min_trades:
@@ -1659,7 +1661,12 @@ def build_config_panel():
                     html.Div([html.Label('Initial Capital:'),
                               dcc.Input(id='capital-input', value=10000, type='number', min=1,
                                         className='custom-input')], className='flex-item'),
-                    # SL/TP removed - using signal flip only
+                    html.Div([html.Label('Position Sizing:'),
+                              dcc.RadioItems(id='manual-sizing-mode',
+                                             options=[{'label': ' Fixed (off initial capital)', 'value': 'fixed'},
+                                                      {'label': ' Compounding (off running equity)', 'value': 'compound'}],
+                                             value='fixed', className='custom-checklist')],
+                             className='flex-item'),
                 ], className='flex-container')
             ], className='control-panel-group'),
             html.Div([
@@ -1837,8 +1844,13 @@ def build_optimizer_panel():
                        style={'fontSize': '12px', 'color': '#888', 'margin': '0'}),
                 html.P("• Efficient: Avoids duplicate combinations (recommended)", 
                        style={'fontSize': '12px', 'color': '#888', 'margin': '0'}),
-                html.P("• Smart Sampling: Uses AI to focus on promising areas", 
+                html.P("• Smart Sampling: Uses AI to focus on promising areas",
                        style={'fontSize': '12px', 'color': '#888', 'margin': '0 0 15px 0'}),
+                html.Label("Position Sizing:"),
+                dcc.RadioItems(id='opt-sizing-mode',
+                               options=[{'label': ' Fixed (off initial capital)', 'value': 'fixed'},
+                                        {'label': ' Compounding (off running equity)', 'value': 'compound'}],
+                               value='fixed', className='custom-checklist'),
             ], className='control-panel-group'),
             html.Div([
                 html.H4("Optimization Goal (Weights)"),
@@ -2265,9 +2277,10 @@ def update_main_chart(n_clicks, n_intervals, symbol, timeframe, start_date, end_
     [State('capital-input', 'value'),
      State('strategy-selector-dropdown', 'value'),
      State({'type': 'strategy-param-input', 'param': ALL}, 'value'),
-     State({'type': 'strategy-param-input', 'param': ALL}, 'id')]
+     State({'type': 'strategy-param-input', 'param': ALL}, 'id'),
+     State('manual-sizing-mode', 'value')]
 )
-def run_backtest_callback(n_clicks, capital, strategy_name, param_values, param_ids):
+def run_backtest_callback(n_clicks, capital, strategy_name, param_values, param_ids, sizing_mode):
     if n_clicks == 0 or not all([trader, not trader.data.empty, strategy_name]):
         return go.Figure(), [], [], [], "", {}
     strategy_class = STRATEGY_REGISTRY.get(strategy_name)
@@ -2277,7 +2290,7 @@ def run_backtest_callback(n_clicks, capital, strategy_name, param_values, param_
     strategy_instance = strategy_class()
     df_with_signals = strategy_instance.generate_signals(
         trader.data.copy(), params)
-    backtester = Backtester(initial_capital=float(capital))
+    backtester = Backtester(initial_capital=float(capital), sizing_mode=sizing_mode or 'fixed')
     trades_df, portfolio_df = backtester.run_backtest(df_with_signals)
     summary_text = "No trades executed."
     if portfolio_df is not None and not portfolio_df.empty and trades_df is not None and not trades_df.empty:
@@ -2397,10 +2410,10 @@ def _build_portfolio_figure_and_trades(trades_df, portfolio_df):
     Input('opt-results-table', 'active_cell'),
     [State('opt-results-table', 'derived_viewport_data'),
      State('is-date-start', 'value'), State('is-date-end', 'value'),
-     State('capital-input', 'value')],
+     State('capital-input', 'value'), State('opt-sizing-mode', 'value')],
     prevent_initial_call=True
 )
-def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, capital):
+def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, capital, sizing_mode):
     no = no_update
     blank = (no,) * 10
     if not active_cell or not table_data or trader is None:
@@ -2434,7 +2447,7 @@ def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, cap
                 no, no, no, no, f"No data could be loaded for {pair}.", pair, timeframe, strategy_name, params)
 
     df = strategy_class().generate_signals(data.copy(), params)
-    trades_df, portfolio_df = Backtester(initial_capital=cap).run_backtest(df)
+    trades_df, portfolio_df = Backtester(initial_capital=cap, sizing_mode=sizing_mode or 'fixed').run_backtest(df)
 
     price_fig = _build_price_signal_figure(df, f"{pair} Chart ({timeframe})")
     pf_fig, trades_data, trades_cols, style = _build_portfolio_figure_and_trades(trades_df, portfolio_df)
@@ -2947,14 +2960,15 @@ def toggle_opt_buttons(status):
      State('weight-return-input', 'value'),                     # weight_return
      State('weight-winrate-input', 'value'),                    # weight_winrate
      State('weight-trades-input', 'value'),                     # weight_trades
-     State('optimization-mode-dropdown', 'value')],             # optimization_mode
+     State('optimization-mode-dropdown', 'value'),              # optimization_mode
+     State('opt-sizing-mode', 'value')],                        # sizing_mode
     prevent_initial_call=True
 )
 def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str, sw_str, slr_str,
                                exit_minus_str, exit_plus_str, n_trials, min_trades, min_candles,
                                strategy_name, timeframe, is_start, is_end,
                                weight_return, weight_winrate, weight_trades,
-                               optimization_mode):
+                               optimization_mode, sizing_mode):
     
     # DEBUG: Add explicit debug logging to verify date alignment
     print(f"DEBUG: Optimization Trigger Received")
@@ -3039,6 +3053,7 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
             'weight_return': weight_return, 'weight_winrate': weight_winrate,
             'weight_trades': weight_trades,
             'optimization_mode': optimization_mode or 'efficient',
+            'sizing_mode': sizing_mode or 'fixed',
         }
     except (ValueError, TypeError) as e:
         msg = f"Error: Invalid numeric input. Please check values. Details: {e}"
@@ -3094,8 +3109,9 @@ def run_optimization_task(n_intervals, settings):
     # Run the standard optimization
     optimization_mode = settings.get('optimization_mode', 'efficient')
     strategy_name = settings.get('strategy_name', list(STRATEGY_REGISTRY.keys())[0])
+    trader.backtest_sizing_mode = settings.get('sizing_mode', 'fixed')
 
-    add_optimization_log(f"📈 Using STANDARD optimization ({optimization_mode.upper()} mode) with {strategy_name} strategy")
+    add_optimization_log(f"📈 Using STANDARD optimization ({optimization_mode.upper()} mode, {trader.backtest_sizing_mode} sizing) with {strategy_name} strategy")
     df_results = trader.optimize_trading_pairs(
         trading_pairs=pairs, param_ranges=param_ranges, selected_params=settings['selected_params'],
         is_start_date=settings['is_start'], is_end_date=settings['is_end'],
