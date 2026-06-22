@@ -56,6 +56,77 @@ class _NullEvent:
     def wait(self, timeout=None):
         return False
 
+
+SPLIT_METRICS = ['Total_Return', 'Win_Rate', 'Total_Trades', 'Max_Drawdown', 'Profit_Factor']
+
+
+def compute_split_metrics(trades_df, portfolio_df, start, end, n_splits):
+    """Split [start, end] into n_splits equal time segments and compute metrics
+    per segment from a single backtest's trades + equity curve.
+
+    Returns a list of dicts (one per segment). Segment return and drawdown come
+    from the equity curve; trade stats come from trades whose exit falls in the
+    segment.
+    """
+    import pandas as pd
+    records = []
+    try:
+        n_splits = int(n_splits)
+    except (TypeError, ValueError):
+        return records
+    if n_splits < 1:
+        return records
+
+    start = pd.to_datetime(start, utc=True)
+    end = pd.to_datetime(end, utc=True)
+    if pd.isna(start) or pd.isna(end) or end <= start:
+        return records
+    step = (end - start) / n_splits
+
+    pv = portfolio_df.copy() if portfolio_df is not None else pd.DataFrame()
+    if not pv.empty:
+        pv['Date'] = pd.to_datetime(pv['Date'], utc=True)
+    td = trades_df.copy() if trades_df is not None else pd.DataFrame()
+    if td is not None and not td.empty:
+        td['Exit_Date'] = pd.to_datetime(td['Exit_Date'], utc=True)
+
+    for i in range(n_splits):
+        s = start + step * i
+        e = start + step * (i + 1)
+        ret, dd = 0.0, 0.0
+        if not pv.empty:
+            seg = pv[(pv['Date'] >= s) & (pv['Date'] < e)]
+            if len(seg) >= 2:
+                eq = seg['Portfolio_Value'].to_numpy()
+                if eq[0] != 0:
+                    ret = (eq[-1] / eq[0] - 1) * 100
+                peak = np.maximum.accumulate(eq)
+                with np.errstate(divide='ignore', invalid='ignore'):
+                    dd_series = np.where(peak > 0, (peak - eq) / peak * 100, 0)
+                dd = float(np.nanmax(dd_series)) if len(dd_series) else 0.0
+        n_tr, wr, pf = 0, 0.0, 0.0
+        if td is not None and not td.empty:
+            seg_t = td[(td['Exit_Date'] >= s) & (td['Exit_Date'] < e)]
+            n_tr = len(seg_t)
+            if n_tr:
+                wins = (seg_t['PnL'] > 0).sum()
+                wr = wins / n_tr * 100
+                gp = seg_t.loc[seg_t['PnL'] > 0, 'PnL'].sum()
+                gl = abs(seg_t.loc[seg_t['PnL'] < 0, 'PnL'].sum())
+                pf = (gp / gl) if gl > 0 else 0.0
+        records.append({
+            'Segment': f'#{i + 1}',
+            'Start': s.strftime('%Y-%m-%d'),
+            'End': e.strftime('%Y-%m-%d'),
+            'Total_Return': round(float(ret), 2),
+            'Win_Rate': round(float(wr), 1),
+            'Total_Trades': int(n_tr),
+            'Max_Drawdown': round(float(dd), 2),
+            'Profit_Factor': round(float(pf), 2),
+        })
+    return records
+
+
 # Robust annualization factors for Sharpe Ratio calculation across different timeframes
 TIMEFRAME_TO_ANNUALIZATION_FACTOR = {
     '1m': np.sqrt(365 * 24 * 60), '5m': np.sqrt(365 * 24 * 12), '15m': np.sqrt(365 * 24 * 4),
@@ -130,6 +201,9 @@ class FuturesTrader:
         self.optimizer_strategy = CandlestickStrategy()  # Default strategy
         # 'fixed' or 'compound' position sizing for optimization backtests.
         self.backtest_sizing_mode = 'fixed'
+        # Per-pair split-range columns in optimization results.
+        self.split_columns = False
+        self.split_n = 4
 
     def __getstate__(self):
         """
@@ -982,8 +1056,20 @@ class FuturesTrader:
                         avg_unprofitable_long = avg_unprofitable_trade if long_trades > short_trades else 0
                         avg_unprofitable_short = avg_unprofitable_trade if short_trades > long_trades else 0
 
+                # Optional per-segment split columns (added to the results table).
+                _split_cols = {}
+                if getattr(self, 'split_columns', False):
+                    for _i, _seg in enumerate(compute_split_metrics(
+                            trades_df_is, portfolio_df_is, is_start_date, is_end_date,
+                            getattr(self, 'split_n', 4)), 1):
+                        _split_cols[f'S{_i}_Return'] = _seg['Total_Return']
+                        _split_cols[f'S{_i}_WinRate'] = _seg['Win_Rate']
+                        _split_cols[f'S{_i}_Trades'] = _seg['Total_Trades']
+                        _split_cols[f'S{_i}_MaxDD'] = _seg['Max_Drawdown']
+
                 # --- Store All Results ---
                 trial.set_user_attr('results', {
+                    **_split_cols,
                     'Total_Return': total_return_is, 'Total_Trades': total_trades_is, 'Win_Rate': win_rate_is,
                     'Max_Drawdown': max_drawdown, 'Sharpe_Ratio': sharpe_ratio, 'Profit_Factor': profit_factor,
                     'Score': score, 'Calmar_Ratio': calmar_ratio, 'Consistency_Score': consistency_score,
@@ -1372,7 +1458,18 @@ class FuturesTrader:
 
                 composite_score = score
 
+                _split_cols = {}
+                if getattr(self, 'split_columns', False):
+                    for _i, _seg in enumerate(compute_split_metrics(
+                            trades_df_is, portfolio_df_is, is_start_date, is_end_date,
+                            getattr(self, 'split_n', 4)), 1):
+                        _split_cols[f'S{_i}_Return'] = _seg['Total_Return']
+                        _split_cols[f'S{_i}_WinRate'] = _seg['Win_Rate']
+                        _split_cols[f'S{_i}_Trades'] = _seg['Total_Trades']
+                        _split_cols[f'S{_i}_MaxDD'] = _seg['Max_Drawdown']
+
                 trial.set_user_attr('results', {
+                    **_split_cols,
                     'Total_Return': total_return_is, 'Total_Trades': total_trades_is, 'Win_Rate': win_rate_is,
                     'Max_Drawdown': max_drawdown, 'Sharpe_Ratio': sharpe_ratio, 'Profit_Factor': profit_factor,
                     'Score': score, 'Calmar_Ratio': calmar_ratio, 'Consistency_Score': consistency_score,
@@ -1667,6 +1764,9 @@ def build_config_panel():
                                                       {'label': ' Compounding (off running equity)', 'value': 'compound'}],
                                              value='fixed', className='custom-checklist')],
                              className='flex-item'),
+                    html.Div([html.Label('Number of Date Splits:'),
+                              dcc.Input(id='num-splits-input', value=4, type='number', min=1, max=50, step=1,
+                                        className='custom-input')], className='flex-item'),
                 ], className='flex-container')
             ], className='control-panel-group'),
             html.Div([
@@ -1851,6 +1951,15 @@ def build_optimizer_panel():
                                options=[{'label': ' Fixed (off initial capital)', 'value': 'fixed'},
                                         {'label': ' Compounding (off running equity)', 'value': 'compound'}],
                                value='fixed', className='custom-checklist'),
+                html.Hr(style={'margin': '12px 0'}),
+                html.Label("Split Date-Range Results:"),
+                dcc.RadioItems(id='opt-split-mode',
+                               options=[{'label': ' On row click only (per pair when you click a result)', 'value': 'onclick'},
+                                        {'label': ' Add per-segment columns to results table (all pairs)', 'value': 'columns'}],
+                               value='onclick', className='custom-checklist'),
+                html.Div([html.Label("Number of Date Splits:"),
+                          dcc.Input(id='opt-num-splits', value=4, type='number', min=1, max=20, step=1,
+                                    className='custom-input')], style={'marginTop': '8px'}),
             ], className='control-panel-group'),
             html.Div([
                 html.H4("Optimization Goal (Weights)"),
@@ -1988,6 +2097,7 @@ def build_refine_panel():
 # --- App Layout ---
 app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', 'padding': '10px'}, children=[
     dcc.Store(id='trades-data-store'),
+    dcc.Store(id='split-data-store'),
     dcc.Store(id='all-pairs-store'),
     dcc.Store(id='opt-results-store'),
     dcc.Store(id='all-trials-store'),
@@ -2033,6 +2143,22 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
                 style={'textAlign': 'center', 'color': '#4CAF50', 'margin': '20px'}),
         create_collapsible_container("Portfolio Value", "portfolio-graph",
                                      dcc.Graph(id='portfolio-graph', style={'height': '40vh'})),
+        create_collapsible_container("Split Date-Range Results", "split-results", [
+            html.Div([
+                html.Label("Chart Metric:", style={'marginRight': '10px'}),
+                dcc.Dropdown(id='split-metric-dropdown',
+                             options=[{'label': m.replace('_', ' '), 'value': m} for m in SPLIT_METRICS],
+                             value='Total_Return', clearable=False,
+                             style={'width': '260px', 'display': 'inline-block'}),
+            ], style={'marginBottom': '10px'}),
+            dcc.Graph(id='split-results-graph', style={'height': '35vh'}),
+            html.Div(dash_table.DataTable(
+                id='split-results-table',
+                style_cell={'backgroundColor': '#2c2c2c', 'color': '#f0f0f0', 'border': '1px solid #444'},
+                style_header={'backgroundColor': '#00BFFF', 'color': '#000000', 'fontWeight': 'bold'},
+                style_data={'backgroundColor': '#2c2c2c', 'color': '#f0f0f0'},
+            ), className='dash-table-container'),
+        ]),
         create_collapsible_container("Trades Log", "trades-table",
                                      html.Div(dash_table.DataTable(
                                          id='trades-table',
@@ -2272,20 +2398,25 @@ def update_main_chart(n_clicks, n_intervals, symbol, timeframe, start_date, end_
     [Output('portfolio-graph', 'figure'), Output('trades-table', 'data'), Output('trades-table', 'columns'),
      Output('trades-table',
             'style_data_conditional'), Output('backtest-summary', 'children'),
-     Output('trades-data-store', 'data')],
+     Output('trades-data-store', 'data'),
+     Output('split-results-table', 'data'), Output('split-results-table', 'columns'),
+     Output('split-data-store', 'data')],
     Input('backtest-button', 'n_clicks'),
     [State('capital-input', 'value'),
      State('strategy-selector-dropdown', 'value'),
      State({'type': 'strategy-param-input', 'param': ALL}, 'value'),
      State({'type': 'strategy-param-input', 'param': ALL}, 'id'),
-     State('manual-sizing-mode', 'value')]
+     State('manual-sizing-mode', 'value'),
+     State('date-range-start', 'value'), State('date-range-end', 'value'),
+     State('num-splits-input', 'value')]
 )
-def run_backtest_callback(n_clicks, capital, strategy_name, param_values, param_ids, sizing_mode):
+def run_backtest_callback(n_clicks, capital, strategy_name, param_values, param_ids, sizing_mode,
+                          start_date, end_date, n_splits):
     if n_clicks == 0 or not all([trader, not trader.data.empty, strategy_name]):
-        return go.Figure(), [], [], [], "", {}
+        return go.Figure(), [], [], [], "", {}, [], [], []
     strategy_class = STRATEGY_REGISTRY.get(strategy_name)
     if not strategy_class:
-        return go.Figure(), [], [], [], "Strategy not found", {}
+        return go.Figure(), [], [], [], "Strategy not found", {}, [], [], []
     params = {p['param']: v for p, v in zip(param_ids, param_values)}
     strategy_instance = strategy_class()
     df_with_signals = strategy_instance.generate_signals(
@@ -2336,7 +2467,30 @@ def run_backtest_callback(n_clicks, capital, strategy_name, param_values, param_
          'backgroundColor': '#5c1e1e', 'color': '#f44336', 'fontWeight': 'bold'},
         {'if': {'column_id': 'PnL', 'filter_query': '{PnL} = 0'},
          'backgroundColor': '#2c2c2c', 'color': '#f0f0f0', 'fontWeight': 'bold'}]
-    return fig, trades_data, trades_cols, style_data_conditional, summary_text, trades_data
+    split_records = compute_split_metrics(trades_df, portfolio_df, start_date, end_date, n_splits)
+    split_cols = [{"name": c, "id": c} for c in (split_records[0].keys() if split_records else [])]
+    return (fig, trades_data, trades_cols, style_data_conditional, summary_text, trades_data,
+            split_records, split_cols, split_records)
+
+
+@app.callback(
+    Output('split-results-graph', 'figure'),
+    [Input('split-data-store', 'data'), Input('split-metric-dropdown', 'value')],
+)
+def update_split_chart(split_records, metric):
+    metric = metric or 'Total_Return'
+    fig = go.Figure()
+    if split_records:
+        labels = [f"{r['Segment']}\n{r['Start']}→{r['End']}" for r in split_records]
+        values = [r.get(metric, 0) for r in split_records]
+        colors = ['#4CAF50' if (v is not None and v >= 0) else '#F44336' for v in values]
+        fig.add_trace(go.Bar(x=labels, y=values, marker_color=colors,
+                             text=[round(v, 2) if v is not None else 0 for v in values],
+                             textposition='outside'))
+    fig.update_layout(title=f"Per-Segment {metric.replace('_', ' ')}", template='plotly_dark',
+                      xaxis_title='Segment', yaxis_title=metric.replace('_', ' '),
+                      paper_bgcolor='#111111', plot_bgcolor='#1e1e1e')
+    return fig
 
 
 # --- Click an Optimization Results row -> run a manual-style backtest ---
@@ -2406,16 +2560,20 @@ def _build_portfolio_figure_and_trades(trades_df, portfolio_df):
      Output('symbol-input', 'value', allow_duplicate=True),
      Output('timeframe-input', 'value', allow_duplicate=True),
      Output('strategy-selector-dropdown', 'value', allow_duplicate=True),
-     Output('applied-params-store', 'data', allow_duplicate=True)],
+     Output('applied-params-store', 'data', allow_duplicate=True),
+     Output('split-results-table', 'data', allow_duplicate=True),
+     Output('split-results-table', 'columns', allow_duplicate=True),
+     Output('split-data-store', 'data', allow_duplicate=True)],
     Input('opt-results-table', 'active_cell'),
     [State('opt-results-table', 'derived_viewport_data'),
      State('is-date-start', 'value'), State('is-date-end', 'value'),
-     State('capital-input', 'value'), State('opt-sizing-mode', 'value')],
+     State('capital-input', 'value'), State('opt-sizing-mode', 'value'),
+     State('num-splits-input', 'value')],
     prevent_initial_call=True
 )
-def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, capital, sizing_mode):
+def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, capital, sizing_mode, n_splits):
     no = no_update
-    blank = (no,) * 10
+    blank = (no,) * 13
     if not active_cell or not table_data or trader is None:
         return blank
     try:
@@ -2444,7 +2602,8 @@ def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, cap
     data = trader.get_historical_data(pair, timeframe, start_date, end_date)
     if data is None or data.empty:
         return (go.Figure().update_layout(title=f"No data for {pair}", template='plotly_dark'),
-                no, no, no, no, f"No data could be loaded for {pair}.", pair, timeframe, strategy_name, params)
+                no, no, no, no, f"No data could be loaded for {pair}.", pair, timeframe, strategy_name, params,
+                [], [], [])
 
     df = strategy_class().generate_signals(data.copy(), params)
     trades_df, portfolio_df = Backtester(initial_capital=cap, sizing_mode=sizing_mode or 'fixed').run_backtest(df)
@@ -2457,8 +2616,12 @@ def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, cap
         total_return = (portfolio_df['Portfolio_Value'].iloc[-1] / cap - 1) * 100
         summary = f"{pair}: Total Return: {total_return:.2f}% ({len(trades_df)} trades)"
 
+    split_records = compute_split_metrics(trades_df, portfolio_df, start_date, end_date, n_splits)
+    split_cols = [{"name": c, "id": c} for c in (split_records[0].keys() if split_records else [])]
+
     return (price_fig, pf_fig, trades_data, trades_cols, style, summary,
-            pair, timeframe, strategy_name, params)
+            pair, timeframe, strategy_name, params,
+            split_records, split_cols, split_records)
 
 
 # Scroll to the backtest results when an optimization row is clicked.
@@ -2961,14 +3124,16 @@ def toggle_opt_buttons(status):
      State('weight-winrate-input', 'value'),                    # weight_winrate
      State('weight-trades-input', 'value'),                     # weight_trades
      State('optimization-mode-dropdown', 'value'),              # optimization_mode
-     State('opt-sizing-mode', 'value')],                        # sizing_mode
+     State('opt-sizing-mode', 'value'),                         # sizing_mode
+     State('opt-split-mode', 'value'),                          # split_mode
+     State('opt-num-splits', 'value')],                         # n_splits
     prevent_initial_call=True
 )
 def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str, sw_str, slr_str,
                                exit_minus_str, exit_plus_str, n_trials, min_trades, min_candles,
                                strategy_name, timeframe, is_start, is_end,
                                weight_return, weight_winrate, weight_trades,
-                               optimization_mode, sizing_mode):
+                               optimization_mode, sizing_mode, split_mode, n_splits):
     
     # DEBUG: Add explicit debug logging to verify date alignment
     print(f"DEBUG: Optimization Trigger Received")
@@ -3054,6 +3219,8 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
             'weight_trades': weight_trades,
             'optimization_mode': optimization_mode or 'efficient',
             'sizing_mode': sizing_mode or 'fixed',
+            'split_mode': split_mode or 'onclick',
+            'n_splits': int(n_splits) if n_splits else 4,
         }
     except (ValueError, TypeError) as e:
         msg = f"Error: Invalid numeric input. Please check values. Details: {e}"
@@ -3110,6 +3277,8 @@ def run_optimization_task(n_intervals, settings):
     optimization_mode = settings.get('optimization_mode', 'efficient')
     strategy_name = settings.get('strategy_name', list(STRATEGY_REGISTRY.keys())[0])
     trader.backtest_sizing_mode = settings.get('sizing_mode', 'fixed')
+    trader.split_columns = settings.get('split_mode', 'onclick') == 'columns'
+    trader.split_n = settings.get('n_splits', 4)
 
     add_optimization_log(f"📈 Using STANDARD optimization ({optimization_mode.upper()} mode, {trader.backtest_sizing_mode} sizing) with {strategy_name} strategy")
     df_results = trader.optimize_trading_pairs(
