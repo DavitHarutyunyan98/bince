@@ -62,6 +62,11 @@ class HybridSymbolTrader:
         self.bar_length = self.trade_config["bar_length"]
         self.units_usdt = float(self.trade_config.get("units_usdt", 10.0))
         self.leverage = int(self.trade_config.get("leverage", 1))
+        # Position sizing: 'fixed' = constant notional; 'compound' = scale the
+        # notional with account-equity growth relative to a baseline captured
+        # at the first trade (mirrors the compounding backtest).
+        self.sizing_mode = str(self.trade_config.get("sizing_mode", "fixed")).lower()
+        self.base_equity = None
         self.poll_interval = self._get_poll_interval()
 
         # Position tracking
@@ -472,12 +477,36 @@ class HybridSymbolTrader:
         except Exception as e:
             logger.error(f"[{self.symbol}] Error closing position: {e}")
 
+    def _get_account_equity(self):
+        """Fetch current USDT futures wallet balance (used for compounding)."""
+        try:
+            balances = self.client.futures_account_balance()
+            for b in balances:
+                if b.get('asset') == 'USDT':
+                    return float(b.get('balance', 0.0))
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] Could not fetch account equity: {e}")
+        return None
+
     def _get_trade_quantity(self):
-        """Calculate trade quantity."""
+        """Calculate trade quantity.
+
+        Fixed: constant `units_usdt` notional. Compounding: scale the notional
+        by current equity / baseline equity so position size grows (or shrinks)
+        with the account, matching the compounding backtest.
+        """
         try:
             if self.current_price <= 0:
                 return None
-            quantity = self.units_usdt / self.current_price
+            effective_units = self.units_usdt
+            if self.sizing_mode == 'compound':
+                equity = self._get_account_equity()
+                if equity and equity > 0:
+                    if self.base_equity is None:
+                        self.base_equity = equity
+                        logger.info(f"[{self.symbol}] Compounding baseline equity: {equity:.2f} USDT")
+                    effective_units = self.units_usdt * (equity / self.base_equity)
+            quantity = effective_units / self.current_price
             return float(f"{quantity:.{self.quantity_precision}f}")
         except Exception as e:
             logger.error(f"[{self.symbol}] Error calculating quantity: {e}")
