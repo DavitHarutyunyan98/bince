@@ -509,7 +509,8 @@ class Backtester:
                             1 + (entry_price - exit_price) / entry_price
                         )
 
-                    fee = self.calculate_trading_fee(position_value)
+                    # Round-trip fees: charge on both entry (base) and exit (proceeds).
+                    fee = self.calculate_trading_fee(entry_base) + self.calculate_trading_fee(position_value)
                     net_value = position_value - fee
                     pnl = net_value - entry_base
                     pnl_percent = (pnl / entry_base) * 100 if entry_base > 0 else 0
@@ -553,7 +554,7 @@ class Backtester:
                 position_value = entry_base * (
                     1 + (entry_price - exit_price) / entry_price
                 )
-            fee = self.calculate_trading_fee(position_value)
+            fee = self.calculate_trading_fee(entry_base) + self.calculate_trading_fee(position_value)
             net_value = position_value - fee
             pnl = net_value - entry_base
             pnl_percent = (pnl / entry_base) * 100 if entry_base > 0 else 0
