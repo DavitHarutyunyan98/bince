@@ -1,12 +1,77 @@
-{
+[
+  {
+    "enabled": true,
     "strategy_name": "Candlestick Patterns",
-    "symbol": "BTCUSDT",
+    "symbol": "HUSDT",
     "bar_length": "15m",
-    "start_date": "2025-12-11",
-    "units_usdt": 10.0,
+    "units_usdt": 40.0,
+    "leverage": 4,
+    "sizing_mode": "compound",
+    "buy_signal_window": 8,
+    "buy_pattern_lookback": 1,
+    "sell_signal_window": 10,
+    "sell_pattern_lookback": 2,
+    "exit_minus_percent": 10.0,
+    "exit_plus_percent": 5.0
+  },
+  {
+    "enabled": true,
+    "strategy_name": "Candlestick Patterns",
+    "symbol": "LABUSDT",
+    "bar_length": "15m",
+    "units_usdt": 40.0,
     "leverage": 5,
-    "buy_signal_window": 11,
+    "sizing_mode": "compound",
+    "buy_signal_window": 4,
+    "buy_pattern_lookback": 1,
+    "sell_signal_window": 4,
+    "sell_pattern_lookback": 4,
+    "exit_minus_percent": 10.0,
+    "exit_plus_percent": 7.5
+  },
+  {
+    "enabled": true,
+    "strategy_name": "Candlestick Patterns",
+    "symbol": "BSBUSDT",
+    "bar_length": "15m",
+    "units_usdt": 40.0,
+    "leverage": 5,
+    "sizing_mode": "compound",
+    "buy_signal_window": 14,
+    "buy_pattern_lookback": 3,
+    "sell_signal_window": 3,
+    "sell_pattern_lookback": 2,
+    "exit_minus_percent": 6.0,
+    "exit_plus_percent": 10.0
+  },
+  {
+    "enabled": true,
+    "strategy_name": "Candlestick Patterns",
+    "symbol": "SIRENUSDT",
+    "bar_length": "15m",
+    "units_usdt": 40.0,
+    "leverage": 5,
+    "sizing_mode": "compound",
+    "buy_signal_window": 5,
+    "buy_pattern_lookback": 3,
+    "sell_signal_window": 20,
+    "sell_pattern_lookback": 5,
+    "exit_minus_percent": 3.0,
+    "exit_plus_percent": 3.5
+  },
+  {
+    "enabled": true,
+    "strategy_name": "Candlestick Patterns",
+    "symbol": "RIFUSDT",
+    "bar_length": "15m",
+    "units_usdt": 40.0,
+    "leverage": 5,
+    "sizing_mode": "compound",
+    "buy_signal_window": 6,
     "buy_pattern_lookback": 2,
-    "sell_signal_window": 11,
-    "sell_pattern_lookback": 5
-}
+    "sell_signal_window": 7,
+    "sell_pattern_lookback": 3,
+    "exit_minus_percent": 9.5,
+    "exit_plus_percent": 5.0
+  }
+]
