@@ -145,7 +145,7 @@ def _result_col(param_key):
     return param_key.replace('_', ' ').title().replace(' ', '_')
 
 
-def _build_pair_trade_config(row, timeframe, units_usdt, leverage):
+def _build_pair_trade_config(row, timeframe, units_usdt, leverage, sizing_mode='fixed'):
     """Build a complete trade_config entry for one optimization-result row.
 
     Derives the strategy generically from STRATEGY_REGISTRY so that EVERY
@@ -167,6 +167,7 @@ def _build_pair_trade_config(row, timeframe, units_usdt, leverage):
         "bar_length": timeframe,
         "units_usdt": float(units_usdt),
         "leverage": int(leverage),
+        "sizing_mode": sizing_mode or 'fixed',
     }
     if chosen_cls is not None:
         specs = chosen_cls.get_parameters()
@@ -397,7 +398,8 @@ class FuturesTrader:
             return False
 
     def export_best_results_to_config_enhanced(self, results_df, top_n=5, sort_by='Score',
-                                               units_usdt=50.0, leverage=10, timeframe='15m'):
+                                               units_usdt=50.0, leverage=10, timeframe='15m',
+                                               sizing_mode='fixed'):
         """Enhanced export with custom sorting and configuration parameters."""
         try:
             if results_df is None or results_df.empty:
@@ -423,7 +425,7 @@ class FuturesTrader:
 
             configs = []
             for _, row in best_pairs.iterrows():
-                configs.append(_build_pair_trade_config(row, timeframe, units_usdt, leverage))
+                configs.append(_build_pair_trade_config(row, timeframe, units_usdt, leverage, sizing_mode))
 
             # Save to trade_config.json
             with open('trade_config.json', 'w') as f:
@@ -2697,17 +2699,19 @@ app.clientside_callback(
      State('strategy-selector-dropdown',
            'value'), State({'type': 'strategy-param-input', 'param': ALL}, 'value'),
      State({'type': 'strategy-param-input', 'param': ALL}, 'id'),
-     State('live-start-date-picker', 'value'), State('units-usdt-input', 'value'), State('leverage-input', 'value')],
+     State('live-start-date-picker', 'value'), State('units-usdt-input', 'value'), State('leverage-input', 'value'),
+     State('manual-sizing-mode', 'value')],
     prevent_initial_call=True
 )
 def save_trade_config(n_clicks, symbol, bar_length,
-                      strategy_name, param_values, param_ids, start_date, units, leverage):
+                      strategy_name, param_values, param_ids, start_date, units, leverage, sizing_mode):
     if n_clicks > 0:
         strategy_params = {p['param']: v for p,
                            v in zip(param_ids, param_values)}
         config_data = {
             "strategy_name": strategy_name, "symbol": symbol, "bar_length": bar_length,
             "start_date": start_date, "units_usdt": float(units), "leverage": int(leverage),
+            "sizing_mode": sizing_mode or 'fixed',
             **strategy_params
         }
         try:
@@ -3046,10 +3050,11 @@ def stop_optimization(n_clicks):
     [State('all-trials-store', 'data'), State('export-count-input', 'value'),
      State('refine-sort-by-dropdown',
            'value'), State('export-units-input', 'value'),
-     State('export-leverage-input', 'value'), State('export-timeframe-dropdown', 'value')],
+     State('export-leverage-input', 'value'), State('export-timeframe-dropdown', 'value'),
+     State('opt-sizing-mode', 'value')],
     prevent_initial_call=True
 )
-def export_to_config(n_clicks, opt_data, export_count, sort_by, units_usdt, leverage, timeframe):
+def export_to_config(n_clicks, opt_data, export_count, sort_by, units_usdt, leverage, timeframe, sizing_mode):
     if n_clicks > 0 and opt_data:
         try:
             df = pd.DataFrame(opt_data)
@@ -3063,7 +3068,8 @@ def export_to_config(n_clicks, opt_data, export_count, sort_by, units_usdt, leve
 
                 success = trader.export_best_results_to_config_enhanced(
                     df, top_n=count, sort_by=sort_column,
-                    units_usdt=units, leverage=lev, timeframe=tf)
+                    units_usdt=units, leverage=lev, timeframe=tf,
+                    sizing_mode=sizing_mode or 'fixed')
 
                 if success:
                     add_optimization_log(
