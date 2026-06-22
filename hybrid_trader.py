@@ -750,8 +750,12 @@ class HybridTraderManager:
         logger.info("HybridTraderManager starting up...")
 
         self.api_config = self._load_json(api_config_path)
-        self.trade_configs = [c for c in self._load_json(
-            trade_configs_path) if c.get("enabled", True)]
+        # trade_config.json may be a single config object or a list of them.
+        loaded_configs = self._load_json(trade_configs_path)
+        if isinstance(loaded_configs, dict):
+            loaded_configs = [loaded_configs]
+        self.trade_configs = [c for c in (loaded_configs or [])
+                              if isinstance(c, dict) and c.get("enabled", True)]
 
         if not self.trade_configs or not self.api_config:
             raise ValueError(
