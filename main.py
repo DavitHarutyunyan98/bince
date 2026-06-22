@@ -648,10 +648,8 @@ class FuturesTrader:
             filtered_out = len(selected_params) - len(effective_params)
             add_optimization_log(f"-> {symbol}: Filtered out {filtered_out} invalid parameters for {strategy.__class__.__name__}")
 
-        # Split data into In-Sample and dual Out-of-Sample periods
+        # Optimization uses a single In-Sample window (OOS removed).
         is_data = full_data.loc[is_start_date:is_end_date]
-        oos1_data = full_data.loc[oos1_start_date:oos1_end_date]
-        oos2_data = full_data.loc[oos2_start_date:oos2_end_date]
 
         def run_backtest_and_get_metrics(data_df, params_dict):
             """Nested helper to run a backtest and return key metrics."""
@@ -866,38 +864,18 @@ class FuturesTrader:
                 score = (total_return_is * w_return) + \
                     (win_rate_is * w_winrate) + (capped_trades * w_trades)
 
-                # --- OUT-OF-SAMPLE BACKTESTS (for reporting) ---
-                oos1_results = run_backtest_and_get_metrics(oos1_data, params)
-                oos2_results = run_backtest_and_get_metrics(oos2_data, params)
-                
-                # Calculate combined OOS metrics
-                total_oos_return = (oos1_results['Return'] + oos2_results['Return']) / 2  # Average return
-                total_oos_trades = oos1_results['Trades'] + oos2_results['Trades']
-                total_oos_win_rate = (oos1_results['Win_Rate'] + oos2_results['Win_Rate']) / 2  # Average win rate
-
                 # Calculate additional priority metrics
                 # Risk-adjusted return (Calmar ratio)
                 calmar_ratio = total_return_is / max_drawdown if max_drawdown > 0 else 0
-                
+
                 # Consistency score (lower volatility of returns is better)
                 if len(returns) > 1:
                     return_volatility = returns.std() * 100
                     consistency_score = max(0, 100 - return_volatility)  # Higher is better
                 else:
                     consistency_score = 0
-                
-                # OOS vs IS performance ratio (closer to 1 is better)
-                oos1_is_ratio = abs(oos1_results['Return'] / total_return_is) if total_return_is != 0 else 0
-                oos2_is_ratio = abs(oos2_results['Return'] / total_return_is) if total_return_is != 0 else 0
-                avg_oos_is_ratio = (oos1_is_ratio + oos2_is_ratio) / 2
-                robustness_score = max(0, 100 - abs(100 * (1 - avg_oos_is_ratio)))  # Higher is better
-                
-                # Calculate individual OOS scores using same weighting as IS
-                oos1_score = (oos1_results['Return'] * w_return) + (oos1_results['Win_Rate'] * w_winrate) + (min(oos1_results['Trades'], 100) * w_trades)
-                oos2_score = (oos2_results['Return'] * w_return) + (oos2_results['Win_Rate'] * w_winrate) + (min(oos2_results['Trades'], 100) * w_trades)
-                
-                # Calculate Composite Score: IS (60%) + OOS1 (20%) + OOS2 (20%)
-                composite_score = (score * 0.6) + (oos1_score * 0.2) + (oos2_score * 0.2)
+
+                composite_score = score
 
                 # Calculate trade balance metrics
                 if not trades_df_is.empty and 'Position' in trades_df_is.columns:
@@ -1007,7 +985,7 @@ class FuturesTrader:
                     'Total_Return': total_return_is, 'Total_Trades': total_trades_is, 'Win_Rate': win_rate_is,
                     'Max_Drawdown': max_drawdown, 'Sharpe_Ratio': sharpe_ratio, 'Profit_Factor': profit_factor,
                     'Score': score, 'Calmar_Ratio': calmar_ratio, 'Consistency_Score': consistency_score,
-                    'Robustness_Score': robustness_score, 'Long_Trades': long_trades, 'Short_Trades': short_trades,
+                    'Long_Trades': long_trades, 'Short_Trades': short_trades,
                     'Trade_Balance_Ratio': trade_balance_ratio, 'Trade_Balance_Score': trade_balance_score,
                     'Trade_Difference': trade_difference,
                     'Profitable_Trades': profitable_trade_count, 'Unprofitable_Trades': unprofitable_trade_count,
@@ -1016,13 +994,6 @@ class FuturesTrader:
                     'Avg_Profitable_Trade': round(avg_profitable_trade, 2), 'Avg_Unprofitable_Trade': round(avg_unprofitable_trade, 2),
                     'Avg_Profitable_Long': round(avg_profitable_long, 2), 'Avg_Profitable_Short': round(avg_profitable_short, 2),
                     'Avg_Unprofitable_Long': round(avg_unprofitable_long, 2), 'Avg_Unprofitable_Short': round(avg_unprofitable_short, 2),
-                    'OOS1_Return': oos1_results['Return'],
-                    'OOS1_Trades': oos1_results['Trades'],
-                    'OOS1_Win_Rate': oos1_results['Win_Rate'],
-                    'OOS2_Return': oos2_results['Return'],
-                    'OOS2_Trades': oos2_results['Trades'],
-                    'OOS2_Win_Rate': oos2_results['Win_Rate'],
-                    'Total_OOS_Return': total_oos_return,
                     'Composite_Score': composite_score,
                     'params': params
                 })
@@ -1050,8 +1021,6 @@ class FuturesTrader:
                 ret = results.get('Total_Return', 0)
                 wr = results.get('Win_Rate', 0)
                 trades = results.get('Total_Trades', 0)
-                oos1_ret = results.get('OOS1_Return', 0)
-                oos2_ret = results.get('OOS2_Return', 0)
 
                 # Add relevant parameters to log based on strategy
                 param_parts = []
@@ -1085,7 +1054,7 @@ class FuturesTrader:
 
                 if param_parts:
                     message += f" | Params: {'/'.join(param_parts)}"
-                message += f" | Ret: {ret:.2f}% | WR: {wr:.1f}% | Trades: {trades} | OOS1: {oos1_ret:.2f}% | OOS2: {oos2_ret:.2f}%"
+                message += f" | Ret: {ret:.2f}% | WR: {wr:.1f}% | Trades: {trades}"
             elif trial.state != optuna.trial.TrialState.RUNNING:
                 message += f" ({trial.state.name})"
             
@@ -1171,8 +1140,6 @@ class FuturesTrader:
             add_optimization_log(f"-> {symbol}: Filtered out {filtered_out} invalid parameters for {strategy.__class__.__name__}")
 
         is_data = full_data.loc[is_start_date:is_end_date]
-        oos1_data = full_data.loc[oos1_start_date:oos1_end_date]
-        oos2_data = full_data.loc[oos2_start_date:oos2_end_date]
 
         def run_backtest_and_get_metrics(data_df, params_dict):
             if data_df is None or data_df.empty:
@@ -1291,15 +1258,6 @@ class FuturesTrader:
                 capped_trades = min(total_trades_is, 100)
                 score = (total_return_is * w_return) + (win_rate_is * w_winrate) + (capped_trades * w_trades)
 
-                # OUT-OF-SAMPLE BACKTESTS
-                oos1_results = run_backtest_and_get_metrics(oos1_data, params)
-                oos2_results = run_backtest_and_get_metrics(oos2_data, params)
-                
-                # Calculate combined OOS metrics
-                total_oos_return = (oos1_results['Return'] + oos2_results['Return']) / 2
-                total_oos_trades = oos1_results['Trades'] + oos2_results['Trades']
-                total_oos_win_rate = (oos1_results['Win_Rate'] + oos2_results['Win_Rate']) / 2
-
                 # Additional metrics
                 calmar_ratio = total_return_is / max_drawdown if max_drawdown > 0 else 0
                 if len(returns) > 1:
@@ -1307,9 +1265,6 @@ class FuturesTrader:
                     consistency_score = max(0, 100 - return_volatility)
                 else:
                     consistency_score = 0
-                
-                oos_is_ratio = abs(total_oos_return / total_return_is) if total_return_is != 0 else 0
-                robustness_score = max(0, 100 - abs(100 * (1 - oos_is_ratio)))
 
                 # Calculate trade balance metrics
                 if not trades_df_is.empty and 'Position' in trades_df_is.columns:
@@ -1413,16 +1368,13 @@ class FuturesTrader:
                         avg_unprofitable_long = avg_unprofitable_trade if long_trades > short_trades else 0
                         avg_unprofitable_short = avg_unprofitable_trade if short_trades > long_trades else 0
 
-                # Calculate composite score and additional metrics
-                oos1_score = (oos1_results['Return'] * w_return) + (oos1_results['Win_Rate'] * w_winrate) + (min(oos1_results['Trades'], 100) * w_trades)
-                oos2_score = (oos2_results['Return'] * w_return) + (oos2_results['Win_Rate'] * w_winrate) + (min(oos2_results['Trades'], 100) * w_trades)
-                composite_score = (score * 0.6) + (oos1_score * 0.2) + (oos2_score * 0.2)
-                
+                composite_score = score
+
                 trial.set_user_attr('results', {
                     'Total_Return': total_return_is, 'Total_Trades': total_trades_is, 'Win_Rate': win_rate_is,
                     'Max_Drawdown': max_drawdown, 'Sharpe_Ratio': sharpe_ratio, 'Profit_Factor': profit_factor,
                     'Score': score, 'Calmar_Ratio': calmar_ratio, 'Consistency_Score': consistency_score,
-                    'Robustness_Score': robustness_score, 'Long_Trades': long_trades, 'Short_Trades': short_trades,
+                    'Long_Trades': long_trades, 'Short_Trades': short_trades,
                     'Trade_Balance_Ratio': trade_balance_ratio, 'Trade_Balance_Score': trade_balance_score,
                     'Trade_Difference': trade_difference,
                     'Profitable_Trades': profitable_trade_count, 'Unprofitable_Trades': unprofitable_trade_count,
@@ -1431,9 +1383,7 @@ class FuturesTrader:
                     'Avg_Profitable_Trade': round(avg_profitable_trade, 2), 'Avg_Unprofitable_Trade': round(avg_unprofitable_trade, 2),
                     'Avg_Profitable_Long': round(avg_profitable_long, 2), 'Avg_Profitable_Short': round(avg_profitable_short, 2),
                     'Avg_Unprofitable_Long': round(avg_unprofitable_long, 2), 'Avg_Unprofitable_Short': round(avg_unprofitable_short, 2),
-                    'OOS1_Return': oos1_results['Return'], 'OOS1_Trades': oos1_results['Trades'], 'OOS1_Win_Rate': oos1_results['Win_Rate'],
-                    'OOS2_Return': oos2_results['Return'], 'OOS2_Trades': oos2_results['Trades'], 'OOS2_Win_Rate': oos2_results['Win_Rate'],
-                    'Total_OOS_Return': total_oos_return, 'Composite_Score': composite_score, 'params': params
+                    'Composite_Score': composite_score, 'params': params
                 })
                 return score
             except Exception as e:
@@ -1459,8 +1409,6 @@ class FuturesTrader:
                 ret = results.get('Total_Return', 0)
                 wr = results.get('Win_Rate', 0)
                 trades = results.get('Total_Trades', 0)
-                oos1_ret = results.get('OOS1_Return', 0)
-                oos2_ret = results.get('OOS2_Return', 0)
 
                 # Add relevant parameters to log based on strategy
                 param_parts = []
@@ -1494,7 +1442,7 @@ class FuturesTrader:
 
                 if param_parts:
                     message += f" | Params: {'/'.join(param_parts)}"
-                message += f" | Ret: {ret:.2f}% | WR: {wr:.1f}% | Trades: {trades} | OOS1: {oos1_ret:.2f}% | OOS2: {oos2_ret:.2f}%"
+                message += f" | Ret: {ret:.2f}% | WR: {wr:.1f}% | Trades: {trades}"
             elif trial.state != optuna.trial.TrialState.RUNNING:
                 message += f" ({trial.state.name})"
             
@@ -1854,14 +1802,8 @@ def build_optimizer_panel():
                                                                 ['5m', '15m', '30m', '1h', '4h']], value='1h',
                                                        className='custom-input', clearable=False)],
                 className='flex-item'),
-                html.Div([html.Label("In-Sample (IS) Date Range"),
-                          date_range_inputs('is-date', sixty_days_ago.date(), fifteen_days_ago.date())],
-                         className='flex-item'),
-                html.Div([html.Label("Out-of-Sample 1 (OOS1) Date Range"),
-                          date_range_inputs('oos1-date', fifteen_days_ago.date(), (today - timedelta(days=7)).date())],
-                         className='flex-item'),
-                html.Div([html.Label("Out-of-Sample 2 (OOS2) Date Range"),
-                          date_range_inputs('oos2-date', (today - timedelta(days=7)).date(), today.date())],
+                html.Div([html.Label("Optimization Date Range"),
+                          date_range_inputs('is-date', sixty_days_ago.date(), today.date())],
                          className='flex-item'),
                 html.Div(
                     [html.Label("Number of Trials"),
@@ -1911,27 +1853,6 @@ def build_optimizer_panel():
                               dcc.Input(id='weight-trades-input', type='number', value=20, min=0,
                                         className='custom-input')], className='flex-item'),
                 ], className='flex-container'),
-                html.Hr(style={'margin': '15px 0'}),
-                html.H4("Trade Balance Filter", style={'textAlign': 'center'}),
-                html.Div([
-                    html.Div([
-                        dcc.Checklist(
-                            id='trade-balance-filter-checkbox',
-                            options=[{'label': ' Enable Trade Balance Filter (balanced long/short trades)', 'value': 'enabled'}],
-                            value=[],
-                            className='custom-checklist'
-                        )
-                    ], className='flex-item'),
-                    html.Div([
-                        html.Label("Max Long/Short Ratio:"),
-                        dcc.Input(id='max-trade-ratio-input', type='number', value=3.0, min=1.0, max=10.0, step=0.1,
-                                  className='custom-input', disabled=True)
-                    ], className='flex-item', style={'marginLeft': '20px'})
-                ], className='flex-container', style={'alignItems': 'center'}),
-                html.P("• Filters out strategies heavily biased toward long or short trades", 
-                       style={'fontSize': '12px', 'color': '#888', 'margin': '5px 0 0 0', 'textAlign': 'center'}),
-                html.P("• Ratio 2.0 means max 2:1 long:short or short:long trade count", 
-                       style={'fontSize': '12px', 'color': '#888', 'margin': '0 0 15px 0', 'textAlign': 'center'})
             ], className='control-panel-group'),
             html.Div([
                 html.Div([
@@ -1976,7 +1897,6 @@ def build_refine_panel():
                             {'label': 'Sharpe Ratio', 'value': 'Sharpe_Ratio'},
                             {'label': 'Calmar Ratio (Risk-Adjusted)', 'value': 'Calmar_Ratio'},
                             {'label': 'Consistency Score', 'value': 'Consistency_Score'},
-                            {'label': 'Robustness Score (IS/OOS)', 'value': 'Robustness_Score'},
                             {'label': 'Trade Balance Score', 'value': 'Trade_Balance_Score'},
                             {'label': 'Trade Balance Ratio (Lower Better)', 'value': 'Trade_Balance_Ratio'},
                             {'label': 'Trade Difference (Lower Better)', 'value': 'Trade_Difference'},
@@ -1985,10 +1905,6 @@ def build_refine_panel():
                             {'label': 'Avg Profitable Long', 'value': 'Avg_Profitable_Long'},
                             {'label': 'Avg Profitable Short', 'value': 'Avg_Profitable_Short'},
                             {'label': 'Avg Unprofitable Trade (Higher Better)', 'value': 'Avg_Unprofitable_Trade'},
-                            {'label': 'OOS1 Return %', 'value': 'OOS1_Return'},
-                            {'label': 'OOS2 Return %', 'value': 'OOS2_Return'},
-                            {'label': 'Total OOS Return %', 'value': 'Total_OOS_Return'},
-                            {'label': 'Composite Score', 'value': 'Composite_Score'},
                             {'label': 'Max Drawdown (Lower Better)', 'value': 'Max_Drawdown'},
                         ],
                         value='Score',
@@ -2004,7 +1920,6 @@ def build_refine_panel():
                             {'label': 'Score (Weighted)', 'value': 'Score'},
                             {'label': 'Total Return %', 'value': 'Total_Return'},
                             {'label': 'Calmar Ratio', 'value': 'Calmar_Ratio'},
-                            {'label': 'Robustness Score', 'value': 'Robustness_Score'},
                             {'label': 'Trade Balance Score', 'value': 'Trade_Balance_Score'},
                             {'label': 'Avg Profitable Trade', 'value': 'Avg_Profitable_Trade'},
                             {'label': 'Profitable Trades Count', 'value': 'Profitable_Trades'},
@@ -2481,7 +2396,7 @@ def _build_portfolio_figure_and_trades(trades_df, portfolio_df):
      Output('applied-params-store', 'data', allow_duplicate=True)],
     Input('opt-results-table', 'active_cell'),
     [State('opt-results-table', 'derived_viewport_data'),
-     State('date-range-start', 'value'), State('date-range-end', 'value'),
+     State('is-date-start', 'value'), State('is-date-end', 'value'),
      State('capital-input', 'value')],
     prevent_initial_call=True
 )
@@ -2806,17 +2721,6 @@ def set_parameter_presets(fast, normal, deep):
     return [no_update] * 6
 
 
-# Trade balance filter checkbox callback
-@app.callback(
-    Output('max-trade-ratio-input', 'disabled'),
-    Input('trade-balance-filter-checkbox', 'value'),
-    prevent_initial_call=True
-)
-def toggle_trade_ratio_input(checkbox_value):
-    """Enable/disable trade ratio input based on checkbox."""
-    return 'enabled' not in (checkbox_value or [])
-
-
 # Dynamic parameter visibility callback
 @app.callback(
     [Output('candlestick-params-container', 'style'),
@@ -3040,30 +2944,21 @@ def toggle_opt_buttons(status):
      State('opt-timeframe-dropdown', 'value'),                  # timeframe
      State('is-date-start', 'value'),                     # is_start
      State('is-date-end', 'value'),                       # is_end
-     State('oos1-date-start', 'value'),                   # oos1_start
-     State('oos1-date-end', 'value'),                     # oos1_end
-     State('oos2-date-start', 'value'),                   # oos2_start
-     State('oos2-date-end', 'value'),                     # oos2_end
      State('weight-return-input', 'value'),                     # weight_return
      State('weight-winrate-input', 'value'),                    # weight_winrate
      State('weight-trades-input', 'value'),                     # weight_trades
-     State('optimization-mode-dropdown', 'value'),              # optimization_mode
-     State('trade-balance-filter-checkbox', 'value'),           # trade_balance_checkbox
-     State('max-trade-ratio-input', 'value')],                  # max_trade_ratio
+     State('optimization-mode-dropdown', 'value')],             # optimization_mode
     prevent_initial_call=True
 )
-def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str, sw_str, slr_str, 
+def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str, sw_str, slr_str,
                                exit_minus_str, exit_plus_str, n_trials, min_trades, min_candles,
-                               strategy_name, timeframe, is_start, is_end, oos1_start, oos1_end, 
-                               oos2_start, oos2_end, weight_return, weight_winrate, weight_trades,
-                               optimization_mode,
-                               trade_balance_checkbox, max_trade_ratio):
+                               strategy_name, timeframe, is_start, is_end,
+                               weight_return, weight_winrate, weight_trades,
+                               optimization_mode):
     
     # DEBUG: Add explicit debug logging to verify date alignment
     print(f"DEBUG: Optimization Trigger Received")
-    print(f"DEBUG: IS Dates: {is_start} to {is_end}")
-    print(f"DEBUG: OOS1 Dates: {oos1_start} to {oos1_end}")
-    print(f"DEBUG: OOS2 Dates: {oos2_start} to {oos2_end}")
+    print(f"DEBUG: Optimization Dates: {is_start} to {is_end}")
     print(f"DEBUG: Strategy: {strategy_name}, Timeframe: {timeframe}")
     print(f"DEBUG: Selected Pairs: {pairs}")
     print(f"DEBUG: Selected Params: {selected_params}")
@@ -3095,7 +2990,7 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
 
     # Proper validation - check data availability for all pairs
     overall_start_date = is_start
-    overall_end_date = oos2_end  # Use the end of OOS2 as the overall end date
+    overall_end_date = is_end
 
     for symbol in pairs:
         try:
@@ -3136,20 +3031,14 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
         add_optimization_log(f"⚠️ Skipped pairs: {', '.join(skipped_pairs)}")
 
     try:
-        # Check if trade balance filter is enabled
-        use_trade_balance_filter = 'enabled' in (trade_balance_checkbox or [])
-        max_trade_ratio_val = float(max_trade_ratio) if use_trade_balance_filter and max_trade_ratio is not None else 3.0
-        
         settings = {
             'pairs': valid_pairs, 'selected_params': selected_params, 'bw_str': bw_str, 'bl_str': bl_str,
             'sw_str': sw_str, 'slr_str': slr_str, 'exit_minus_str': exit_minus_str, 'exit_plus_str': exit_plus_str, 'n_trials': int(n_trials),
             'min_trades': int(min_trades), 'min_candles': min_candles_val, 'strategy_name': strategy_name, 'timeframe': timeframe,
-            'is_start': is_start, 'is_end': is_end, 
-            'oos1_start': oos1_start, 'oos1_end': oos1_end, 'oos2_start': oos2_start, 'oos2_end': oos2_end,
+            'is_start': is_start, 'is_end': is_end,
             'weight_return': weight_return, 'weight_winrate': weight_winrate,
             'weight_trades': weight_trades,
-            'optimization_mode': optimization_mode or 'efficient', 'use_trade_balance_filter': use_trade_balance_filter,
-            'max_trade_ratio': max_trade_ratio_val
+            'optimization_mode': optimization_mode or 'efficient',
         }
     except (ValueError, TypeError) as e:
         msg = f"Error: Invalid numeric input. Please check values. Details: {e}"
@@ -3210,8 +3099,8 @@ def run_optimization_task(n_intervals, settings):
     df_results = trader.optimize_trading_pairs(
         trading_pairs=pairs, param_ranges=param_ranges, selected_params=settings['selected_params'],
         is_start_date=settings['is_start'], is_end_date=settings['is_end'],
-        oos1_start_date=settings['oos1_start'], oos1_end_date=settings['oos1_end'],
-        oos2_start_date=settings['oos2_start'], oos2_end_date=settings['oos2_end'],
+        oos1_start_date=settings['is_start'], oos1_end_date=settings['is_end'],
+        oos2_start_date=settings['is_start'], oos2_end_date=settings['is_end'],
         timeframe=settings['timeframe'], min_trades=settings['min_trades'], n_trials=settings['n_trials'],
         weights=weights, min_candles=settings['min_candles'], stop_event=OPTIMIZATION_STOP_EVENT,
         pause_event=OPTIMIZATION_PAUSE_EVENT, optimization_mode=optimization_mode, strategy_name=strategy_name
@@ -3232,29 +3121,6 @@ def run_optimization_task(n_intervals, settings):
     # Store original results for file export (before filtering)
     df_all_results_for_export = df_results.copy() if not df_results.empty else pd.DataFrame()
     
-    # Apply trade balance filter if enabled (for UI display only)
-    if not df_results.empty and settings.get('use_trade_balance_filter', False):
-        max_ratio = settings.get('max_trade_ratio', 3.0)
-        initial_count = len(df_results)
-        
-        # Filter results based on trade balance ratio for UI display
-        if 'Trade_Balance_Ratio' in df_results.columns:
-            df_results_filtered = df_results[df_results['Trade_Balance_Ratio'] <= max_ratio]
-            filtered_count = len(df_results_filtered)
-            add_optimization_log(f"🎯 Trade Balance Filter: {filtered_count}/{initial_count} results meet criteria (max ratio: {max_ratio})")
-            
-            if filtered_count < initial_count:
-                add_optimization_log(f"   {initial_count - filtered_count} strategies have unbalanced long/short trades")
-                add_optimization_log(f"   All results will be included in exported files for manual review")
-            
-            # Use filtered results for UI display if any meet criteria
-            if filtered_count > 0:
-                df_results = df_results_filtered
-            else:
-                add_optimization_log("⚠️ No results meet trade balance criteria, showing all results")
-        else:
-            add_optimization_log("⚠️ Trade Balance Filter enabled but ratio data not available")
-
     if df_results.empty:
         message = "⚠️ Optimization finished, but no valid results were found that met the criteria."
         if not OPTIMIZATION_STOP_EVENT.is_set():
@@ -3280,25 +3146,18 @@ def run_optimization_task(n_intervals, settings):
             results_for_export = df_all_results_for_export if not df_all_results_for_export.empty else df_results
             message = f"✅ Optimization complete! Found {len(results_for_export)} total valid results from {len(pairs)} pairs."
             
-            # Add trade balance info to message if filter was applied
-            if settings.get('use_trade_balance_filter', False) and not df_results.empty:
-                balanced_count = len(df_results)
-                total_count = len(results_for_export)
-                if balanced_count < total_count:
-                    message += f"\n🎯 {balanced_count} results meet trade balance criteria, {total_count} total results in file for manual review."
-            
             output_best = io.BytesIO()
             # Use complete results for best per pair calculation
             df_best_all = results_for_export.loc[results_for_export.groupby('Trading_Pair')['Score'].idxmax()].copy() if not results_for_export.empty else pd.DataFrame()
             if not df_best_all.empty:
                 df_best_all.to_excel(output_best, index=False, sheet_name='Best_Results')
-            file1 = {'object': output_best, 'filename': f"Best_Results_{settings['is_start']}_to_{settings['oos2_end']}.xlsx",
+            file1 = {'object': output_best, 'filename': f"Best_Results_{settings['is_start']}_to_{settings['is_end']}.xlsx",
                      'caption': "Top result for each pair (all results included)."}
             
             output_all = io.BytesIO()
             if not results_for_export.empty:
                 results_for_export.to_excel(output_all, index=False, sheet_name='All_Trials')
-            file2 = {'object': output_all, 'filename': f"All_Trials_{settings['is_start']}_to_{settings['oos2_end']}.xlsx",
+            file2 = {'object': output_all, 'filename': f"All_Trials_{settings['is_start']}_to_{settings['is_end']}.xlsx",
                      'caption': "All valid trials."}
             send_telegram_notification(message, files=[file1, file2])
         except Exception as e:
@@ -3329,7 +3188,7 @@ def update_logs(n): return "\n".join(OPTIMIZATION_LOGS)
     Output('download-opt-xlsx', 'data'),
     Input('export-opt-results-btn', 'n_clicks'),
     [State('all-trials-store', 'data'), State('is-date-start', 'value'),
-     State('oos2-date-end', 'value')],
+     State('is-date-end', 'value')],
     prevent_initial_call=True
 )
 def export_opt_results(n_clicks, all_trials_data, start_date, end_date):
@@ -3349,7 +3208,7 @@ def export_opt_results(n_clicks, all_trials_data, start_date, end_date):
 @app.callback(
     Output('download-all-trials-xlsx', 'data'),
     Input('export-all-trials-btn', 'n_clicks'),
-    [State('all-trials-store', 'data'), State('is-date-start', 'value'), State('oos2-date-end', 'value')],
+    [State('all-trials-store', 'data'), State('is-date-start', 'value'), State('is-date-end', 'value')],
     prevent_initial_call=True
 )
 def export_all_trials_results(n_clicks, all_trials_data, start_date, end_date):
@@ -3368,7 +3227,7 @@ def export_all_trials_results(n_clicks, all_trials_data, start_date, end_date):
     Output('download-partial-opt-xlsx', 'data'),
     Input('download-partial-results-btn', 'n_clicks'),
     [State('is-date-start', 'value'),
-     State('oos2-date-end', 'value')],
+     State('is-date-end', 'value')],
     prevent_initial_call=True
 )
 def export_partial_opt_results(n_clicks, start_date, end_date):
