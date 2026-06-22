@@ -431,9 +431,12 @@ STRATEGY_REGISTRY = {
 class Backtester:
     """Handles the logic for running a backtest on historical data with trading signals."""
 
-    def __init__(self, initial_capital=10000, fee_percent=0.05):
+    def __init__(self, initial_capital=10000, fee_percent=0.05, sizing_mode='fixed'):
         self.initial_capital = initial_capital
         self.fee_percent = fee_percent / 100
+        # 'fixed'      -> every trade sized off the initial capital (no compounding)
+        # 'compound'   -> every trade sized off the running equity (compounding)
+        self.sizing_mode = 'compound' if str(sizing_mode).lower() == 'compound' else 'fixed'
         self.trades = []
         self.portfolio_value = []
 
@@ -449,12 +452,11 @@ class Backtester:
         self.trades = []
         self.portfolio_value = []
         capital = self.initial_capital   # running realized equity
-        # Fixed per-trade size: every trade is sized off the INITIAL capital,
-        # not the result of the previous trade (no compounding).
-        base = self.initial_capital
+        compounding = self.sizing_mode == 'compound'
         position = 0
         entry_price = 0
         entry_date = None
+        entry_base = self.initial_capital  # size of the open trade
 
         # Convert to list for index-based access
         df_list = list(df_with_signals.itertuples())
@@ -464,11 +466,11 @@ class Backtester:
             current_price = row.Close  # Access using dot notation
             current_signal = getattr(row, 'position', 0)  # Safe access to position column
 
-            # Portfolio value = realized equity + unrealized PnL on the fixed base
+            # Portfolio value = realized equity + unrealized PnL on the trade's base
             if position == 1:
-                portfolio_val = capital + (base * (current_price / entry_price) - base)
+                portfolio_val = capital + (entry_base * (current_price / entry_price) - entry_base)
             elif position == -1:
-                portfolio_val = capital + (base * (1 + (entry_price - current_price) / entry_price) - base)
+                portfolio_val = capital + (entry_base * (1 + (entry_price - current_price) / entry_price) - entry_base)
             else:
                 portfolio_val = capital
             self.portfolio_value.append({
@@ -501,16 +503,16 @@ class Backtester:
                         exit_date = date
                     
                     if position == 1:
-                        position_value = base * (exit_price / entry_price)
+                        position_value = entry_base * (exit_price / entry_price)
                     else:
-                        position_value = base * (
+                        position_value = entry_base * (
                             1 + (entry_price - exit_price) / entry_price
                         )
 
                     fee = self.calculate_trading_fee(position_value)
                     net_value = position_value - fee
-                    pnl = net_value - base
-                    pnl_percent = (pnl / base) * 100 if base > 0 else 0
+                    pnl = net_value - entry_base
+                    pnl_percent = (pnl / entry_base) * 100 if entry_base > 0 else 0
 
                     self.trades.append({
                         'Entry_Date': entry_date,
@@ -535,6 +537,8 @@ class Backtester:
                         position = current_signal
                         entry_price = getattr(next_row, 'Open', next_row.Close)  # Use next candle's OPEN price
                         entry_date = next_row.Index  # Use next candle's timestamp
+                        # Compounding sizes off current equity; fixed off initial.
+                        entry_base = capital if compounding else self.initial_capital
                     # If no next candle available, skip the trade (edge case handling)
 
         # Close any open position at the end of the data
@@ -544,15 +548,15 @@ class Backtester:
             exit_date = last_row.name
             exit_reason = 'End of Data'
             if position == 1:
-                position_value = base * (exit_price / entry_price)
+                position_value = entry_base * (exit_price / entry_price)
             else:
-                position_value = base * (
+                position_value = entry_base * (
                     1 + (entry_price - exit_price) / entry_price
                 )
             fee = self.calculate_trading_fee(position_value)
             net_value = position_value - fee
-            pnl = net_value - base
-            pnl_percent = (pnl / base) * 100 if base > 0 else 0
+            pnl = net_value - entry_base
+            pnl_percent = (pnl / entry_base) * 100 if entry_base > 0 else 0
             capital = capital + pnl
             pos_type = 'Long' if position == 1 else 'Short'
             self.trades.append({
