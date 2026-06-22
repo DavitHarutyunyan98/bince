@@ -152,10 +152,18 @@ class HybridSymbolTrader:
                 self.position = 1 if pos_amt > 0 else -1 if pos_amt < 0 else 0
                 logger.info(
                     f"[{self.symbol}] Initial position: {self.position}")
-                
-                # If we have an existing position, mark as opened
+
+                # If we have an existing position, mark as opened and adopt its
+                # real entry price from the exchange so PnL reports correctly.
                 if self.position != 0:
                     self.initial_position_opened = True
+                    try:
+                        ep = float(position_info[0].get("entryPrice", 0) or 0)
+                        if ep > 0:
+                            self.entry_price = ep
+                            logger.info(f"[{self.symbol}] Adopted entry price: {ep}")
+                    except (TypeError, ValueError):
+                        pass
             else:
                 self.position = 0
                 logger.info(f"[{self.symbol}] No initial position")
@@ -174,6 +182,16 @@ class HybridSymbolTrader:
                 if exchange_position != self.position:
                     logger.warning(f"[{self.symbol}] Position sync: Internal={self.position}, Exchange={exchange_position}")
                     self.position = exchange_position
+                    # Adopt the exchange entry price so PnL stays accurate.
+                    if exchange_position != 0:
+                        try:
+                            ep = float(position_info[0].get("entryPrice", 0) or 0)
+                            if ep > 0:
+                                self.entry_price = ep
+                        except (TypeError, ValueError):
+                            pass
+                    else:
+                        self.entry_price = 0.0
                     return True
             return False
         except Exception as e:
