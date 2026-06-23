@@ -16,28 +16,48 @@ from datetime import datetime, timezone, timedelta
 from binance.client import Client
 from strategy_utils import STRATEGY_REGISTRY
 
-# Persisted reference equity for compounding. Captured once (the first time the
-# bot ever sizes a compound trade) and reused across restarts, so position size
-# genuinely scales with account growth instead of resetting to "fixed" on every
-# restart.
+# Persisted per-symbol realized PnL for compounding. To mirror the backtester
+# (which sizes every trade off that one symbol's running realized equity), each
+# symbol accumulates its OWN realized PnL here and scales its notional by it.
+# The value survives restarts so compounding doesn't reset to "fixed" each time.
+# Schema: {"<SYMBOL>": {"realized_pnl": <float>}, ...}
 COMPOUND_STATE_FILE = "compound_state.json"
 
+# Read-modify-write of the shared state file happens from multiple per-symbol
+# trader threads, so guard it with a lock to avoid lost updates.
+_compound_state_lock = threading.Lock()
 
-def load_compound_reference():
+
+def _load_compound_state():
     try:
         with open(COMPOUND_STATE_FILE) as f:
-            val = float(json.load(f).get("reference_equity", 0) or 0)
-            return val if val > 0 else None
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except Exception:
-        return None
+        return {}
 
 
-def save_compound_reference(value):
-    try:
-        with open(COMPOUND_STATE_FILE, "w") as f:
-            json.dump({"reference_equity": float(value)}, f)
-    except Exception:
-        pass
+def load_symbol_realized_pnl(symbol):
+    """Cumulative realized PnL persisted for one symbol (0.0 if none yet)."""
+    entry = _load_compound_state().get(symbol)
+    if isinstance(entry, dict):
+        try:
+            return float(entry.get("realized_pnl", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            return 0.0
+    return 0.0
+
+
+def save_symbol_realized_pnl(symbol, realized_pnl):
+    """Persist one symbol's cumulative realized PnL without clobbering others."""
+    with _compound_state_lock:
+        state = _load_compound_state()
+        state[symbol] = {"realized_pnl": float(realized_pnl)}
+        try:
+            with open(COMPOUND_STATE_FILE, "w") as f:
+                json.dump(state, f)
+        except Exception:
+            pass
 
 
 # Setup logging
@@ -90,7 +110,13 @@ class HybridSymbolTrader:
         # notional with account-equity growth relative to a baseline captured
         # at the first trade (mirrors the compounding backtest).
         self.sizing_mode = str(self.trade_config.get("sizing_mode", "fixed")).lower()
-        self.base_equity = None
+        # Per-symbol cumulative realized PnL used for compounding. Restored from
+        # disk so sizing keeps compounding across restarts (mirrors the
+        # backtester, which sizes each trade off this symbol's running equity).
+        self.compound_realized_pnl = (
+            load_symbol_realized_pnl(self.symbol)
+            if self.sizing_mode == "compound" else 0.0
+        )
         self.poll_interval = self._get_poll_interval()
 
         # Position tracking
@@ -503,6 +529,11 @@ class HybridSymbolTrader:
                 pnl = (self.entry_price - self.current_price) * position_size
 
             self.session_pnl += pnl
+            # Accumulate realized PnL for compound sizing so the next entry is
+            # sized off this symbol's running equity (and survives restarts).
+            if self.sizing_mode == 'compound':
+                self.compound_realized_pnl += pnl
+                save_symbol_realized_pnl(self.symbol, self.compound_realized_pnl)
             # Update position tracking immediately after closing
             self.position = 0
 
@@ -534,18 +565,21 @@ class HybridSymbolTrader:
 
     def _get_effective_units(self):
         """USDT notional to use for the next entry. Fixed = units_usdt as-is.
-        Compound = units_usdt scaled by current equity / persisted reference."""
+
+        Compound mirrors the backtester: it sizes each trade off this symbol's
+        OWN running realized equity. Treating the configured ``units_usdt`` as
+        the symbol's equity base, the running equity is
+        ``units_usdt + cumulative_realized_pnl``, so the next notional grows (or
+        shrinks) by exactly this symbol's accumulated profit. The total account
+        balance and other symbols' performance are intentionally ignored."""
         if self.sizing_mode != 'compound':
             return self.units_usdt
-        equity = self._get_account_equity()
-        if not equity or equity <= 0:
-            return self.units_usdt
-        ref = load_compound_reference()
-        if ref is None or ref <= 0:
-            ref = equity
-            save_compound_reference(ref)
-            logger.info(f"[{self.symbol}] Compounding reference equity set: {ref:.2f} USDT")
-        return self.units_usdt * (equity / ref)
+        effective = self.units_usdt + self.compound_realized_pnl
+        # Never size a non-positive (or vanishingly small) notional; if this
+        # symbol has drawn down past its base, fall back to a small floor so it
+        # can still trade its way back, just like the backtest keeps trading.
+        min_units = max(self.units_usdt * 0.1, 1.0)
+        return max(effective, min_units)
 
     def _get_trade_quantity(self):
         """Calculate trade quantity from the effective USDT notional."""
