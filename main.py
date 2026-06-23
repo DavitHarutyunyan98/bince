@@ -9,6 +9,7 @@ import logging
 import json
 import io
 import os
+import base64
 import random
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import re
@@ -2143,7 +2144,55 @@ def build_refine_panel():
 
 
 # --- App Layout ---
+def build_batch_backtest_panel():
+    """Upload a trade-config JSON (the same one the live bot uses) and backtest
+    every enabled pair at once over a shared date range. Each pair is sized off
+    its own ``units_usdt`` with its own ``sizing_mode``, mirroring the live bot
+    and the compare_backtest_log tool."""
+    today = datetime.now().date()
+    thirty_days_ago = today - timedelta(days=30)
+    return create_collapsible_container("Batch Backtest (from Config)", "batch-panel", [
+        html.Div([
+            html.Div([
+                html.Label('Trade Config (JSON):'),
+                dcc.Upload(
+                    id='batch-config-upload',
+                    children=html.Div(['Drag & drop or ', html.A('select a trade_config.json')]),
+                    multiple=False,
+                    className='custom-input',
+                    style={'border': '1px dashed #555', 'padding': '12px',
+                           'textAlign': 'center', 'cursor': 'pointer'}),
+                html.Div(id='batch-upload-status',
+                         style={'marginTop': '6px', 'color': '#9aa'}),
+            ], className='config-item'),
+            html.Div([html.Label('Date Range:'),
+                      date_range_inputs('batch-date', thirty_days_ago, today)],
+                     className='config-item'),
+        ], className='config-row'),
+        html.Div([
+            html.Button('Run Batch Backtest', id='batch-backtest-button',
+                        n_clicks=0, className='custom-button'),
+        ], style={'marginTop': '10px'}),
+        html.H4(id='batch-summary',
+                style={'textAlign': 'center', 'color': '#4CAF50', 'margin': '15px'}),
+        html.Div(dash_table.DataTable(
+            id='batch-results-table',
+            style_cell={'backgroundColor': '#2c2c2c', 'color': '#f0f0f0',
+                        'border': '1px solid #444', 'textAlign': 'center'},
+            style_header={'backgroundColor': '#1c1c1c', 'fontWeight': 'bold'},
+            style_data_conditional=[
+                {'if': {'column_id': 'PnL', 'filter_query': '{PnL} > 0'},
+                 'color': '#4caf50', 'fontWeight': 'bold'},
+                {'if': {'column_id': 'PnL', 'filter_query': '{PnL} < 0'},
+                 'color': '#f44336', 'fontWeight': 'bold'},
+            ],
+            sort_action='native'),
+            style={'overflowX': 'auto'}),
+    ])
+
+
 app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', 'padding': '10px'}, children=[
+    dcc.Store(id='batch-config-store'),
     dcc.Store(id='trades-data-store'),
     dcc.Store(id='split-data-store'),
     dcc.Store(id='all-pairs-store'),
@@ -2166,6 +2215,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
     html.Div([
         html.H2("Futures Dashboard", style={'margin': '0', 'flex': '1'}),
         html.A('Manual Backtester', href='#manual-section', className='nav-link'),
+        html.A('Batch Backtest', href='#batch-section', className='nav-link'),
         html.A('Optimizer', href='#optimizer-section', className='nav-link'),
         html.A('Backtest Results', href='#manual-results-section',
                className='nav-link'),
@@ -2179,6 +2229,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
     html.Div([
         html.Div(build_config_panel(), id='manual-section'),
         html.Div(build_live_config_panel(), id='live-config-section'),
+        html.Div(build_batch_backtest_panel(), id='batch-section'),
         html.Div(build_optimizer_panel(), id='optimizer-section'),
     ], className='main-container'),
     html.Hr(style={'borderColor': '#555', 'marginTop': '30px'}),
@@ -2519,6 +2570,114 @@ def run_backtest_callback(n_clicks, capital, strategy_name, param_values, param_
     split_cols = [{"name": c, "id": c} for c in (split_records[0].keys() if split_records else [])]
     return (fig, trades_data, trades_cols, style_data_conditional, summary_text, trades_data,
             split_records, split_cols, split_records)
+
+
+@app.callback(
+    [Output('batch-config-store', 'data'),
+     Output('batch-upload-status', 'children')],
+    Input('batch-config-upload', 'contents'),
+    State('batch-config-upload', 'filename'),
+    prevent_initial_call=True,
+)
+def store_batch_config(contents, filename):
+    """Parse an uploaded trade-config JSON into the batch store."""
+    if not contents:
+        return no_update, no_update
+    try:
+        _, b64 = contents.split(',', 1)
+        configs = json.loads(base64.b64decode(b64).decode('utf-8'))
+        if isinstance(configs, dict):
+            configs = [configs]
+        if not isinstance(configs, list) or not configs:
+            return None, "❌ Config must be a non-empty list of pair objects."
+        enabled = [c for c in configs if c.get('enabled', True)]
+        return configs, (f"✅ Loaded {filename or 'config'}: "
+                         f"{len(configs)} pairs ({len(enabled)} enabled).")
+    except Exception as e:
+        return None, f"❌ Could not parse JSON: {e}"
+
+
+@app.callback(
+    [Output('batch-results-table', 'data'),
+     Output('batch-results-table', 'columns'),
+     Output('batch-summary', 'children')],
+    Input('batch-backtest-button', 'n_clicks'),
+    [State('batch-config-store', 'data'),
+     State('batch-date-start', 'value'),
+     State('batch-date-end', 'value')],
+    prevent_initial_call=True,
+)
+def run_batch_backtest(n_clicks, configs, start_date, end_date):
+    """Backtest every enabled pair in the uploaded config over one date range.
+
+    Each pair is sized off its own ``units_usdt`` (as initial capital) with its
+    own ``sizing_mode``, so totals are directly comparable to the live bot."""
+    if not configs:
+        return [], [], "Upload a trade config first."
+    if trader is None or trader.client is None:
+        return [], [], "Binance client unavailable."
+
+    rows = []
+    tot_pnl = tot_trades = 0.0
+    tot_base = 0.0
+    for cfg in configs:
+        if not cfg.get('enabled', True):
+            continue
+        symbol = str(cfg.get('symbol', '')).upper()
+        strat_cls = STRATEGY_REGISTRY.get(cfg.get('strategy_name'))
+        bar = cfg.get('bar_length', '15m')
+        base = float(cfg.get('units_usdt', 100.0))
+        sizing = cfg.get('sizing_mode', 'fixed')
+        if not symbol or not strat_cls:
+            rows.append({'Symbol': symbol or '?', 'Strategy': cfg.get('strategy_name', '?'),
+                         'Bar': bar, 'Trades': 0, 'Win %': '-', 'PnL': 0.0,
+                         'Return %': '-', 'Sizing': sizing, 'Base': base,
+                         'Note': 'unknown strategy/symbol'})
+            continue
+        try:
+            df = trader.get_historical_data_for_symbol(symbol, bar, start_date, end_date)
+        except Exception as e:
+            df = None
+            err = str(e)
+        else:
+            err = None
+        if df is None or df.empty:
+            rows.append({'Symbol': symbol, 'Strategy': cfg.get('strategy_name'),
+                         'Bar': bar, 'Trades': 0, 'Win %': '-', 'PnL': 0.0,
+                         'Return %': '-', 'Sizing': sizing, 'Base': base,
+                         'Note': f'no data{": " + err if err else ""}'})
+            continue
+        signals = strat_cls().generate_signals(df.copy(), cfg)
+        bt = Backtester(initial_capital=base, sizing_mode=sizing)
+        trades_df, portfolio_df = bt.run_backtest(signals)
+        n = 0 if trades_df is None else len(trades_df)
+        pnl = 0.0 if trades_df is None or trades_df.empty else float(trades_df['PnL'].sum())
+        wins = 0 if trades_df is None or trades_df.empty else int((trades_df['PnL'] > 0).sum())
+        win_pct = f"{(wins / n * 100):.1f}" if n else '-'
+        ret_pct = f"{(pnl / base * 100):.2f}" if base else '-'
+        rows.append({'Symbol': symbol, 'Strategy': cfg.get('strategy_name'),
+                     'Bar': bar, 'Trades': n, 'Win %': win_pct,
+                     'PnL': round(pnl, 2), 'Return %': ret_pct,
+                     'Sizing': sizing, 'Base': base, 'Note': ''})
+        tot_pnl += pnl
+        tot_trades += n
+        tot_base += base
+
+    if not rows:
+        return [], [], "No enabled pairs in config."
+    rows.append({'Symbol': 'TOTAL', 'Strategy': '', 'Bar': '',
+                 'Trades': int(tot_trades), 'Win %': '',
+                 'PnL': round(tot_pnl, 2),
+                 'Return %': f"{(tot_pnl / tot_base * 100):.2f}" if tot_base else '-',
+                 'Sizing': '', 'Base': round(tot_base, 2), 'Note': ''})
+    cols = [{'name': c, 'id': c} for c in
+            ['Symbol', 'Strategy', 'Bar', 'Trades', 'Win %', 'PnL',
+             'Return %', 'Sizing', 'Base', 'Note']]
+    summary = (f"Batch over {start_date} → {end_date}:  "
+               f"{int(tot_trades)} trades, total PnL {tot_pnl:+.2f} USDT "
+               f"({(tot_pnl / tot_base * 100):+.2f}% on {tot_base:.0f} base)"
+               if tot_base else "Batch complete.")
+    return rows, cols, summary
 
 
 @app.callback(
