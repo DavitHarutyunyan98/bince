@@ -2175,6 +2175,9 @@ def build_batch_backtest_panel():
         ], style={'marginTop': '10px'}),
         html.H4(id='batch-summary',
                 style={'textAlign': 'center', 'color': '#4CAF50', 'margin': '15px'}),
+        html.Div("Tip: click any pair row to load its detailed backtest below.",
+                 style={'textAlign': 'center', 'color': '#9aa', 'fontSize': '13px',
+                        'marginBottom': '8px'}),
         html.Div(dash_table.DataTable(
             id='batch-results-table',
             style_cell={'backgroundColor': '#2c2c2c', 'color': '#f0f0f0',
@@ -2844,6 +2847,103 @@ app.clientside_callback(
     """,
     Output('scroll-optrow-dummy', 'children'),
     Input('opt-results-table', 'active_cell'),
+    prevent_initial_call=True,
+)
+
+
+@app.callback(
+    [Output('crypto-candlestick-graph', 'figure', allow_duplicate=True),
+     Output('portfolio-graph', 'figure', allow_duplicate=True),
+     Output('trades-table', 'data', allow_duplicate=True),
+     Output('trades-table', 'columns', allow_duplicate=True),
+     Output('trades-table', 'style_data_conditional', allow_duplicate=True),
+     Output('backtest-summary', 'children', allow_duplicate=True),
+     Output('symbol-input', 'value', allow_duplicate=True),
+     Output('timeframe-input', 'value', allow_duplicate=True),
+     Output('strategy-selector-dropdown', 'value', allow_duplicate=True),
+     Output('applied-params-store', 'data', allow_duplicate=True),
+     Output('split-results-table', 'data', allow_duplicate=True),
+     Output('split-results-table', 'columns', allow_duplicate=True),
+     Output('split-data-store', 'data', allow_duplicate=True)],
+    Input('batch-results-table', 'active_cell'),
+    [State('batch-results-table', 'derived_viewport_data'),
+     State('batch-config-store', 'data'),
+     State('batch-date-start', 'value'), State('batch-date-end', 'value'),
+     State('num-splits-input', 'value')],
+    prevent_initial_call=True
+)
+def backtest_selected_batch_row(active_cell, table_data, configs, start_date, end_date, n_splits):
+    """Click a batch-results row to run its detailed backtest (chart, portfolio,
+    trades, split metrics) using that pair's own config params - mirrors the
+    optimizer's best-results row-click behaviour."""
+    no = no_update
+    blank = (no,) * 13
+    if not active_cell or not table_data or not configs or trader is None:
+        return blank
+    try:
+        row = table_data[active_cell['row']]
+    except (KeyError, IndexError, TypeError):
+        return blank
+
+    symbol = str(row.get('Symbol', '')).upper()
+    if not symbol or symbol == 'TOTAL':
+        return blank
+
+    # Find the matching config entry (full params, bar_length, sizing, base).
+    cfg = next((c for c in configs
+                if str(c.get('symbol', '')).upper() == symbol), None)
+    if cfg is None:
+        return blank
+
+    strategy_name = cfg.get('strategy_name')
+    strategy_class = STRATEGY_REGISTRY.get(strategy_name)
+    if not strategy_class:
+        return blank
+    timeframe = cfg.get('bar_length', '15m')
+    base = float(cfg.get('units_usdt', 100.0))
+    sizing = cfg.get('sizing_mode', 'fixed')
+    # Strategy params straight from the config (same keys generate_signals reads).
+    params = {k: cfg[k] for k in strategy_class.get_parameters() if k in cfg}
+
+    data = trader.get_historical_data(symbol, timeframe, start_date, end_date)
+    if data is None or data.empty:
+        return (go.Figure().update_layout(title=f"No data for {symbol}", template='plotly_dark'),
+                no, no, no, no, f"No data could be loaded for {symbol}.",
+                symbol, timeframe, strategy_name, params, [], [], [])
+
+    df = strategy_class().generate_signals(data.copy(), params)
+    trades_df, portfolio_df = Backtester(initial_capital=base, sizing_mode=sizing).run_backtest(df)
+
+    price_fig = _build_price_signal_figure(df, f"{symbol} Chart ({timeframe})")
+    pf_fig, trades_data, trades_cols, style = _build_portfolio_figure_and_trades(trades_df, portfolio_df)
+
+    summary = f"{symbol}: No trades executed."
+    if portfolio_df is not None and not portfolio_df.empty and trades_df is not None and not trades_df.empty:
+        total_return = (portfolio_df['Portfolio_Value'].iloc[-1] / base - 1) * 100
+        summary = (f"{symbol} ({sizing}, base {base:.0f}): "
+                   f"Total Return: {total_return:.2f}% ({len(trades_df)} trades)")
+
+    split_records = compute_split_metrics(trades_df, portfolio_df, start_date, end_date, n_splits)
+    split_cols = [{"name": c, "id": c} for c in (split_records[0].keys() if split_records else [])]
+
+    return (price_fig, pf_fig, trades_data, trades_cols, style, summary,
+            symbol, timeframe, strategy_name, params,
+            split_records, split_cols, split_records)
+
+
+# Scroll to the backtest results when a batch row is clicked.
+app.clientside_callback(
+    """
+    function(cell) {
+        if (cell) {
+            const el = document.getElementById('manual-results-section');
+            if (el) { el.scrollIntoView({behavior: 'smooth', block: 'start'}); }
+        }
+        return '';
+    }
+    """,
+    Output('scroll-optrow-dummy', 'children', allow_duplicate=True),
+    Input('batch-results-table', 'active_cell'),
     prevent_initial_call=True,
 )
 
