@@ -141,6 +141,36 @@ def segment_consistency_score(seg_returns):
     return round(max(0.0, pct_positive - penalty), 2)
 
 
+def win_loss_ratio(avg_profitable_trade, avg_unprofitable_trade):
+    """Payoff ratio = average winning trade / |average losing trade|.
+
+    >1 means winners are bigger than losers. Returns 0 when there are no
+    losing trades to divide by (treated as undefined rather than infinite)."""
+    denom = abs(float(avg_unprofitable_trade or 0.0))
+    if denom <= 1e-9:
+        return 0.0
+    return round(float(avg_profitable_trade or 0.0) / denom, 2)
+
+
+def overfitting_metrics(seg_returns):
+    """Quantify how much performance varies across the N segments.
+
+    Returns (std, cv_pct):
+      * std    - standard deviation of per-segment returns (raw variability).
+      * cv_pct - coefficient of variation = std / |mean| * 100. Higher = the
+                 strategy's per-segment results swing wildly relative to their
+                 average, a classic overfitting red flag. 0 when fewer than two
+                 segments or a ~zero mean (undefined)."""
+    vals = [r for r in seg_returns if r is not None]
+    if len(vals) < 2:
+        return 0.0, 0.0
+    arr = np.asarray(vals, dtype=float)
+    std = float(np.std(arr))
+    mean = float(np.mean(arr))
+    cv = (std / abs(mean) * 100) if abs(mean) > 1e-9 else 0.0
+    return round(std, 2), round(cv, 1)
+
+
 def _result_col(param_key):
     """Map a snake_case strategy param to its Title_Case results-table column."""
     return param_key.replace('_', ' ').title().replace(' ', '_')
@@ -961,21 +991,37 @@ class FuturesTrader:
                     getattr(self, 'split_n', 4) or 4)
                 segment_consistency = segment_consistency_score(
                     [s['Total_Return'] for s in seg_records])
+                seg_return_std, overfitting_risk = overfitting_metrics(
+                    [s['Total_Return'] for s in seg_records])
+
+                # Payoff (win/loss) ratio for the score, computed straight from
+                # the IS trades so it is available before the detailed breakdown.
+                _prof_pnl = trades_df_is[trades_df_is['PnL'] > 0]['PnL']
+                _loss_pnl = trades_df_is[trades_df_is['PnL'] <= 0]['PnL']
+                win_loss = win_loss_ratio(
+                    _prof_pnl.mean() if len(_prof_pnl) else 0.0,
+                    _loss_pnl.mean() if len(_loss_pnl) else 0.0)
 
                 # --- Calculate IS Score ---
                 w_consistency_raw = weights.get('consistency', 0)
+                w_winloss_raw = weights.get('win_loss', 0)
                 total_weight = weights['total_return'] + \
-                    weights['win_rate'] + weights['total_trades'] + w_consistency_raw
+                    weights['win_rate'] + weights['total_trades'] + \
+                    w_consistency_raw + w_winloss_raw
                 if total_weight == 0:
                     total_weight = 1
                 w_return = weights['total_return'] / total_weight
                 w_winrate = weights['win_rate'] / total_weight
                 w_trades = weights['total_trades'] / total_weight
                 w_consistency = w_consistency_raw / total_weight
+                w_winloss = w_winloss_raw / total_weight
                 capped_trades = min(total_trades_is, 100)
+                # Scale payoff ratio onto a ~0-100 range (cap at 10x -> 100).
+                winloss_component = min(win_loss, 10.0) * 10
                 score = (total_return_is * w_return) + \
                     (win_rate_is * w_winrate) + (capped_trades * w_trades) + \
-                    (segment_consistency * w_consistency)
+                    (segment_consistency * w_consistency) + \
+                    (winloss_component * w_winloss)
 
                 # Calculate additional priority metrics
                 # Risk-adjusted return (Calmar ratio)
@@ -1115,8 +1161,10 @@ class FuturesTrader:
                     'Profitable_Long_Count': profitable_long_count, 'Profitable_Short_Count': profitable_short_count,
                     'Unprofitable_Long_Count': unprofitable_long_count, 'Unprofitable_Short_Count': unprofitable_short_count,
                     'Avg_Profitable_Trade': round(avg_profitable_trade, 2), 'Avg_Unprofitable_Trade': round(avg_unprofitable_trade, 2),
+                    'Win_Loss_Ratio': win_loss_ratio(avg_profitable_trade, avg_unprofitable_trade),
                     'Avg_Profitable_Long': round(avg_profitable_long, 2), 'Avg_Profitable_Short': round(avg_profitable_short, 2),
                     'Avg_Unprofitable_Long': round(avg_unprofitable_long, 2), 'Avg_Unprofitable_Short': round(avg_unprofitable_short, 2),
+                    'Seg_Return_Std': seg_return_std, 'Overfitting_Risk': overfitting_risk,
                     'Composite_Score': composite_score,
                     'params': params
                 })
@@ -1377,19 +1425,30 @@ class FuturesTrader:
                     getattr(self, 'split_n', 4) or 4)
                 segment_consistency = segment_consistency_score(
                     [s['Total_Return'] for s in seg_records])
+                seg_return_std, overfitting_risk = overfitting_metrics(
+                    [s['Total_Return'] for s in seg_records])
+
+                _prof_pnl = trades_df_is[trades_df_is['PnL'] > 0]['PnL']
+                _loss_pnl = trades_df_is[trades_df_is['PnL'] <= 0]['PnL']
+                win_loss = win_loss_ratio(
+                    _prof_pnl.mean() if len(_prof_pnl) else 0.0,
+                    _loss_pnl.mean() if len(_loss_pnl) else 0.0)
 
                 # Calculate score
                 w_consistency_raw = weights.get('consistency', 0)
-                total_weight = weights['total_return'] + weights['win_rate'] + weights['total_trades'] + w_consistency_raw
+                w_winloss_raw = weights.get('win_loss', 0)
+                total_weight = weights['total_return'] + weights['win_rate'] + weights['total_trades'] + w_consistency_raw + w_winloss_raw
                 if total_weight == 0:
                     total_weight = 1
                 w_return = weights['total_return'] / total_weight
                 w_winrate = weights['win_rate'] / total_weight
                 w_trades = weights['total_trades'] / total_weight
                 w_consistency = w_consistency_raw / total_weight
+                w_winloss = w_winloss_raw / total_weight
                 capped_trades = min(total_trades_is, 100)
+                winloss_component = min(win_loss, 10.0) * 10
                 score = (total_return_is * w_return) + (win_rate_is * w_winrate) + (capped_trades * w_trades) + \
-                    (segment_consistency * w_consistency)
+                    (segment_consistency * w_consistency) + (winloss_component * w_winloss)
 
                 # Additional metrics
                 calmar_ratio = total_return_is / max_drawdown if max_drawdown > 0 else 0
@@ -1523,8 +1582,10 @@ class FuturesTrader:
                     'Profitable_Long_Count': profitable_long_count, 'Profitable_Short_Count': profitable_short_count,
                     'Unprofitable_Long_Count': unprofitable_long_count, 'Unprofitable_Short_Count': unprofitable_short_count,
                     'Avg_Profitable_Trade': round(avg_profitable_trade, 2), 'Avg_Unprofitable_Trade': round(avg_unprofitable_trade, 2),
+                    'Win_Loss_Ratio': win_loss_ratio(avg_profitable_trade, avg_unprofitable_trade),
                     'Avg_Profitable_Long': round(avg_profitable_long, 2), 'Avg_Profitable_Short': round(avg_profitable_short, 2),
                     'Avg_Unprofitable_Long': round(avg_unprofitable_long, 2), 'Avg_Unprofitable_Short': round(avg_unprofitable_short, 2),
+                    'Seg_Return_Std': seg_return_std, 'Overfitting_Risk': overfitting_risk,
                     'Composite_Score': composite_score, 'params': params
                 })
                 return score
@@ -2019,9 +2080,16 @@ def build_optimizer_panel():
                     html.Div([html.Label("Consistency Score Weight:"),
                               dcc.Input(id='weight-consistency-input', type='number', value=0, min=0,
                                         className='custom-input')], className='flex-item'),
+                    html.Div([html.Label("Win/Loss Ratio Weight:"),
+                              dcc.Input(id='weight-winloss-input', type='number', value=0, min=0,
+                                        className='custom-input')], className='flex-item'),
                 ], className='flex-container'),
                 html.P("• Consistency Score = % of split segments profitable, penalized by the worst segment. "
                        "Uses the Number of Date Splits above (defaults to 4 if splitting is off).",
+                       style={'fontSize': '12px', 'color': '#888', 'margin': '4px 0 0 0'}),
+                html.P("• Win/Loss Ratio = avg profitable trade ÷ avg losing trade (payoff). Capped at 10x "
+                       "(=100 pts) in the score. Results also include Seg_Return_Std and Overfitting_Risk "
+                       "(CV% of per-segment returns) — high values flag overfit, unstable parameters.",
                        style={'fontSize': '12px', 'color': '#888', 'margin': '4px 0 0 0'}),
             ], className='control-panel-group'),
             html.Div([
@@ -2194,6 +2262,37 @@ def build_batch_backtest_panel():
     ])
 
 
+def build_param_heatmap_panel():
+    """Parameter sensitivity heatmap built from ALL optimization trials.
+
+    Instead of trusting a single 'best' parameter combo, this averages a chosen
+    metric over every trial binned by two parameters, revealing robust 'safe
+    zones' (broad high-scoring regions) versus fragile spikes (isolated peaks
+    surrounded by poor neighbours = likely overfit)."""
+    dd_style = {'width': '220px', 'display': 'inline-block',
+                'marginRight': '12px', 'color': '#000'}
+    return create_collapsible_container("Parameter Sensitivity / Safe Zones", "param-heatmap", [
+        html.Div([
+            html.Div([html.Label('Pair:'),
+                      dcc.Dropdown(id='heatmap-pair-dropdown', clearable=False,
+                                   style=dd_style)], style={'display': 'inline-block'}),
+            html.Div([html.Label('X Parameter:'),
+                      dcc.Dropdown(id='heatmap-x-dropdown', clearable=False,
+                                   style=dd_style)], style={'display': 'inline-block'}),
+            html.Div([html.Label('Y Parameter:'),
+                      dcc.Dropdown(id='heatmap-y-dropdown', clearable=False,
+                                   style=dd_style)], style={'display': 'inline-block'}),
+            html.Div([html.Label('Metric:'),
+                      dcc.Dropdown(id='heatmap-metric-dropdown', clearable=False,
+                                   style=dd_style)], style={'display': 'inline-block'}),
+        ], style={'marginBottom': '10px'}),
+        html.P("Each cell = average metric across all trials at that (X, Y) pair. "
+               "Look for large contiguous bright regions (robust) rather than lone bright cells (fragile/overfit).",
+               style={'fontSize': '12px', 'color': '#888'}),
+        dcc.Graph(id='heatmap-graph', style={'height': '55vh'}),
+    ])
+
+
 app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', 'padding': '10px'}, children=[
     dcc.Store(id='batch-config-store'),
     dcc.Store(id='trades-data-store'),
@@ -2304,6 +2403,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
                                          ),
                                          className='dash-table-container'),
                                      export_info={'button_id': 'export-opt-results-btn'}),
+        build_param_heatmap_panel(),
         create_collapsible_container("All Optimization Trials", "opt-all-trials-table",
                                      html.Div(
                                          dash_table.DataTable(
@@ -2948,6 +3048,101 @@ app.clientside_callback(
 )
 
 
+# --- Parameter sensitivity heatmap (robust "safe zone" discovery) ---
+HEATMAP_METRICS = ['Score', 'Total_Return', 'Win_Rate', 'Win_Loss_Ratio',
+                   'Profit_Factor', 'Sharpe_Ratio', 'Max_Drawdown',
+                   'Overfitting_Risk', 'Seg_Return_Std', 'Segment_Consistency',
+                   'Total_Trades']
+
+
+def _param_columns_in(df_columns):
+    """Title_Case strategy-parameter columns present in a trials dataframe."""
+    cols = set(df_columns)
+    out = []
+    for scls in STRATEGY_REGISTRY.values():
+        for key in scls.get_parameters().keys():
+            c = _result_col(key)
+            if c in cols and c not in out:
+                out.append(c)
+    return out
+
+
+@app.callback(
+    [Output('heatmap-pair-dropdown', 'options'), Output('heatmap-pair-dropdown', 'value'),
+     Output('heatmap-x-dropdown', 'options'), Output('heatmap-x-dropdown', 'value'),
+     Output('heatmap-y-dropdown', 'options'), Output('heatmap-y-dropdown', 'value'),
+     Output('heatmap-metric-dropdown', 'options'), Output('heatmap-metric-dropdown', 'value')],
+    Input('all-trials-store', 'data'),
+    prevent_initial_call=True,
+)
+def populate_heatmap_dropdowns(data):
+    """Fill the heatmap dropdowns from the completed trials' columns."""
+    blank = ([], None, [], None, [], None, [], None)
+    if not data:
+        return blank
+    df = pd.DataFrame(data)
+    pairs = sorted(df['Trading_Pair'].dropna().unique()) if 'Trading_Pair' in df else []
+    params = _param_columns_in(df.columns)
+    metrics = [m for m in HEATMAP_METRICS if m in df.columns]
+    pair_opts = [{'label': p, 'value': p} for p in pairs]
+    par_opts = [{'label': c.replace('_', ' '), 'value': c} for c in params]
+    met_opts = [{'label': m.replace('_', ' '), 'value': m} for m in metrics]
+    xval = params[0] if params else None
+    yval = params[1] if len(params) > 1 else xval
+    mval = 'Score' if 'Score' in metrics else (metrics[0] if metrics else None)
+    return (pair_opts, (pairs[0] if pairs else None),
+            par_opts, xval, par_opts, yval, met_opts, mval)
+
+
+@app.callback(
+    Output('heatmap-graph', 'figure'),
+    [Input('heatmap-pair-dropdown', 'value'), Input('heatmap-x-dropdown', 'value'),
+     Input('heatmap-y-dropdown', 'value'), Input('heatmap-metric-dropdown', 'value')],
+    State('all-trials-store', 'data'),
+    prevent_initial_call=True,
+)
+def build_param_heatmap(pair, xcol, ycol, metric, data):
+    """Average `metric` over all trials binned by two parameters. Equal X/Y
+    falls back to a 1D sensitivity curve."""
+    empty = go.Figure().update_layout(
+        template='plotly_dark', title='Run an optimization, then pick parameters.')
+    if not data or not all([xcol, ycol, metric]):
+        return empty
+    df = pd.DataFrame(data)
+    if pair and 'Trading_Pair' in df.columns:
+        df = df[df['Trading_Pair'] == pair]
+    if df.empty or xcol not in df.columns or ycol not in df.columns or metric not in df.columns:
+        return empty
+
+    if xcol == ycol:
+        g = df.groupby(xcol)[metric].mean().reset_index().sort_values(xcol)
+        fig = go.Figure(go.Scatter(x=g[xcol], y=g[metric], mode='lines+markers',
+                                   line=dict(color='#00BFFF', width=2)))
+        fig.update_layout(template='plotly_dark',
+                          title=f'{metric.replace("_", " ")} sensitivity vs {xcol.replace("_", " ")}',
+                          xaxis_title=xcol.replace('_', ' '), yaxis_title=metric.replace('_', ' '))
+        return fig
+
+    piv = df.pivot_table(index=ycol, columns=xcol, values=metric, aggfunc='mean')
+    piv = piv.sort_index().sort_index(axis=1)
+    # Lower drawdown / overfitting is better -> reverse colours so green = good.
+    reverse = metric in ('Max_Drawdown', 'Overfitting_Risk', 'Seg_Return_Std')
+    fig = go.Figure(go.Heatmap(
+        z=piv.values,
+        x=[str(c) for c in piv.columns], y=[str(i) for i in piv.index],
+        colorscale='RdYlGn_r' if reverse else 'Viridis',
+        colorbar=dict(title=metric.replace('_', ' ')),
+        hovertemplate=(f'{xcol.replace("_", " ")}=%{{x}}<br>'
+                       f'{ycol.replace("_", " ")}=%{{y}}<br>'
+                       f'{metric.replace("_", " ")}=%{{z:.2f}}<extra></extra>')))
+    fig.update_layout(
+        template='plotly_dark',
+        title=f'Avg {metric.replace("_", " ")} — {xcol.replace("_", " ")} (x) vs {ycol.replace("_", " ")} (y)'
+              + (f' · {pair}' if pair else ''),
+        xaxis_title=xcol.replace('_', ' '), yaxis_title=ycol.replace('_', ' '))
+    return fig
+
+
 
 @app.callback(
     Output('save-config-confirmation', 'children'),
@@ -3435,6 +3630,7 @@ def toggle_opt_buttons(status):
      State('weight-winrate-input', 'value'),                    # weight_winrate
      State('weight-trades-input', 'value'),                     # weight_trades
      State('weight-consistency-input', 'value'),                # weight_consistency
+     State('weight-winloss-input', 'value'),                    # weight_winloss
      State('optimization-mode-dropdown', 'value'),              # optimization_mode
      State('opt-sizing-mode', 'value'),                         # sizing_mode
      State('opt-split-mode', 'value'),                          # split_mode
@@ -3445,7 +3641,7 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
                                exit_minus_str, exit_plus_str, n_trials, min_trades, min_candles,
                                strategy_name, timeframe, is_start, is_end,
                                weight_return, weight_winrate, weight_trades, weight_consistency,
-                               optimization_mode, sizing_mode, split_mode, n_splits):
+                               weight_winloss, optimization_mode, sizing_mode, split_mode, n_splits):
     
     # DEBUG: Add explicit debug logging to verify date alignment
     print(f"DEBUG: Optimization Trigger Received")
@@ -3529,6 +3725,7 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
             'is_start': is_start, 'is_end': is_end,
             'weight_return': weight_return, 'weight_winrate': weight_winrate,
             'weight_trades': weight_trades, 'weight_consistency': weight_consistency,
+            'weight_winloss': weight_winloss,
             'optimization_mode': optimization_mode or 'efficient',
             'sizing_mode': sizing_mode or 'fixed',
             'split_mode': split_mode or 'onclick',
@@ -3580,6 +3777,7 @@ def run_optimization_task(n_intervals, settings):
             'win_rate': settings['weight_winrate'] or 0,
             'total_trades': settings['weight_trades'] or 0,
             'consistency': settings.get('weight_consistency') or 0,
+            'win_loss': settings.get('weight_winloss') or 0,
         }
     except KeyError as e:
         add_optimization_log(
