@@ -171,6 +171,69 @@ def overfitting_metrics(seg_returns):
     return round(std, 2), round(cv, 1)
 
 
+def standard_backtest_metrics(trades_df, portfolio_df, initial_capital, timeframe):
+    """Core metric set for one backtest, shared so the OOS columns mirror the
+    in-sample ones. Returns zeros when there are no trades."""
+    blank = {'Total_Return': 0.0, 'Win_Rate': 0.0, 'Total_Trades': 0,
+             'Max_Drawdown': 0.0, 'Sharpe_Ratio': 0.0, 'Profit_Factor': 0.0,
+             'Win_Loss_Ratio': 0.0, 'Avg_Profitable_Trade': 0.0,
+             'Avg_Unprofitable_Trade': 0.0}
+    if (trades_df is None or portfolio_df is None or trades_df.empty
+            or portfolio_df.empty):
+        return blank
+    pv = portfolio_df['Portfolio_Value']
+    total_return = (pv.iloc[-1] / initial_capital - 1) * 100
+    n = len(trades_df)
+    wins = trades_df[trades_df['PnL'] > 0]
+    losses = trades_df[trades_df['PnL'] <= 0]
+    win_rate = (len(wins) / n * 100) if n else 0.0
+    vals = pv.to_numpy()
+    rmax = np.maximum.accumulate(vals)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        dd = np.where(rmax > 0, (rmax - vals) / rmax * 100, 0)
+    max_dd = float(np.nanmax(dd)) if len(dd) else 0.0
+    rets = pv.pct_change().dropna()
+    af = TIMEFRAME_TO_ANNUALIZATION_FACTOR.get(timeframe, np.sqrt(365))
+    sharpe = (rets.mean() / rets.std() * af) if rets.std() > 0 else 0.0
+    gross_profit = wins['PnL'].sum()
+    gross_loss = abs(trades_df[trades_df['PnL'] < 0]['PnL'].sum())
+    pf = (gross_profit / gross_loss) if gross_loss > 0 else 999.0
+    avg_w = wins['PnL'].mean() if len(wins) else 0.0
+    avg_l = losses['PnL'].mean() if len(losses) else 0.0
+    return {
+        'Total_Return': round(float(total_return), 2),
+        'Win_Rate': round(float(win_rate), 1),
+        'Total_Trades': int(n),
+        'Max_Drawdown': round(float(max_dd), 2),
+        'Sharpe_Ratio': round(float(sharpe), 2),
+        'Profit_Factor': round(float(min(pf, 999.0)), 2),
+        'Win_Loss_Ratio': win_loss_ratio(avg_w, avg_l),
+        'Avg_Profitable_Trade': round(float(avg_w), 2),
+        'Avg_Unprofitable_Trade': round(float(avg_l), 2),
+    }
+
+
+def compute_oos_columns(strategy, params, full_data, oos_start, oos_end,
+                        initial_capital, sizing_mode, timeframe):
+    """Backtest `params` on the out-of-sample window and return the standard
+    metrics prefixed with 'OOS_'. Empty/invalid windows yield zeroed columns."""
+    def _prefixed(m):
+        return {f'OOS_{k}': v for k, v in m.items()}
+    try:
+        oos_data = full_data.loc[oos_start:oos_end]
+    except Exception:
+        oos_data = None
+    if oos_data is None or oos_data.empty or len(oos_data) < 2:
+        return _prefixed(standard_backtest_metrics(None, None, initial_capital, timeframe))
+    try:
+        sig = strategy.generate_signals(oos_data.copy(), params)
+        bt = Backtester(initial_capital, sizing_mode=sizing_mode)
+        tr, pf = bt.run_backtest(sig)
+        return _prefixed(standard_backtest_metrics(tr, pf, initial_capital, timeframe))
+    except Exception:
+        return _prefixed(standard_backtest_metrics(None, None, initial_capital, timeframe))
+
+
 def _result_col(param_key):
     """Map a snake_case strategy param to its Title_Case results-table column."""
     return param_key.replace('_', ' ').title().replace(' ', '_')
@@ -1002,12 +1065,19 @@ class FuturesTrader:
                     _prof_pnl.mean() if len(_prof_pnl) else 0.0,
                     _loss_pnl.mean() if len(_loss_pnl) else 0.0)
 
+                # --- OUT-OF-SAMPLE BACKTEST (same params, held-out window) ---
+                oos_cols = compute_oos_columns(
+                    strategy, params, full_data, oos1_start_date, oos1_end_date,
+                    self.initial_capital, self.backtest_sizing_mode, timeframe)
+                oos_return = oos_cols.get('OOS_Total_Return', 0.0)
+
                 # --- Calculate IS Score ---
                 w_consistency_raw = weights.get('consistency', 0)
                 w_winloss_raw = weights.get('win_loss', 0)
+                w_oos_raw = weights.get('oos_return', 0)
                 total_weight = weights['total_return'] + \
                     weights['win_rate'] + weights['total_trades'] + \
-                    w_consistency_raw + w_winloss_raw
+                    w_consistency_raw + w_winloss_raw + w_oos_raw
                 if total_weight == 0:
                     total_weight = 1
                 w_return = weights['total_return'] / total_weight
@@ -1015,13 +1085,15 @@ class FuturesTrader:
                 w_trades = weights['total_trades'] / total_weight
                 w_consistency = w_consistency_raw / total_weight
                 w_winloss = w_winloss_raw / total_weight
+                w_oos = w_oos_raw / total_weight
                 capped_trades = min(total_trades_is, 100)
                 # Scale payoff ratio onto a ~0-100 range (cap at 10x -> 100).
                 winloss_component = min(win_loss, 10.0) * 10
                 score = (total_return_is * w_return) + \
                     (win_rate_is * w_winrate) + (capped_trades * w_trades) + \
                     (segment_consistency * w_consistency) + \
-                    (winloss_component * w_winloss)
+                    (winloss_component * w_winloss) + \
+                    (oos_return * w_oos)
 
                 # Calculate additional priority metrics
                 # Risk-adjusted return (Calmar ratio)
@@ -1165,6 +1237,7 @@ class FuturesTrader:
                     'Avg_Profitable_Long': round(avg_profitable_long, 2), 'Avg_Profitable_Short': round(avg_profitable_short, 2),
                     'Avg_Unprofitable_Long': round(avg_unprofitable_long, 2), 'Avg_Unprofitable_Short': round(avg_unprofitable_short, 2),
                     'Seg_Return_Std': seg_return_std, 'Overfitting_Risk': overfitting_risk,
+                    **oos_cols,
                     'Composite_Score': composite_score,
                     'params': params
                 })
@@ -1434,10 +1507,17 @@ class FuturesTrader:
                     _prof_pnl.mean() if len(_prof_pnl) else 0.0,
                     _loss_pnl.mean() if len(_loss_pnl) else 0.0)
 
+                # --- OUT-OF-SAMPLE BACKTEST (same params, held-out window) ---
+                oos_cols = compute_oos_columns(
+                    strategy, params, full_data, oos1_start_date, oos1_end_date,
+                    self.initial_capital, self.backtest_sizing_mode, timeframe)
+                oos_return = oos_cols.get('OOS_Total_Return', 0.0)
+
                 # Calculate score
                 w_consistency_raw = weights.get('consistency', 0)
                 w_winloss_raw = weights.get('win_loss', 0)
-                total_weight = weights['total_return'] + weights['win_rate'] + weights['total_trades'] + w_consistency_raw + w_winloss_raw
+                w_oos_raw = weights.get('oos_return', 0)
+                total_weight = weights['total_return'] + weights['win_rate'] + weights['total_trades'] + w_consistency_raw + w_winloss_raw + w_oos_raw
                 if total_weight == 0:
                     total_weight = 1
                 w_return = weights['total_return'] / total_weight
@@ -1445,10 +1525,12 @@ class FuturesTrader:
                 w_trades = weights['total_trades'] / total_weight
                 w_consistency = w_consistency_raw / total_weight
                 w_winloss = w_winloss_raw / total_weight
+                w_oos = w_oos_raw / total_weight
                 capped_trades = min(total_trades_is, 100)
                 winloss_component = min(win_loss, 10.0) * 10
                 score = (total_return_is * w_return) + (win_rate_is * w_winrate) + (capped_trades * w_trades) + \
-                    (segment_consistency * w_consistency) + (winloss_component * w_winloss)
+                    (segment_consistency * w_consistency) + (winloss_component * w_winloss) + \
+                    (oos_return * w_oos)
 
                 # Additional metrics
                 calmar_ratio = total_return_is / max_drawdown if max_drawdown > 0 else 0
@@ -1586,6 +1668,7 @@ class FuturesTrader:
                     'Avg_Profitable_Long': round(avg_profitable_long, 2), 'Avg_Profitable_Short': round(avg_profitable_short, 2),
                     'Avg_Unprofitable_Long': round(avg_unprofitable_long, 2), 'Avg_Unprofitable_Short': round(avg_unprofitable_short, 2),
                     'Seg_Return_Std': seg_return_std, 'Overfitting_Risk': overfitting_risk,
+                    **oos_cols,
                     'Composite_Score': composite_score, 'params': params
                 })
                 return score
@@ -1694,9 +1777,14 @@ class FuturesTrader:
             if stop_event.is_set():
                 add_optimization_log("Stop requested during data fetching.")
                 return pd.DataFrame()
-            # Fetch data covering IS and both OOS periods
+            # Fetch data covering both the IS and OOS windows (whichever comes
+            # first/last). ISO date strings compare chronologically.
+            _starts = [d for d in (is_start_date, oos1_start_date, oos2_start_date) if d]
+            _ends = [d for d in (is_end_date, oos1_end_date, oos2_end_date) if d]
+            fetch_start = min(_starts) if _starts else is_start_date
+            fetch_end = max(_ends) if _ends else oos2_end_date
             data = self.get_historical_data_for_symbol(
-                symbol, timeframe, is_start_date, oos2_end_date)
+                symbol, timeframe, fetch_start, fetch_end)
             # This check is now mostly redundant due to pre-flight check, but serves as a final safeguard
             if data is not None and len(data) >= min_candles:
                 pair_data[symbol] = data
@@ -2013,8 +2101,11 @@ def build_optimizer_panel():
                                                                 ['5m', '15m', '30m', '1h', '4h']], value='1h',
                                                        className='custom-input', clearable=False)],
                 className='flex-item'),
-                html.Div([html.Label("Optimization Date Range"),
+                html.Div([html.Label("In-Sample Date Range"),
                           date_range_inputs('is-date', sixty_days_ago.date(), today.date())],
+                         className='flex-item'),
+                html.Div([html.Label("Out-of-Sample Date Range"),
+                          date_range_inputs('oos-date', today.date() - timedelta(days=14), today.date())],
                          className='flex-item'),
                 html.Div(
                     [html.Label("Number of Trials"),
@@ -2083,6 +2174,9 @@ def build_optimizer_panel():
                     html.Div([html.Label("Win/Loss Ratio Weight:"),
                               dcc.Input(id='weight-winloss-input', type='number', value=0, min=0,
                                         className='custom-input')], className='flex-item'),
+                    html.Div([html.Label("OOS Return % Weight:"),
+                              dcc.Input(id='weight-oos-input', type='number', value=0, min=0,
+                                        className='custom-input')], className='flex-item'),
                 ], className='flex-container'),
                 html.P("• Consistency Score = % of split segments profitable, penalized by the worst segment. "
                        "Uses the Number of Date Splits above (defaults to 4 if splitting is off).",
@@ -2090,6 +2184,10 @@ def build_optimizer_panel():
                 html.P("• Win/Loss Ratio = avg profitable trade ÷ avg losing trade (payoff). Capped at 10x "
                        "(=100 pts) in the score. Results also include Seg_Return_Std and Overfitting_Risk "
                        "(CV% of per-segment returns) — high values flag overfit, unstable parameters.",
+                       style={'fontSize': '12px', 'color': '#888', 'margin': '4px 0 0 0'}),
+                html.P("• OOS Return % = total return when the same params are re-tested on the Out-of-Sample "
+                       "date range (held-out data). Results add OOS_* columns mirroring the in-sample metrics; "
+                       "a big gap between Total Return and OOS Total Return is a strong overfitting signal.",
                        style={'fontSize': '12px', 'color': '#888', 'margin': '4px 0 0 0'}),
             ], className='control-panel-group'),
             html.Div([
@@ -3063,10 +3161,10 @@ app.clientside_callback(
 
 
 # --- Parameter sensitivity heatmap (robust "safe zone" discovery) ---
-HEATMAP_METRICS = ['Score', 'Total_Return', 'Win_Rate', 'Win_Loss_Ratio',
-                   'Profit_Factor', 'Sharpe_Ratio', 'Max_Drawdown',
-                   'Overfitting_Risk', 'Seg_Return_Std', 'Segment_Consistency',
-                   'Total_Trades']
+HEATMAP_METRICS = ['Score', 'Total_Return', 'OOS_Total_Return', 'Win_Rate',
+                   'OOS_Win_Rate', 'Win_Loss_Ratio', 'Profit_Factor',
+                   'Sharpe_Ratio', 'Max_Drawdown', 'Overfitting_Risk',
+                   'Seg_Return_Std', 'Segment_Consistency', 'Total_Trades']
 
 
 def _param_columns_in(df_columns):
@@ -3734,11 +3832,14 @@ def toggle_opt_buttons(status):
      State('opt-timeframe-dropdown', 'value'),                  # timeframe
      State('is-date-start', 'value'),                     # is_start
      State('is-date-end', 'value'),                       # is_end
+     State('oos-date-start', 'value'),                    # oos_start
+     State('oos-date-end', 'value'),                      # oos_end
      State('weight-return-input', 'value'),                     # weight_return
      State('weight-winrate-input', 'value'),                    # weight_winrate
      State('weight-trades-input', 'value'),                     # weight_trades
      State('weight-consistency-input', 'value'),                # weight_consistency
      State('weight-winloss-input', 'value'),                    # weight_winloss
+     State('weight-oos-input', 'value'),                        # weight_oos
      State('optimization-mode-dropdown', 'value'),              # optimization_mode
      State('opt-sizing-mode', 'value'),                         # sizing_mode
      State('opt-split-mode', 'value'),                          # split_mode
@@ -3747,9 +3848,9 @@ def toggle_opt_buttons(status):
 )
 def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str, sw_str, slr_str,
                                exit_minus_str, exit_plus_str, n_trials, min_trades, min_candles,
-                               strategy_name, timeframe, is_start, is_end,
+                               strategy_name, timeframe, is_start, is_end, oos_start, oos_end,
                                weight_return, weight_winrate, weight_trades, weight_consistency,
-                               weight_winloss, optimization_mode, sizing_mode, split_mode, n_splits):
+                               weight_winloss, weight_oos, optimization_mode, sizing_mode, split_mode, n_splits):
     
     # DEBUG: Add explicit debug logging to verify date alignment
     print(f"DEBUG: Optimization Trigger Received")
@@ -3831,9 +3932,10 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
             'sw_str': sw_str, 'slr_str': slr_str, 'exit_minus_str': exit_minus_str, 'exit_plus_str': exit_plus_str, 'n_trials': int(n_trials),
             'min_trades': int(min_trades), 'min_candles': min_candles_val, 'strategy_name': strategy_name, 'timeframe': timeframe,
             'is_start': is_start, 'is_end': is_end,
+            'oos_start': oos_start, 'oos_end': oos_end,
             'weight_return': weight_return, 'weight_winrate': weight_winrate,
             'weight_trades': weight_trades, 'weight_consistency': weight_consistency,
-            'weight_winloss': weight_winloss,
+            'weight_winloss': weight_winloss, 'weight_oos': weight_oos,
             'optimization_mode': optimization_mode or 'efficient',
             'sizing_mode': sizing_mode or 'fixed',
             'split_mode': split_mode or 'onclick',
@@ -3886,6 +3988,7 @@ def run_optimization_task(n_intervals, settings):
             'total_trades': settings['weight_trades'] or 0,
             'consistency': settings.get('weight_consistency') or 0,
             'win_loss': settings.get('weight_winloss') or 0,
+            'oos_return': settings.get('weight_oos') or 0,
         }
     except KeyError as e:
         add_optimization_log(
@@ -3903,8 +4006,10 @@ def run_optimization_task(n_intervals, settings):
     df_results = trader.optimize_trading_pairs(
         trading_pairs=pairs, param_ranges=param_ranges, selected_params=settings['selected_params'],
         is_start_date=settings['is_start'], is_end_date=settings['is_end'],
-        oos1_start_date=settings['is_start'], oos1_end_date=settings['is_end'],
-        oos2_start_date=settings['is_start'], oos2_end_date=settings['is_end'],
+        oos1_start_date=settings.get('oos_start') or settings['is_start'],
+        oos1_end_date=settings.get('oos_end') or settings['is_end'],
+        oos2_start_date=settings.get('oos_start') or settings['is_start'],
+        oos2_end_date=settings.get('oos_end') or settings['is_end'],
         timeframe=settings['timeframe'], min_trades=settings['min_trades'], n_trials=settings['n_trials'],
         weights=weights, min_candles=settings['min_candles'], stop_event=OPTIMIZATION_STOP_EVENT,
         pause_event=OPTIMIZATION_PAUSE_EVENT, optimization_mode=optimization_mode, strategy_name=strategy_name
