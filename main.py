@@ -2376,6 +2376,20 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
     html.Div(id='optimizer-results-section', children=[
         dcc.Loading(id="loading-opt", children=[html.Div(
             id='opt-progress-output', style={'textAlign': 'center'})]),
+        create_collapsible_container("Load Previous Optimization Results", "opt-upload", [
+            dcc.Upload(
+                id='opt-results-upload',
+                children=html.Div(['Drag & drop or ', html.A('select an All_Trials results file'),
+                                   ' (.xlsx or .csv)']),
+                multiple=False,
+                style={'border': '1px dashed #555', 'padding': '14px',
+                       'textAlign': 'center', 'cursor': 'pointer', 'borderRadius': '6px'}),
+            html.Div(id='opt-upload-status',
+                     style={'marginTop': '8px', 'textAlign': 'center', 'color': '#9aa'}),
+            html.P("Repopulates the results tables, the parameter heatmap and the clickable per-pair "
+                   "backtests from a results file previously exported by the optimizer — no re-run needed.",
+                   style={'fontSize': '12px', 'color': '#888', 'textAlign': 'center'}),
+        ]),
         create_collapsible_container("Optimization Log", "opt-log", dcc.Textarea(id='opt-log-textarea', readOnly=True,
                                                                                  style={'width': '100%',
                                                                                         'height': '400px',
@@ -3141,6 +3155,56 @@ def build_param_heatmap(pair, xcol, ycol, metric, data):
               + (f' · {pair}' if pair else ''),
         xaxis_title=xcol.replace('_', ' '), yaxis_title=ycol.replace('_', ' '))
     return fig
+
+
+@app.callback(
+    [Output('opt-results-table', 'data', allow_duplicate=True),
+     Output('opt-results-table', 'columns', allow_duplicate=True),
+     Output('opt-all-trials-table', 'data', allow_duplicate=True),
+     Output('opt-all-trials-table', 'columns', allow_duplicate=True),
+     Output('all-trials-store', 'data', allow_duplicate=True),
+     Output('optimized-pairs-store', 'data', allow_duplicate=True),
+     Output('opt-upload-status', 'children')],
+    Input('opt-results-upload', 'contents'),
+    State('opt-results-upload', 'filename'),
+    prevent_initial_call=True,
+)
+def load_optimization_results(contents, filename):
+    """Rebuild the optimizer tables/heatmap/stores from a previously exported
+    All_Trials results file (.xlsx or .csv) so results can be reviewed without
+    re-running the optimization."""
+    if not contents:
+        return (no_update,) * 6 + (no_update,)
+    try:
+        _, b64 = contents.split(',', 1)
+        raw = base64.b64decode(b64)
+        name = (filename or '').lower()
+        if name.endswith('.csv'):
+            df = pd.read_csv(io.BytesIO(raw))
+        else:
+            df = pd.read_excel(io.BytesIO(raw))
+    except Exception as e:
+        return (no_update,) * 6 + (f"❌ Could not read file: {e}",)
+
+    if df is None or df.empty:
+        return (no_update,) * 6 + ("❌ File contained no rows.",)
+    if 'Trading_Pair' not in df.columns or 'Score' not in df.columns:
+        return (no_update,) * 6 + (
+            "❌ Expected an All_Trials export with 'Trading_Pair' and 'Score' columns.",)
+
+    df = df.sort_values(by='Score', ascending=False).round(2)
+    all_trials = df.to_dict('records')
+    try:
+        df_best = df.loc[df.groupby('Trading_Pair')['Score'].idxmax()].copy()
+    except Exception:
+        df_best = df.copy()
+    cols = [{"name": c.replace("_", " ").title(), "id": c} for c in df.columns]
+    best_cols = [{"name": c.replace("_", " ").title(), "id": c} for c in df_best.columns]
+    pairs = sorted(df['Trading_Pair'].dropna().unique().tolist())
+    status = (f"✅ Loaded {filename}: {len(df)} trials across {len(pairs)} pairs. "
+              f"Tables, heatmap and per-pair backtests updated.")
+    return (df_best.to_dict('records'), best_cols,
+            all_trials, cols, all_trials, pairs, status)
 
 
 
