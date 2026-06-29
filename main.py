@@ -2379,8 +2379,8 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
         create_collapsible_container("Load Previous Optimization Results", "opt-upload", [
             dcc.Upload(
                 id='opt-results-upload',
-                children=html.Div(['Drag & drop or ', html.A('select an All_Trials results file'),
-                                   ' (.xlsx or .csv)']),
+                children=html.Div(['Drag & drop or ', html.A('select a results file'),
+                                   ' (.xlsx, .csv or optimizer .txt log)']),
                 multiple=False,
                 style={'border': '1px dashed #555', 'padding': '14px',
                        'textAlign': 'center', 'cursor': 'pointer', 'borderRadius': '6px'}),
@@ -3157,6 +3157,35 @@ def build_param_heatmap(pair, xcol, ycol, metric, data):
     return fig
 
 
+_LOG_TRIAL_RE = re.compile(
+    r'->\s*(?P<pair>\w+):\s*Trial\s+\d+/\d+\s*\([\d.]+%\)\s*\|\s*'
+    r'Params:\s*BW(?P<bw>\d+)/BL(?P<bl>\d+)/SW(?P<sw>\d+)/SL(?P<sl>\d+)/'
+    r'EXIT(?P<em>[\d.]+)/EXIT(?P<ep>[\d.]+)\s*\|\s*'
+    r'Ret:\s*(?P<ret>-?[\d.]+)%\s*\|\s*WR:\s*(?P<wr>[\d.]+)%\s*\|\s*'
+    r'Trades:\s*(?P<trades>\d+)')
+
+
+def parse_optimization_log(text):
+    """Best-effort reconstruction of a trials dataframe from an optimizer .txt
+    log. Each per-trial line carries the params + return/win-rate/trades, but
+    NOT the composite Score, so callers should synthesize one if needed."""
+    rows = []
+    for m in _LOG_TRIAL_RE.finditer(text):
+        rows.append({
+            'Trading_Pair': m.group('pair'),
+            'Buy_Signal_Window': int(m.group('bw')),
+            'Buy_Pattern_Lookback': int(m.group('bl')),
+            'Sell_Signal_Window': int(m.group('sw')),
+            'Sell_Pattern_Lookback': int(m.group('sl')),
+            'Exit_Minus_Percent': float(m.group('em')),
+            'Exit_Plus_Percent': float(m.group('ep')),
+            'Total_Return': float(m.group('ret')),
+            'Win_Rate': float(m.group('wr')),
+            'Total_Trades': int(m.group('trades')),
+        })
+    return pd.DataFrame(rows)
+
+
 @app.callback(
     [Output('opt-results-table', 'data', allow_duplicate=True),
      Output('opt-results-table', 'columns', allow_duplicate=True),
@@ -3171,16 +3200,23 @@ def build_param_heatmap(pair, xcol, ycol, metric, data):
 )
 def load_optimization_results(contents, filename):
     """Rebuild the optimizer tables/heatmap/stores from a previously exported
-    All_Trials results file (.xlsx or .csv) so results can be reviewed without
-    re-running the optimization."""
+    results file (.xlsx / .csv) or an optimizer .txt log, so results can be
+    reviewed without re-running the optimization."""
     if not contents:
         return (no_update,) * 6 + (no_update,)
+    note = ""
     try:
         _, b64 = contents.split(',', 1)
         raw = base64.b64decode(b64)
         name = (filename or '').lower()
         if name.endswith('.csv'):
             df = pd.read_csv(io.BytesIO(raw))
+        elif name.endswith('.txt') or name.endswith('.log'):
+            df = parse_optimization_log(raw.decode('utf-8', errors='replace'))
+            if df.empty:
+                return (no_update,) * 6 + (
+                    "❌ No parseable trial lines found in the log.",)
+            note = " (parsed from log; Score proxied by Total Return)"
         else:
             df = pd.read_excel(io.BytesIO(raw))
     except Exception as e:
@@ -3188,9 +3224,17 @@ def load_optimization_results(contents, filename):
 
     if df is None or df.empty:
         return (no_update,) * 6 + ("❌ File contained no rows.",)
-    if 'Trading_Pair' not in df.columns or 'Score' not in df.columns:
-        return (no_update,) * 6 + (
-            "❌ Expected an All_Trials export with 'Trading_Pair' and 'Score' columns.",)
+    if 'Trading_Pair' not in df.columns:
+        return (no_update,) * 6 + ("❌ File is missing a 'Trading_Pair' column.",)
+    # Logs (and some exports) lack a composite Score; fall back to Total_Return.
+    if 'Score' not in df.columns:
+        if 'Total_Return' in df.columns:
+            df['Score'] = df['Total_Return']
+            if not note:
+                note = " (no Score column; proxied by Total Return)"
+        else:
+            return (no_update,) * 6 + (
+                "❌ Need a 'Score' or 'Total_Return' column to rank results.",)
 
     df = df.sort_values(by='Score', ascending=False).round(2)
     all_trials = df.to_dict('records')
@@ -3201,7 +3245,7 @@ def load_optimization_results(contents, filename):
     cols = [{"name": c.replace("_", " ").title(), "id": c} for c in df.columns]
     best_cols = [{"name": c.replace("_", " ").title(), "id": c} for c in df_best.columns]
     pairs = sorted(df['Trading_Pair'].dropna().unique().tolist())
-    status = (f"✅ Loaded {filename}: {len(df)} trials across {len(pairs)} pairs. "
+    status = (f"✅ Loaded {filename}: {len(df)} trials across {len(pairs)} pairs{note}. "
               f"Tables, heatmap and per-pair backtests updated.")
     return (df_best.to_dict('records'), best_cols,
             all_trials, cols, all_trials, pairs, status)
