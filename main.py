@@ -2391,6 +2391,110 @@ def build_param_heatmap_panel():
     ])
 
 
+TRADE_CONFIG_INT_FIELDS = {'leverage', 'buy_signal_window', 'buy_pattern_lookback',
+                           'sell_signal_window', 'sell_pattern_lookback'}
+TRADE_CONFIG_FLOAT_FIELDS = {'units_usdt', 'exit_minus_percent', 'exit_plus_percent'}
+
+
+def _load_trade_config_rows(path='trade_config.json'):
+    """Read trade_config.json into a list of row dicts (empty list if missing)."""
+    try:
+        with open(path) as f:
+            cfgs = json.load(f)
+        if isinstance(cfgs, dict):
+            cfgs = [cfgs]
+        return cfgs if isinstance(cfgs, list) else []
+    except Exception:
+        return []
+
+
+def _coerce_trade_config_rows(rows):
+    """Turn editable-table rows back into properly-typed trade_config entries.
+    Rows without a symbol are dropped."""
+    out = []
+    for r in rows or []:
+        sym = str(r.get('symbol') or '').strip().upper()
+        if not sym:
+            continue
+        cfg = {
+            'enabled': bool(r.get('enabled', True)),
+            'strategy_name': r.get('strategy_name') or 'Candlestick Patterns',
+            'symbol': sym,
+            'bar_length': r.get('bar_length') or '15m',
+            'units_usdt': 0.0, 'leverage': 1, 'sizing_mode': r.get('sizing_mode') or 'fixed',
+        }
+        for k in TRADE_CONFIG_INT_FIELDS:
+            try:
+                cfg[k] = int(float(r.get(k)))
+            except (TypeError, ValueError):
+                cfg[k] = 0
+        for k in TRADE_CONFIG_FLOAT_FIELDS:
+            try:
+                cfg[k] = float(r.get(k))
+            except (TypeError, ValueError):
+                cfg[k] = 0.0
+        out.append(cfg)
+    return out
+
+
+def build_trade_config_editor_panel():
+    """Edit trade_config.json in-place: change any pair's parameters, add a new
+    pair, delete pairs (row trash icon), then save back to the file the live
+    bot reads."""
+    cols = [
+        {'name': 'Enabled', 'id': 'enabled', 'presentation': 'dropdown'},
+        {'name': 'Strategy', 'id': 'strategy_name', 'presentation': 'dropdown'},
+        {'name': 'Symbol', 'id': 'symbol', 'type': 'text'},
+        {'name': 'Bar', 'id': 'bar_length', 'presentation': 'dropdown'},
+        {'name': 'Units USDT', 'id': 'units_usdt', 'type': 'numeric'},
+        {'name': 'Leverage', 'id': 'leverage', 'type': 'numeric'},
+        {'name': 'Sizing', 'id': 'sizing_mode', 'presentation': 'dropdown'},
+        {'name': 'Buy Win', 'id': 'buy_signal_window', 'type': 'numeric'},
+        {'name': 'Buy LB', 'id': 'buy_pattern_lookback', 'type': 'numeric'},
+        {'name': 'Sell Win', 'id': 'sell_signal_window', 'type': 'numeric'},
+        {'name': 'Sell LB', 'id': 'sell_pattern_lookback', 'type': 'numeric'},
+        {'name': 'Exit -%', 'id': 'exit_minus_percent', 'type': 'numeric'},
+        {'name': 'Exit +%', 'id': 'exit_plus_percent', 'type': 'numeric'},
+    ]
+    dropdown = {
+        'enabled': {'options': [{'label': 'Yes', 'value': True}, {'label': 'No', 'value': False}]},
+        'strategy_name': {'options': [{'label': k, 'value': k} for k in STRATEGY_REGISTRY]},
+        'bar_length': {'options': [{'label': b, 'value': b}
+                                   for b in ['1m', '5m', '15m', '30m', '1h', '4h', '1d']]},
+        'sizing_mode': {'options': [{'label': 'Fixed', 'value': 'fixed'},
+                                    {'label': 'Compound', 'value': 'compound'}]},
+    }
+    return create_collapsible_container("Trade Config Editor (trade_config.json)", "trade-config-editor", [
+        html.P("Edit any cell inline, use the trash icon to remove a pair, or 'Add Pair' for a new row. "
+               "'Save' writes trade_config.json — restart the live bot to pick up changes.",
+               style={'fontSize': '13px', 'color': '#9aa'}),
+        dash_table.DataTable(
+            id='trade-config-table',
+            columns=cols,
+            data=_load_trade_config_rows(),
+            editable=True,
+            row_deletable=True,
+            dropdown=dropdown,
+            style_cell={'backgroundColor': '#2c2c2c', 'color': '#f0f0f0',
+                        'border': '1px solid #444', 'textAlign': 'center', 'minWidth': '70px'},
+            style_header={'backgroundColor': '#1c1c1c', 'fontWeight': 'bold'},
+            style_data_conditional=[
+                {'if': {'filter_query': '{enabled} = false'}, 'color': '#888'},
+            ],
+            style_table={'overflowX': 'auto'},
+        ),
+        html.Div([
+            html.Button('Add Pair', id='add-pair-button', n_clicks=0, className='custom-button'),
+            html.Button('Reload from file', id='reload-trade-config-btn', n_clicks=0,
+                        className='custom-button', style={'marginLeft': '8px'}),
+            html.Button('Save to trade_config.json', id='save-trade-config-btn', n_clicks=0,
+                        className='custom-button', style={'marginLeft': '8px'}),
+        ], style={'marginTop': '10px'}),
+        html.Div(id='trade-config-status',
+                 style={'marginTop': '8px', 'color': '#4CAF50', 'fontWeight': 'bold'}),
+    ])
+
+
 app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', 'padding': '10px'}, children=[
     dcc.Store(id='batch-config-store'),
     dcc.Store(id='trades-data-store'),
@@ -2415,6 +2519,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
     html.Div([
         html.H2("Futures Dashboard", style={'margin': '0', 'flex': '1'}),
         html.A('Manual Backtester', href='#manual-section', className='nav-link'),
+        html.A('Trade Config', href='#trade-config-section', className='nav-link'),
         html.A('Batch Backtest', href='#batch-section', className='nav-link'),
         html.A('Optimizer', href='#optimizer-section', className='nav-link'),
         html.A('Backtest Results', href='#manual-results-section',
@@ -2429,6 +2534,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
     html.Div([
         html.Div(build_config_panel(), id='manual-section'),
         html.Div(build_live_config_panel(), id='live-config-section'),
+        html.Div(build_trade_config_editor_panel(), id='trade-config-section'),
         html.Div(build_batch_backtest_panel(), id='batch-section'),
         html.Div(build_optimizer_panel(), id='optimizer-section'),
     ], className='main-container'),
@@ -3158,6 +3264,54 @@ app.clientside_callback(
     Input('batch-results-table', 'active_cell'),
     prevent_initial_call=True,
 )
+
+
+# --- Trade config editor (edit / add / remove pairs in trade_config.json) ---
+@app.callback(
+    Output('trade-config-table', 'data'),
+    [Input('add-pair-button', 'n_clicks'),
+     Input('reload-trade-config-btn', 'n_clicks')],
+    State('trade-config-table', 'data'),
+    prevent_initial_call=True,
+)
+def edit_trade_config_rows(add_clicks, reload_clicks, rows):
+    """Reload rows from disk or append a new default pair row."""
+    trig = callback_context.triggered[0]['prop_id'] if callback_context.triggered else ''
+    if 'reload-trade-config-btn' in trig:
+        return _load_trade_config_rows()
+    rows = list(rows or [])
+    rows.append({
+        'enabled': True, 'strategy_name': 'Candlestick Patterns', 'symbol': '',
+        'bar_length': '15m', 'units_usdt': 100.0, 'leverage': 10, 'sizing_mode': 'compound',
+        'buy_signal_window': 5, 'buy_pattern_lookback': 2,
+        'sell_signal_window': 5, 'sell_pattern_lookback': 2,
+        'exit_minus_percent': 5.0, 'exit_plus_percent': 5.0,
+    })
+    return rows
+
+
+@app.callback(
+    Output('trade-config-status', 'children'),
+    Input('save-trade-config-btn', 'n_clicks'),
+    State('trade-config-table', 'data'),
+    prevent_initial_call=True,
+)
+def save_trade_config_table(n_clicks, rows):
+    """Persist the edited rows back to trade_config.json (typed + validated)."""
+    cfgs = _coerce_trade_config_rows(rows)
+    if not cfgs:
+        return "❌ Nothing saved — every pair needs a symbol."
+    dupes = [s for s in {c['symbol'] for c in cfgs}
+             if [c['symbol'] for c in cfgs].count(s) > 1]
+    try:
+        with open('trade_config.json', 'w') as f:
+            json.dump(cfgs, f, indent=4)
+    except Exception as e:
+        return f"❌ Save failed: {e}"
+    enabled = sum(1 for c in cfgs if c['enabled'])
+    warn = f" ⚠️ duplicate symbols: {', '.join(sorted(set(dupes)))}" if dupes else ""
+    return (f"✅ Saved {len(cfgs)} pairs ({enabled} enabled) to trade_config.json. "
+            f"Restart the live bot to apply.{warn}")
 
 
 # --- Parameter sensitivity heatmap (robust "safe zone" discovery) ---
