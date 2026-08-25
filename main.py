@@ -1341,6 +1341,7 @@ class FuturesTrader:
                     'Avg_Unprofitable_Long': round(avg_unprofitable_long, 2), 'Avg_Unprofitable_Short': round(avg_unprofitable_short, 2),
                     'Seg_Return_Std': seg_return_std, 'Overfitting_Risk': overfitting_risk,
                     **oos_cols,
+                    'Strategy': strategy_name,
                     'Composite_Score': composite_score,
                     'params': params
                 })
@@ -1773,6 +1774,7 @@ class FuturesTrader:
                     'Avg_Unprofitable_Long': round(avg_unprofitable_long, 2), 'Avg_Unprofitable_Short': round(avg_unprofitable_short, 2),
                     'Seg_Return_Std': seg_return_std, 'Overfitting_Risk': overfitting_risk,
                     **oos_cols,
+                    'Strategy': strategy_name,
                     'Composite_Score': composite_score, 'params': params
                 })
                 return score
@@ -2367,23 +2369,6 @@ def build_refine_panel():
                     )
                 ], className='flex-item'),
                 html.Div([
-                    html.Label("Results View (page):"),
-                    dcc.Dropdown(
-                        id='opt-results-view',
-                        options=[
-                            {'label': 'Total (overall per pair)', 'value': 'total'},
-                            {'label': 'Segments · Return %', 'value': 'Return'},
-                            {'label': 'Segments · Win Rate %', 'value': 'WinRate'},
-                            {'label': 'Segments · Profit Factor', 'value': 'ProfitFactor'},
-                            {'label': 'Segments · Trades', 'value': 'Trades'},
-                            {'label': 'Segments · Max Drawdown %', 'value': 'MaxDD'},
-                        ],
-                        value='total',
-                        clearable=False,
-                        className='custom-input'
-                    )
-                ], className='flex-item'),
-                html.Div([
                     html.Label("Number of Top Pairs to Keep:"),
                     dcc.Input(id='refine-top-n-input', type='number',
                               value=10, min=1, className='custom-input')
@@ -2739,6 +2724,8 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
                                          ),
                                          className='dash-table-container'),
                                      export_info={'button_id': 'export-opt-results-btn'}),
+        create_collapsible_container("Segment Metrics (per date split)", "opt-segment-tables-panel",
+                                     html.Div(id='opt-segment-tables')),
         build_param_heatmap_panel(),
         create_collapsible_container("All Optimization Trials", "opt-all-trials-table",
                                      html.Div(
@@ -3152,6 +3139,18 @@ def _build_price_signal_figure(df, title):
                                  marker=dict(color='cyan', size=10, symbol='triangle-up'), name='Buy Signal'))
         fig.add_trace(go.Scatter(x=sell.index, y=sell['High'], mode='markers',
                                  marker=dict(color='yellow', size=10, symbol='triangle-down'), name='Sell Signal'))
+    # Overlay moving-average lines when the MA strategy produced them.
+    _ma_lines = [('fast_ma', '#00BFFF', 'Fast MA'),
+                 ('middle_ma', '#FFA500', 'Middle MA'),
+                 ('slow_ma', '#FF00FF', 'Slow MA')]
+    for col, color, label in _ma_lines:
+        if col in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df[col], mode='lines',
+                                     line=dict(color=color, width=1.5), name=label))
+    # Overlay SuperTrend line if present.
+    if 'supertrend' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['supertrend'], mode='lines',
+                                 line=dict(color='#26a69a', width=1.5), name='SuperTrend'))
     if 'ThreeWhiteSoldiers' in df.columns:
         tws = df[df['ThreeWhiteSoldiers'] == 1]
         if not tws.empty:
@@ -3239,12 +3238,15 @@ def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, cap
     strategy_name = row.get('Strategy')
     strategy_class = STRATEGY_REGISTRY.get(strategy_name) if strategy_name else None
     if strategy_class is None:
+        # Infer the strategy by how many of its parameter columns are present
+        # (optional params like exit bands may be absent), picking the best fit.
+        best_score = 0
         for sname, scls in STRATEGY_REGISTRY.items():
             keys = list(scls.get_parameters().keys())
-            if keys and all(_result_col(k) in row and row[_result_col(k)] not in (None, '')
-                            for k in keys):
-                strategy_name, strategy_class = sname, scls
-                break
+            present = sum(1 for k in keys
+                          if _result_col(k) in row and row[_result_col(k)] not in (None, ''))
+            if present > best_score:
+                best_score, strategy_name, strategy_class = present, sname, scls
     if strategy_class is None:
         strategy_name = "Candlestick Patterns"
         strategy_class = STRATEGY_REGISTRY.get(strategy_name)
@@ -3990,40 +3992,83 @@ def _build_results_view(df_best, view):
     return df_best[keep].to_dict('records'), columns
 
 
-# Best results priority + paginated view callback
+_SEGMENT_METRIC_TABLES = [
+    ('Return', 'Return %'), ('WinRate', 'Win Rate %'),
+    ('ProfitFactor', 'Profit Factor'), ('Trades', 'Trades'),
+    ('MaxDD', 'Max Drawdown %'),
+]
+
+
+def _best_per_pair(all_trials_data, priority_column):
+    """Best row per pair by the priority metric (shared by both callbacks)."""
+    df_all = pd.DataFrame(all_trials_data)
+    if priority_column not in df_all.columns:
+        return None
+    ascending = priority_column in ['Max_Drawdown', 'Trade_Balance_Ratio',
+                                    'Trade_Difference', 'Avg_Unprofitable_Trade']
+    idx = (df_all.groupby('Trading_Pair')[priority_column].idxmin() if ascending
+           else df_all.groupby('Trading_Pair')[priority_column].idxmax())
+    return df_all.loc[idx].copy().sort_values(by=priority_column, ascending=ascending).round(2)
+
+
+# Best results priority callback (Total table)
 @app.callback(
     [Output('opt-results-table', 'data', allow_duplicate=True),
      Output('opt-results-table', 'columns', allow_duplicate=True)],
-    [Input('best-results-priority-dropdown', 'value'),
-     Input('opt-results-view', 'value')],
+    Input('best-results-priority-dropdown', 'value'),
     State('all-trials-store', 'data'),
     prevent_initial_call=True
 )
-def update_best_results_priority(priority_column, view, all_trials_data):
-    """Rebuild the best-results table for the chosen priority metric and the
-    chosen page/view (Total, or one metric across all date segments)."""
+def update_best_results_priority(priority_column, all_trials_data):
+    """Rebuild the Total best-results table for the chosen priority metric."""
     if not all_trials_data or not priority_column:
         return no_update, no_update
-
     try:
-        df_all = pd.DataFrame(all_trials_data)
-        if priority_column not in df_all.columns:
+        df_best = _best_per_pair(all_trials_data, priority_column)
+        if df_best is None:
             return no_update, no_update
-
-        # Lower-is-better metrics sort ascending.
-        ascending = priority_column in ['Max_Drawdown', 'Trade_Balance_Ratio', 'Trade_Difference', 'Avg_Unprofitable_Trade']
-
-        if ascending:
-            df_best = df_all.loc[df_all.groupby('Trading_Pair')[priority_column].idxmin()].copy()
-        else:
-            df_best = df_all.loc[df_all.groupby('Trading_Pair')[priority_column].idxmax()].copy()
-
-        df_best = df_best.sort_values(by=priority_column, ascending=ascending).round(2)
-        data, columns = _build_results_view(df_best, view)
-        return data, columns
+        return _build_results_view(df_best, 'total')
     except Exception as e:
-        add_optimization_log(f"❌ Error updating best results view: {e}")
+        add_optimization_log(f"❌ Error updating best results: {e}")
         return no_update, no_update
+
+
+# Separate per-segment metric tables (one table per metric).
+@app.callback(
+    Output('opt-segment-tables', 'children'),
+    [Input('best-results-priority-dropdown', 'value'),
+     Input('all-trials-store', 'data')],
+    prevent_initial_call=True
+)
+def render_segment_tables(priority_column, all_trials_data):
+    """Render one table per metric (Return, Win Rate, Profit Factor, Trades,
+    Max Drawdown), each showing that metric across all chosen date segments."""
+    if not all_trials_data or not priority_column:
+        return []
+    try:
+        df_best = _best_per_pair(all_trials_data, priority_column)
+        if df_best is None:
+            return []
+        children = []
+        for suffix, label in _SEGMENT_METRIC_TABLES:
+            data, columns = _build_results_view(df_best, suffix)
+            if len(columns) <= 1:
+                continue  # no segment columns for this metric
+            children.append(html.H4(f"Segments · {label}",
+                                    style={'color': '#00BFFF', 'marginTop': '18px'}))
+            children.append(dash_table.DataTable(
+                data=data, columns=columns, sort_action='native', page_size=15,
+                style_cell={'backgroundColor': '#2c2c2c', 'color': '#f0f0f0',
+                            'border': '1px solid #444', 'textAlign': 'center'},
+                style_header={'backgroundColor': '#1c1c1c', 'fontWeight': 'bold'},
+                style_table={'overflowX': 'auto'}))
+        if not children:
+            return [html.P("Run an optimization to see per-segment metrics.",
+                           style={'color': '#888'})]
+        return children
+    except Exception as e:
+        add_optimization_log(f"❌ Error building segment tables: {e}")
+        return []
 
 
 @app.callback(
