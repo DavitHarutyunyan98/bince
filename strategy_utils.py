@@ -303,6 +303,10 @@ class MACrossoverStrategy(BaseStrategy):
             'middle_ma_period': {'type': 'number', 'default': 20, 'step': 1},
             'slow_ma_period': {'type': 'number', 'default': 50, 'step': 1},
             'ma_type': {'type': 'text', 'default': 'EMA'},
+            'exit_minus_percent': {
+                'type': 'number', 'default': '', 'step': 0.25},
+            'exit_plus_percent': {
+                'type': 'number', 'default': '', 'step': 0.25},
         }
 
     def generate_signals(self, data, params):
@@ -316,6 +320,23 @@ class MACrossoverStrategy(BaseStrategy):
         ma_type = params.get('ma_type') or 'EMA'
         ma_type = ma_type.upper()
 
+        # Optional percent-range exits (same semantics as Candlestick): exit to
+        # flat when CLOSE crosses outside [entry - minus%, entry + plus%].
+        minus_raw = params.get('exit_minus_percent')
+        plus_raw = params.get('exit_plus_percent')
+        exit_minus = None
+        exit_plus = None
+        try:
+            if minus_raw is not None and minus_raw != '':
+                exit_minus = float(minus_raw)
+        except (TypeError, ValueError):
+            exit_minus = None
+        try:
+            if plus_raw is not None and plus_raw != '':
+                exit_plus = float(plus_raw)
+        except (TypeError, ValueError):
+            exit_plus = None
+
         def ma_func(period):
             if ma_type == 'EMA':
                 return df['Close'].ewm(span=period, adjust=False).mean()
@@ -326,21 +347,36 @@ class MACrossoverStrategy(BaseStrategy):
         df['middle_ma'] = ma_func(middle_period)
         df['slow_ma'] = ma_func(slow_period)
 
-        df['signal'] = 0
-        buy_condition = (
-            (df['fast_ma'] > df['middle_ma']) &
-            (df['middle_ma'] > df['slow_ma'])
-        )
-        sell_condition = (
-            (df['fast_ma'] < df['middle_ma']) &
-            (df['middle_ma'] < df['slow_ma'])
-        )
+        buy_raw = ((df['fast_ma'] > df['middle_ma']) &
+                   (df['middle_ma'] > df['slow_ma'])).to_numpy()
+        sell_raw = ((df['fast_ma'] < df['middle_ma']) &
+                    (df['middle_ma'] < df['slow_ma'])).to_numpy()
+        close = df['Close'].to_numpy()
 
-        df.loc[buy_condition, 'signal'] = 1
-        df.loc[sell_condition, 'signal'] = -1
+        n = len(df)
+        positions = np.zeros(n, dtype=int)
+        pos = 0
+        entry_price = 0.0
+        for i in range(n):
+            if pos == 0:
+                if buy_raw[i]:
+                    pos, entry_price = 1, close[i]
+                elif sell_raw[i]:
+                    pos, entry_price = -1, close[i]
+            else:
+                # Opposite crossover flips the position.
+                if pos == 1 and sell_raw[i]:
+                    pos, entry_price = -1, close[i]
+                elif pos == -1 and buy_raw[i]:
+                    pos, entry_price = 1, close[i]
+                elif entry_price > 0:
+                    hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
+                    hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
+                    if hit_lower or hit_upper:
+                        pos, entry_price = 0, 0.0
+            positions[i] = pos
 
-        df['position'] = df['signal'].replace(0, np.nan).ffill().fillna(0)
-
+        df['position'] = positions
         return df
 
 

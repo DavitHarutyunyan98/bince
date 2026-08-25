@@ -1313,13 +1313,15 @@ class FuturesTrader:
                         avg_unprofitable_short = avg_unprofitable_trade if short_trades > long_trades else 0
 
                 # Optional per-segment split columns (added to the results table).
+                # Always emit per-segment columns so the paginated per-metric
+                # results view has data; the "Total" view simply hides them.
                 _split_cols = {'Segment_Consistency': segment_consistency}
-                if getattr(self, 'split_columns', False):
-                    for _i, _seg in enumerate(seg_records, 1):
-                        _split_cols[f'S{_i}_Return'] = _seg['Total_Return']
-                        _split_cols[f'S{_i}_WinRate'] = _seg['Win_Rate']
-                        _split_cols[f'S{_i}_Trades'] = _seg['Total_Trades']
-                        _split_cols[f'S{_i}_MaxDD'] = _seg['Max_Drawdown']
+                for _i, _seg in enumerate(seg_records, 1):
+                    _split_cols[f'S{_i}_Return'] = _seg['Total_Return']
+                    _split_cols[f'S{_i}_WinRate'] = _seg['Win_Rate']
+                    _split_cols[f'S{_i}_ProfitFactor'] = _seg['Profit_Factor']
+                    _split_cols[f'S{_i}_Trades'] = _seg['Total_Trades']
+                    _split_cols[f'S{_i}_MaxDD'] = _seg['Max_Drawdown']
 
                 # --- Store All Results ---
                 trial.set_user_attr('results', {
@@ -1744,13 +1746,15 @@ class FuturesTrader:
 
                 composite_score = score
 
+                # Always emit per-segment columns so the paginated per-metric
+                # results view has data; the "Total" view simply hides them.
                 _split_cols = {'Segment_Consistency': segment_consistency}
-                if getattr(self, 'split_columns', False):
-                    for _i, _seg in enumerate(seg_records, 1):
-                        _split_cols[f'S{_i}_Return'] = _seg['Total_Return']
-                        _split_cols[f'S{_i}_WinRate'] = _seg['Win_Rate']
-                        _split_cols[f'S{_i}_Trades'] = _seg['Total_Trades']
-                        _split_cols[f'S{_i}_MaxDD'] = _seg['Max_Drawdown']
+                for _i, _seg in enumerate(seg_records, 1):
+                    _split_cols[f'S{_i}_Return'] = _seg['Total_Return']
+                    _split_cols[f'S{_i}_WinRate'] = _seg['Win_Rate']
+                    _split_cols[f'S{_i}_ProfitFactor'] = _seg['Profit_Factor']
+                    _split_cols[f'S{_i}_Trades'] = _seg['Total_Trades']
+                    _split_cols[f'S{_i}_MaxDD'] = _seg['Max_Drawdown']
 
                 trial.set_user_attr('results', {
                     **_split_cols,
@@ -2358,6 +2362,23 @@ def build_refine_panel():
                             {'label': 'Profitable Trades Count', 'value': 'Profitable_Trades'},
                         ],
                         value='Score',
+                        clearable=False,
+                        className='custom-input'
+                    )
+                ], className='flex-item'),
+                html.Div([
+                    html.Label("Results View (page):"),
+                    dcc.Dropdown(
+                        id='opt-results-view',
+                        options=[
+                            {'label': 'Total (overall per pair)', 'value': 'total'},
+                            {'label': 'Segments · Return %', 'value': 'Return'},
+                            {'label': 'Segments · Win Rate %', 'value': 'WinRate'},
+                            {'label': 'Segments · Profit Factor', 'value': 'ProfitFactor'},
+                            {'label': 'Segments · Trades', 'value': 'Trades'},
+                            {'label': 'Segments · Max Drawdown %', 'value': 'MaxDD'},
+                        ],
+                        value='total',
                         clearable=False,
                         className='custom-input'
                     )
@@ -3605,11 +3626,11 @@ def load_optimization_results(contents, filename):
     except Exception:
         df_best = df.copy()
     cols = [{"name": c.replace("_", " ").title(), "id": c} for c in df.columns]
-    best_cols = [{"name": c.replace("_", " ").title(), "id": c} for c in df_best.columns]
+    best_data, best_cols = _build_results_view(df_best, 'total')
     pairs = sorted(df['Trading_Pair'].dropna().unique().tolist())
     status = (f"✅ Loaded {filename}: {len(df)} trials across {len(pairs)} pairs{note}. "
               f"Tables, heatmap and per-pair backtests updated.")
-    return (df_best.to_dict('records'), best_cols,
+    return (best_data, best_cols,
             all_trials, cols, all_trials, pairs, status)
 
 
@@ -3944,44 +3965,64 @@ def update_optimizer_parameter_visibility(selected_strategy):
     return range_inputs, checklist_options, default_values
 
 
-# Best results priority callback
+def _build_results_view(df_best, view):
+    """Shape the best-per-pair frame for the selected page/view.
+
+    'total' hides the per-segment S<n>_* columns (overall metrics only). A
+    metric view (Return / WinRate / ProfitFactor / Trades / MaxDD) shows one
+    column per date segment for that metric — as many segments as were chosen."""
+    if view and view != 'total':
+        suffix = '_' + view
+        seg_cols = [c for c in df_best.columns
+                    if re.match(r'^S\d+' + re.escape(suffix) + r'$', c)]
+        seg_cols.sort(key=lambda c: int(c[1:c.index('_')]))
+        if not seg_cols:
+            return [], [{'name': 'Trading Pair', 'id': 'Trading_Pair'}]
+        columns = [{'name': 'Trading Pair', 'id': 'Trading_Pair'}]
+        for c in seg_cols:
+            columns.append({'name': f'Segment {c[1:c.index("_")]}', 'id': c})
+        keep = ['Trading_Pair'] + seg_cols
+        keep = [c for c in keep if c in df_best.columns]
+        return df_best[keep].to_dict('records'), columns
+    # Total view: drop per-segment columns.
+    keep = [c for c in df_best.columns if not re.match(r'^S\d+_', c)]
+    columns = [{"name": c.replace("_", " ").title(), "id": c} for c in keep]
+    return df_best[keep].to_dict('records'), columns
+
+
+# Best results priority + paginated view callback
 @app.callback(
-    [Output('opt-results-table', 'data', allow_duplicate=True), 
+    [Output('opt-results-table', 'data', allow_duplicate=True),
      Output('opt-results-table', 'columns', allow_duplicate=True)],
-    Input('best-results-priority-dropdown', 'value'),
+    [Input('best-results-priority-dropdown', 'value'),
+     Input('opt-results-view', 'value')],
     State('all-trials-store', 'data'),
     prevent_initial_call=True
 )
-def update_best_results_priority(priority_column, all_trials_data):
-    """Update best results table based on selected priority metric."""
+def update_best_results_priority(priority_column, view, all_trials_data):
+    """Rebuild the best-results table for the chosen priority metric and the
+    chosen page/view (Total, or one metric across all date segments)."""
     if not all_trials_data or not priority_column:
         return no_update, no_update
-    
+
     try:
         df_all = pd.DataFrame(all_trials_data)
         if priority_column not in df_all.columns:
             return no_update, no_update
-        
-        # Handle columns that should be sorted in ascending order (lower is better)
+
+        # Lower-is-better metrics sort ascending.
         ascending = priority_column in ['Max_Drawdown', 'Trade_Balance_Ratio', 'Trade_Difference', 'Avg_Unprofitable_Trade']
-        
-        # Get best result per pair based on selected priority
+
         if ascending:
             df_best = df_all.loc[df_all.groupby('Trading_Pair')[priority_column].idxmin()].copy()
         else:
             df_best = df_all.loc[df_all.groupby('Trading_Pair')[priority_column].idxmax()].copy()
-        
-        # Sort the results
+
         df_best = df_best.sort_values(by=priority_column, ascending=ascending).round(2)
-        
-        columns = [{"name": i.replace("_", " ").title(), "id": i} for i in df_best.columns]
-        data = df_best.to_dict('records')
-        
-        add_optimization_log(f"🎯 Updated best results priority to: {priority_column}")
-        
+        data, columns = _build_results_view(df_best, view)
         return data, columns
     except Exception as e:
-        add_optimization_log(f"❌ Error updating best results priority: {e}")
+        add_optimization_log(f"❌ Error updating best results view: {e}")
         return no_update, no_update
 
 
@@ -4337,9 +4378,8 @@ def run_optimization_task(n_intervals, settings):
     df_best_results = df_results.loc[df_results.groupby('Trading_Pair')[best_results_priority].idxmax()].copy()
     all_trials_data = df_results.to_dict('records')
     df_display = df_best_results.copy()
-    columns = [{"name": i.replace("_", " ").title(), "id": i}
-               for i in df_display.columns]
-    data = df_display.to_dict('records')
+    # Default to the Total view (hide per-segment S<n>_* columns).
+    data, columns = _build_results_view(df_display, 'total')
 
     if not OPTIMIZATION_STOP_EVENT.is_set():
         try:
