@@ -307,6 +307,33 @@ _CATEGORICAL_CHOICES = {
     'ma_type': ['EMA', 'SMA'],
 }
 
+# Human-readable labels for strategy parameters (used by the optimizer UI).
+_PARAM_LABELS = {
+    'buy_signal_window': 'Buy Signal Window',
+    'buy_pattern_lookback': 'Buy Pattern Lookback',
+    'sell_signal_window': 'Sell Signal Window',
+    'sell_pattern_lookback': 'Sell Pattern Lookback',
+    'exit_minus_percent': 'Exit Minus %',
+    'exit_plus_percent': 'Exit Plus %',
+    'rsi_period': 'RSI Period',
+    'oversold_threshold': 'Oversold Threshold',
+    'overbought_threshold': 'Overbought Threshold',
+    'fast_ma_period': 'Fast MA Period',
+    'middle_ma_period': 'Middle MA Period',
+    'slow_ma_period': 'Slow MA Period',
+    'ma_type': 'MA Type',
+    'atr_period': 'ATR Period',
+    'atr_multiplier': 'ATR Multiplier',
+}
+
+# Default "min,max,step" ranges pre-filled into the optimizer UI per parameter.
+_UI_RANGE_DEFAULTS = {
+    'buy_signal_window': '5,15,2', 'buy_pattern_lookback': '2,5,1',
+    'sell_signal_window': '5,15,2', 'sell_pattern_lookback': '2,5,1',
+    'exit_minus_percent': '1.0,5.0,0.5', 'exit_plus_percent': '1.0,5.0,0.5',
+    **_DEFAULT_RANGE_HINTS,
+}
+
 
 def _build_param_map(default_params):
     """Derive optimizer config from a strategy's own parameter spec so every
@@ -332,6 +359,31 @@ def _range_for(p_name, param_ranges):
     if param_ranges and param_ranges.get(p_name):
         return param_ranges[p_name]
     return _DEFAULT_RANGE_HINTS.get(p_name)
+
+
+def _build_opt_range_inputs(strategy_name):
+    """Render one labelled range input per parameter of the selected strategy.
+    Categorical params (e.g. ma_type) show an 'auto' note instead of a range."""
+    from dash import dcc, html
+    strategy_class = STRATEGY_REGISTRY.get(strategy_name) or CandlestickStrategy
+    children = []
+    for key, spec in strategy_class.get_parameters().items():
+        label = _PARAM_LABELS.get(key, key.replace('_', ' ').title())
+        if spec.get('type') == 'text':
+            choices = _CATEGORICAL_CHOICES.get(key)
+            note = f"auto: {', '.join(choices)}" if choices else "auto"
+            children.append(html.Div([
+                html.Label(label, style={'fontSize': '12px', 'color': '#aaa'}),
+                html.Div(note, style={'fontSize': '12px', 'color': '#666', 'padding': '6px 0'}),
+            ]))
+            continue
+        default = _UI_RANGE_DEFAULTS.get(key, '')
+        children.append(html.Div([
+            html.Label(label, style={'fontSize': '12px', 'color': '#aaa'}),
+            dcc.Input(id={'type': 'opt-range', 'param': key}, value=default,
+                      placeholder=f'{label} (min,max,step)', className='custom-input'),
+        ]))
+    return children
 
 
 def add_optimization_log(message):
@@ -2119,22 +2171,11 @@ def build_optimizer_panel():
                                "Normal Scan", id="preset-normal-btn", className='small-button'),
                            html.Button("Deep Scan", id="preset-deep-btn", className='small-button')],
                           style={'display': 'flex', 'justifyContent': 'center', 'gap': '10px', 'marginBottom': '15px',
-                                 'flexWrap': 'wrap'}), html.Label("Ranges (min, max, step)"),
-                      # Candlestick Parameters Container
-                      html.Div([
-                          dcc.Input(id='buy-window-range', placeholder='Buy Window (e.g. 5,15,2)',
-                                    className='custom-input'),
-                          dcc.Input(id='buy-lookback-range', placeholder='Buy Lookback (e.g. 2,5,1)',
-                                    className='custom-input'),
-                          dcc.Input(id='sell-window-range', placeholder='Sell Window (e.g. 5,15,2)',
-                                    className='custom-input'),
-                          dcc.Input(id='sell-lookback-range', placeholder='Sell Lookback (e.g. 2,5,1)',
-                                    className='custom-input'),
-                          dcc.Input(id='exit-minus-range', placeholder='Exit Minus % (e.g. 1.0,5.0,0.5)',
-                                    className='custom-input'),
-                          dcc.Input(id='exit-plus-range', placeholder='Exit Plus % (e.g. 1.0,5.0,0.5)',
-                                    className='custom-input')],
-                               id='candlestick-params-container', className='responsive-grid'),
+                                 'flexWrap': 'wrap'}),
+                      html.Label("Ranges (min, max, step) — fields update with the selected strategy"),
+                      # Range inputs are rendered dynamically per selected strategy.
+                      html.Div(_build_opt_range_inputs(list(STRATEGY_REGISTRY.keys())[0]),
+                               id='opt-param-ranges-container', className='responsive-grid'),
                       ], className='control-panel-group'),
             # Post-exit actions removed (no SL/TP)
             html.Div([html.H4("Run Settings"), html.Div([html.Div(
@@ -2166,7 +2207,15 @@ def build_optimizer_panel():
                     [html.Label("Min Candles"),
                      dcc.Input(id='min-candles-input', type='number', value=500, min=50, className='custom-input')],
                     className='flex-item')
-            ], className='flex-container')], className='control-panel-group'),
+            ], className='flex-container'),
+                html.Div([
+                    html.Label("Quick In-Sample Range:", style={'marginRight': '8px'}),
+                    html.Button("1 Month", id='opt-range-1m', n_clicks=0, className='small-button'),
+                    html.Button("3 Months", id='opt-range-3m', n_clicks=0, className='small-button'),
+                    html.Button("1 Year", id='opt-range-1y', n_clicks=0, className='small-button'),
+                ], style={'display': 'flex', 'gap': '8px', 'alignItems': 'center',
+                          'marginTop': '10px', 'flexWrap': 'wrap'})
+            ], className='control-panel-group'),
             html.Div([
                 html.H4("Optimization Strategy"),
                 html.Div([
@@ -3144,7 +3193,7 @@ def _build_portfolio_figure_and_trades(trades_df, portfolio_df):
     [State('opt-results-table', 'derived_viewport_data'),
      State('is-date-start', 'value'), State('is-date-end', 'value'),
      State('capital-input', 'value'), State('opt-sizing-mode', 'value'),
-     State('num-splits-input', 'value')],
+     State('opt-num-splits', 'value')],
     prevent_initial_call=True
 )
 def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, capital, sizing_mode, n_splits):
@@ -3802,52 +3851,83 @@ def refine_pairs_for_next_run(n_clicks, all_trials_data, sort_by, top_n):
     return top_pairs.tolist()
 
 
+# Preset scan ranges per parameter (fast = coarse, deep = fine).
+_PRESET_RANGES = {
+    'preset-fast-btn': {
+        'buy_signal_window': '5,10,5', 'buy_pattern_lookback': '2,3,1',
+        'sell_signal_window': '5,10,5', 'sell_pattern_lookback': '2,3,1',
+        'exit_minus_percent': '1.0,3.0,1.0', 'exit_plus_percent': '1.0,3.0,1.0',
+        'fast_ma_period': '5,20,5', 'middle_ma_period': '20,50,10', 'slow_ma_period': '50,150,25',
+        'rsi_period': '7,21,7', 'oversold_threshold': '20,40,10', 'overbought_threshold': '60,80,10',
+        'atr_period': '7,21,7', 'atr_multiplier': '1.0,4.0,1.0',
+    },
+    'preset-normal-btn': {
+        'buy_signal_window': '5,15,2', 'buy_pattern_lookback': '2,5,1',
+        'sell_signal_window': '5,15,2', 'sell_pattern_lookback': '2,5,1',
+        'exit_minus_percent': '1.0,5.0,0.5', 'exit_plus_percent': '1.0,5.0,0.5',
+        'fast_ma_period': '5,20,1', 'middle_ma_period': '15,50,5', 'slow_ma_period': '50,150,10',
+        'rsi_period': '7,21,1', 'oversold_threshold': '20,40,5', 'overbought_threshold': '60,80,5',
+        'atr_period': '7,21,1', 'atr_multiplier': '1.0,4.0,0.5',
+    },
+    'preset-deep-btn': {
+        'buy_signal_window': '3,20,1', 'buy_pattern_lookback': '1,5,1',
+        'sell_signal_window': '3,20,1', 'sell_pattern_lookback': '1,5,1',
+        'exit_minus_percent': '0.5,5.0,0.25', 'exit_plus_percent': '0.5,5.0,0.25',
+        'fast_ma_period': '3,25,1', 'middle_ma_period': '10,60,2', 'slow_ma_period': '40,180,5',
+        'rsi_period': '5,25,1', 'oversold_threshold': '15,45,2', 'overbought_threshold': '55,85,2',
+        'atr_period': '5,25,1', 'atr_multiplier': '0.5,5.0,0.25',
+    },
+}
+
+
 @app.callback(
-    [Output('buy-window-range', 'value'), Output('buy-lookback-range', 'value'),
-     Output('sell-window-range', 'value'), Output('sell-lookback-range', 'value'),
-     Output('exit-minus-range', 'value'), Output('exit-plus-range', 'value')],
+    Output({'type': 'opt-range', 'param': ALL}, 'value'),
     [Input('preset-fast-btn', 'n_clicks'), Input('preset-normal-btn', 'n_clicks'),
      Input('preset-deep-btn', 'n_clicks')],
+    State({'type': 'opt-range', 'param': ALL}, 'id'),
     prevent_initial_call=True
 )
-def set_parameter_presets(fast, normal, deep):
+def set_parameter_presets(fast, normal, deep, ids):
+    """Fill the currently-shown range inputs with a preset, per parameter."""
     ctx = callback_context
+    if not ctx.triggered:
+        return [no_update] * len(ids)
     button_id = ctx.triggered[0]['prop_id'].split('.')[0]
-    if button_id == 'preset-fast-btn':
-        return '5,10,5', '2,3,1', '5,10,5', '2,3,1', '1.0,3.0,1.0', '1.0,3.0,1.0'
-    if button_id == 'preset-normal-btn':
-        return '5,15,2', '2,5,1', '5,15,2', '2,5,1', '1.0,5.0,0.5', '1.0,5.0,0.5'
-    if button_id == 'preset-deep-btn':
-        return '3,20,1', '1,5,1', '3,20,1', '1,5,1', '0.5,5.0,0.25', '0.5,5.0,0.25'
-    return [no_update] * 6
+    preset = _PRESET_RANGES.get(button_id, {})
+    return [preset.get(i['param'], no_update) for i in ids]
+
+
+@app.callback(
+    [Output('is-date-start', 'value', allow_duplicate=True),
+     Output('is-date-end', 'value', allow_duplicate=True)],
+    [Input('opt-range-1m', 'n_clicks'), Input('opt-range-3m', 'n_clicks'),
+     Input('opt-range-1y', 'n_clicks')],
+    prevent_initial_call=True,
+)
+def set_opt_quick_date_range(m1, m3, y1):
+    """Quick-set the in-sample date range to the last month / 3 months / year."""
+    ctx = callback_context
+    if not ctx.triggered:
+        return no_update, no_update
+    button = ctx.triggered[0]['prop_id'].split('.')[0]
+    days = {'opt-range-1m': 30, 'opt-range-3m': 90, 'opt-range-1y': 365}.get(button)
+    if not days:
+        return no_update, no_update
+    today = datetime.now().date()
+    return str(today - timedelta(days=days)), str(today)
 
 
 # Dynamic parameter visibility callback
 @app.callback(
-    [Output('candlestick-params-container', 'style'),
+    [Output('opt-param-ranges-container', 'children'),
      Output('param-selection-checklist', 'options'),
      Output('param-selection-checklist', 'value')],
     Input('optimizer-strategy-selector', 'value'),
     prevent_initial_call=True
 )
 def update_optimizer_parameter_visibility(selected_strategy):
-    """Update the optimizable-parameter checklist based on the selected strategy."""
-    param_labels = {
-        'buy_signal_window': 'Buy Signal Window',
-        'buy_pattern_lookback': 'Buy Pattern Lookback',
-        'sell_signal_window': 'Sell Signal Window',
-        'sell_pattern_lookback': 'Sell Pattern Lookback',
-        'exit_minus_percent': 'Exit Minus %',
-        'exit_plus_percent': 'Exit Plus %',
-        'rsi_period': 'RSI Period',
-        'oversold_threshold': 'Oversold Threshold',
-        'overbought_threshold': 'Overbought Threshold',
-        'fast_ma_period': 'Fast MA Period',
-        'middle_ma_period': 'Middle MA Period',
-        'slow_ma_period': 'Slow MA Period',
-        'ma_type': 'MA Type'
-    }
-
+    """Rebuild the range inputs and the optimizable-parameter checklist for the
+    selected strategy, so switching strategy shows that strategy's own params."""
     strategy_class = STRATEGY_REGISTRY.get(selected_strategy) if selected_strategy else None
     if not strategy_class:
         strategy_class = CandlestickStrategy
@@ -3856,11 +3936,12 @@ def update_optimizer_parameter_visibility(selected_strategy):
     checklist_options = []
     default_values = []
     for param_key in param_keys:
-        label = param_labels.get(param_key, param_key.replace('_', ' ').title())
+        label = _PARAM_LABELS.get(param_key, param_key.replace('_', ' ').title())
         checklist_options.append({'label': label, 'value': param_key})
         default_values.append(param_key)
 
-    return {'display': 'block'}, checklist_options, default_values
+    range_inputs = _build_opt_range_inputs(selected_strategy)
+    return range_inputs, checklist_options, default_values
 
 
 # Best results priority callback
@@ -4034,12 +4115,8 @@ def toggle_opt_buttons(status):
     Input('start-opt-button', 'n_clicks'),
     [State('manual-pair-dropdown', 'value'),                    # pairs
      State('param-selection-checklist', 'value'),               # selected_params
-     State('buy-window-range', 'value'),                        # bw_str
-     State('buy-lookback-range', 'value'),                      # bl_str
-     State('sell-window-range', 'value'),                       # sw_str
-     State('sell-lookback-range', 'value'),                     # slr_str
-     State('exit-minus-range', 'value'),                        # exit_minus_str
-     State('exit-plus-range', 'value'),                         # exit_plus_str
+     State({'type': 'opt-range', 'param': ALL}, 'value'),       # range values
+     State({'type': 'opt-range', 'param': ALL}, 'id'),          # range ids
      State('max-combinations-input', 'value'),                  # n_trials
      State('min-trades-input', 'value'),                        # min_trades
      State('min-candles-input', 'value'),                       # min_candles
@@ -4061,8 +4138,8 @@ def toggle_opt_buttons(status):
      State('opt-num-splits', 'value')],                         # n_splits
     prevent_initial_call=True
 )
-def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str, sw_str, slr_str,
-                               exit_minus_str, exit_plus_str, n_trials, min_trades, min_candles,
+def start_optimization_trigger(n_clicks, pairs, selected_params, range_values, range_ids,
+                               n_trials, min_trades, min_candles,
                                strategy_name, timeframe, is_start, is_end, oos_start, oos_end,
                                weight_return, weight_winrate, weight_trades, weight_consistency,
                                weight_winloss, weight_oos, optimization_mode, sizing_mode, split_mode, n_splits):
@@ -4142,9 +4219,12 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, bw_str, bl_str,
         add_optimization_log(f"⚠️ Skipped pairs: {', '.join(skipped_pairs)}")
 
     try:
+        # Build param_ranges generically from the dynamic per-strategy inputs.
+        param_ranges = {i['param']: v for i, v in zip(range_ids or [], range_values or [])
+                        if v not in (None, '')}
         settings = {
-            'pairs': valid_pairs, 'selected_params': selected_params, 'bw_str': bw_str, 'bl_str': bl_str,
-            'sw_str': sw_str, 'slr_str': slr_str, 'exit_minus_str': exit_minus_str, 'exit_plus_str': exit_plus_str, 'n_trials': int(n_trials),
+            'pairs': valid_pairs, 'selected_params': selected_params, 'param_ranges': param_ranges,
+            'n_trials': int(n_trials),
             'min_trades': int(min_trades), 'min_candles': min_candles_val, 'strategy_name': strategy_name, 'timeframe': timeframe,
             'is_start': is_start, 'is_end': is_end,
             'oos_start': oos_start, 'oos_end': oos_end,
@@ -4192,11 +4272,8 @@ def run_optimization_task(n_intervals, settings):
 
     try:
         pairs = settings['pairs']
-        param_ranges = {
-            'buy_signal_window': settings['bw_str'], 'buy_pattern_lookback': settings['bl_str'],
-            'sell_signal_window': settings['sw_str'], 'sell_pattern_lookback': settings['slr_str'],
-            'exit_minus_percent': settings['exit_minus_str'], 'exit_plus_percent': settings['exit_plus_str'],
-        }
+        # Per-strategy ranges collected from the dynamic UI inputs.
+        param_ranges = settings.get('param_ranges', {})
         weights = {
             'total_return': settings['weight_return'] or 0,
             'win_rate': settings['weight_winrate'] or 0,
