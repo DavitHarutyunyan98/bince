@@ -3162,13 +3162,26 @@ def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, cap
     if not pair:
         return blank
 
-    # The optimizer only produces Candlestick results now; map the row's
-    # Title_Case parameter columns back to the strategy's parameter keys.
-    strategy_name = "Candlestick Patterns"
-    strategy_class = STRATEGY_REGISTRY.get(strategy_name)
+    # Detect which strategy produced this row so MA Crossover / RSI / etc.
+    # backtest with their own params — not just Candlestick. Prefer an explicit
+    # 'Strategy' column, else infer the strategy whose full parameter set is
+    # present in the row's Title_Case columns.
+    strategy_name = row.get('Strategy')
+    strategy_class = STRATEGY_REGISTRY.get(strategy_name) if strategy_name else None
+    if strategy_class is None:
+        for sname, scls in STRATEGY_REGISTRY.items():
+            keys = list(scls.get_parameters().keys())
+            if keys and all(_result_col(k) in row and row[_result_col(k)] not in (None, '')
+                            for k in keys):
+                strategy_name, strategy_class = sname, scls
+                break
+    if strategy_class is None:
+        strategy_name = "Candlestick Patterns"
+        strategy_class = STRATEGY_REGISTRY.get(strategy_name)
+
     params = {}
     for key in strategy_class.get_parameters():
-        col = key.replace('_', ' ').title().replace(' ', '_')
+        col = _result_col(key)
         if col in row and row[col] not in (None, ''):
             params[key] = row[col]
 
