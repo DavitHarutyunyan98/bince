@@ -1027,21 +1027,44 @@ class FuturesTrader:
                 add_optimization_log(f"-> {symbol}: No valid parameters found for optimization")
                 return []
             
-            # Generate all combinations
+            # Generate combinations. The full Cartesian product can be enormous
+            # (many params × wide ranges), so only materialize it when it is
+            # small; otherwise randomly SAMPLE up to the trial budget to keep
+            # memory bounded (this is what previously exhausted RAM).
             import itertools
+            import math
             param_names = list(param_values.keys())
             param_lists = [param_values[name] for name in param_names]
-            
-            # FIXED: Handle empty param_lists
+
             if not param_lists:
                 return []
-            
-            for combination in itertools.product(*param_lists):
-                param_dict = dict(zip(param_names, combination))
-                combinations.append(param_dict)
-            
-            # Shuffle combinations for better distribution
-            random.shuffle(combinations)
+
+            sizes = [len(v) for v in param_lists]
+            total = math.prod(sizes) if sizes else 0
+            budget = max(int(n_trials or 0), 1)
+            # Only fully enumerate when the product is modest.
+            enumerate_cap = max(budget * 3, 20000)
+
+            if total <= enumerate_cap:
+                combinations = [dict(zip(param_names, c))
+                                for c in itertools.product(*param_lists)]
+                random.shuffle(combinations)
+            else:
+                target = min(budget, total)
+                seen = set()
+                combinations = []
+                attempts = 0
+                max_attempts = target * 25
+                while len(combinations) < target and attempts < max_attempts:
+                    attempts += 1
+                    combo = tuple(random.choice(v) for v in param_lists)
+                    if combo in seen:
+                        continue
+                    seen.add(combo)
+                    combinations.append(dict(zip(param_names, combo)))
+                add_optimization_log(
+                    f"-> {symbol}: {total:,} combinations possible — sampled "
+                    f"{len(combinations)} to fit the trial budget (memory-safe).")
             add_optimization_log(f"-> {symbol}: Generated {len(combinations)} combinations for strategy {strategy.__class__.__name__}")
             return combinations
 
@@ -1351,12 +1374,8 @@ class FuturesTrader:
                 return -1000.0
 
         def log_trial_progress(study, trial):
-            # Log every 5th trial, on completion, or if it's a new best score
-            is_new_best = hasattr(study, 'best_trial') and study.best_trial == trial
-            should_log = ((trial.number + 1) % 5 == 0 or 
-                         trial.state == optuna.trial.TrialState.COMPLETE or 
-                         is_new_best)
-            
+            # Log every trial so progress is fully visible.
+            should_log = True
             if not should_log:
                 return
                 
@@ -1403,6 +1422,18 @@ class FuturesTrader:
                 if param_parts:
                     message += f" | Params: {'/'.join(param_parts)}"
                 message += f" | Ret: {ret:.2f}% | WR: {wr:.1f}% | Trades: {trades}"
+                # Machine-readable row so results can be reconstructed from logs
+                # for ANY strategy (not just Candlestick).
+                try:
+                    _row = {'Trading_Pair': symbol}
+                    for _k, _v in results.items():
+                        if _k != 'params':
+                            _row[_k] = _v
+                    for _pk, _pv in params.items():
+                        _row[_result_col(_pk)] = _pv
+                    message += " [[ROW]]" + json.dumps(_row, default=str)
+                except Exception:
+                    pass
             elif trial.state != optuna.trial.TrialState.RUNNING:
                 message += f" ({trial.state.name})"
             
@@ -1783,12 +1814,8 @@ class FuturesTrader:
                 return -1000.0
 
         def log_trial_progress(study, trial):
-            # Log every 5th trial, on completion, or if it's a new best score
-            is_new_best = hasattr(study, 'best_trial') and study.best_trial == trial
-            should_log = ((trial.number + 1) % 5 == 0 or 
-                         trial.state == optuna.trial.TrialState.COMPLETE or 
-                         is_new_best)
-            
+            # Log every trial so progress is fully visible.
+            should_log = True
             if not should_log:
                 return
                 
@@ -1835,6 +1862,18 @@ class FuturesTrader:
                 if param_parts:
                     message += f" | Params: {'/'.join(param_parts)}"
                 message += f" | Ret: {ret:.2f}% | WR: {wr:.1f}% | Trades: {trades}"
+                # Machine-readable row so results can be reconstructed from logs
+                # for ANY strategy (not just Candlestick).
+                try:
+                    _row = {'Trading_Pair': symbol}
+                    for _k, _v in results.items():
+                        if _k != 'params':
+                            _row[_k] = _v
+                    for _pk, _pv in params.items():
+                        _row[_result_col(_pk)] = _pv
+                    message += " [[ROW]]" + json.dumps(_row, default=str)
+                except Exception:
+                    pass
             elif trial.state != optuna.trial.TrialState.RUNNING:
                 message += f" ({trial.state.name})"
             
@@ -2258,6 +2297,10 @@ def build_optimizer_panel():
                 html.Div([html.Label("Number of Date Splits:"),
                           dcc.Input(id='opt-num-splits', value=4, type='number', min=1, max=20, step=1,
                                     className='custom-input')], style={'marginTop': '8px'}),
+                dcc.Checklist(id='opt-skip-validation',
+                              options=[{'label': ' Skip candle validation (reuse cached data / faster re-runs)',
+                                        'value': 'skip'}],
+                              value=[], className='custom-checklist', style={'marginTop': '8px'}),
             ], className='control-panel-group'),
             html.Div([
                 html.H4("Optimization Goal (Weights)"),
@@ -2697,11 +2740,15 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
                    "backtests from a results file previously exported by the optimizer — no re-run needed.",
                    style={'fontSize': '12px', 'color': '#888', 'textAlign': 'center'}),
         ]),
-        create_collapsible_container("Optimization Log", "opt-log", dcc.Textarea(id='opt-log-textarea', readOnly=True,
-                                                                                 style={'width': '100%',
-                                                                                        'height': '400px',
-                                                                                        'backgroundColor': '#222',
-                                                                                        'color': 'lightgray'})),
+        create_collapsible_container("Optimization Log", "opt-log", [
+            dcc.Checklist(id='log-autoscroll-toggle',
+                          options=[{'label': ' Auto-scroll to newest', 'value': 'on'}],
+                          value=['on'], className='custom-checklist',
+                          style={'marginBottom': '6px'}),
+            dcc.Textarea(id='opt-log-textarea', readOnly=True,
+                         style={'width': '100%', 'height': '400px',
+                                'backgroundColor': '#222', 'color': 'lightgray'}),
+        ]),
         create_collapsible_container("Optimization Results (Best per Pair)", "opt-results-table",
                                      html.Div(
                                          dash_table.DataTable(
@@ -2891,32 +2938,8 @@ def update_main_chart(n_clicks, n_intervals, symbol, timeframe, start_date, end_
     params = {p['param']: v for p, v in zip(param_ids, param_values)}
     strategy_instance = strategy_class()
     df = strategy_instance.generate_signals(trader.data.copy(), params)
-    fig = go.Figure(data=[go.Candlestick(x=df.index, open=df['Open'], high=df['High'], low=df['Low'], close=df['Close'],
-                                         name='Candlestick')])
-    if 'position' in df.columns:
-        buy_signals = df[df['position'] == 1]
-        sell_signals = df[df['position'] == -1]
-        fig.add_trace(go.Scatter(x=buy_signals.index, y=buy_signals['Low'], mode='markers',
-                                 marker=dict(color='cyan', size=10, symbol='triangle-up'), name='Buy Signal'))
-        fig.add_trace(go.Scatter(x=sell_signals.index, y=sell_signals['High'], mode='markers',
-                                 marker=dict(color='yellow', size=10, symbol='triangle-down'), name='Sell Signal'))
-
-    # Add Three White Soldiers and Three Black Crows pattern visualization
-    if 'ThreeWhiteSoldiers' in df.columns and 'ThreeBlackCrows' in df.columns:
-        # Three White Soldiers patterns (bullish) - show on candle close price
-        white_soldiers = df[df['ThreeWhiteSoldiers'] == 1]
-        if not white_soldiers.empty:
-            fig.add_trace(go.Scatter(x=white_soldiers.index, y=white_soldiers['Close'], mode='markers',
-                                     marker=dict(color='lime', size=13, symbol='circle'), name='Three White Soldiers'))
-
-        # Three Black Crows patterns (bearish) - show on candle close price
-        black_crows = df[df['ThreeBlackCrows'] == 1]
-        if not black_crows.empty:
-            fig.add_trace(go.Scatter(x=black_crows.index, y=black_crows['Close'], mode='markers',
-                                     marker=dict(color='red', size=13, symbol='circle'), name='Three Black Crows'))
-    fig.update_layout(title=f"{symbol} Chart ({timeframe})",
-                      template='plotly_dark', xaxis_rangeslider_visible=False)
-    return fig
+    # Shared builder overlays MA / SuperTrend lines and pattern markers.
+    return _build_price_signal_figure(df, f"{symbol} Chart ({timeframe})")
 
 
 @app.callback(
@@ -3551,9 +3574,24 @@ _LOG_TRIAL_RE = re.compile(
 
 
 def parse_optimization_log(text):
-    """Best-effort reconstruction of a trials dataframe from an optimizer .txt
-    log. Each per-trial line carries the params + return/win-rate/trades, but
-    NOT the composite Score, so callers should synthesize one if needed."""
+    """Reconstruct a trials dataframe from an optimizer .txt log.
+
+    Newer logs embed a machine-readable ``[[ROW]]{json}`` marker per completed
+    trial carrying the full metric set for ANY strategy — those are used when
+    present (rich, includes Score/OOS/segments). Otherwise fall back to the
+    legacy Candlestick regex (return/win-rate/trades only)."""
+    marker_rows = []
+    for line in text.splitlines():
+        idx = line.find('[[ROW]]')
+        if idx == -1:
+            continue
+        try:
+            marker_rows.append(json.loads(line[idx + len('[[ROW]]'):].strip()))
+        except Exception:
+            continue
+    if marker_rows:
+        return pd.DataFrame(marker_rows)
+
     rows = []
     for m in _LOG_TRIAL_RE.finditer(text):
         rows.append({
@@ -4221,14 +4259,16 @@ def toggle_opt_buttons(status):
      State('optimization-mode-dropdown', 'value'),              # optimization_mode
      State('opt-sizing-mode', 'value'),                         # sizing_mode
      State('opt-split-mode', 'value'),                          # split_mode
-     State('opt-num-splits', 'value')],                         # n_splits
+     State('opt-num-splits', 'value'),                          # n_splits
+     State('opt-skip-validation', 'value')],                    # skip_validation
     prevent_initial_call=True
 )
 def start_optimization_trigger(n_clicks, pairs, selected_params, range_values, range_ids,
                                n_trials, min_trades, min_candles,
                                strategy_name, timeframe, is_start, is_end, oos_start, oos_end,
                                weight_return, weight_winrate, weight_trades, weight_consistency,
-                               weight_winloss, weight_oos, optimization_mode, sizing_mode, split_mode, n_splits):
+                               weight_winloss, weight_oos, optimization_mode, sizing_mode, split_mode, n_splits,
+                               skip_validation):
     
     # DEBUG: Add explicit debug logging to verify date alignment
     print(f"DEBUG: Optimization Trigger Received")
@@ -4250,11 +4290,6 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, range_values, r
         return 'idle', no_update, 0, 0, msg
 
     OPTIMIZATION_LOGS.clear()
-    add_optimization_log("--- Quick Validation ---")
-    add_optimization_log(f"Validating {len(pairs)} pairs...")
-
-    # Quick validation - assume most major pairs have data
-    valid_pairs = []
     min_candles_val = int(min_candles)
 
     if not trader:
@@ -4262,33 +4297,34 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, range_values, r
         add_optimization_log(f"!! ERROR: {msg}")
         return 'idle', no_update, 0, 0, msg
 
-    # Proper validation - check data availability for all pairs
-    overall_start_date = is_start
-    overall_end_date = is_end
-
-    for symbol in pairs:
-        try:
-            # Check if data exists for the full date range
-            data = trader.get_historical_data_for_symbol(
-                symbol, timeframe, overall_start_date, overall_end_date)
-
-            if data is not None and not data.empty:
-                # Check if we have enough candles
-                has_enough_candles = len(data) >= min_candles_val
-
-                if has_enough_candles:
-                    valid_pairs.append(symbol)
-                    add_optimization_log(
-                        f"✅ {symbol} - {len(data)} candles available")
+    # Skip the candle-availability pre-check when requested (e.g. re-running on
+    # data already fetched); the optimizer still loads each pair's data itself.
+    if skip_validation and 'skip' in skip_validation:
+        add_optimization_log("Skipping candle validation (using selected pairs as-is).")
+        valid_pairs = list(pairs)
+    else:
+        add_optimization_log("--- Quick Validation ---")
+        add_optimization_log(f"Validating {len(pairs)} pairs...")
+        valid_pairs = []
+        overall_start_date = is_start
+        overall_end_date = is_end
+        for symbol in pairs:
+            try:
+                data = trader.get_historical_data_for_symbol(
+                    symbol, timeframe, overall_start_date, overall_end_date)
+                if data is not None and not data.empty:
+                    if len(data) >= min_candles_val:
+                        valid_pairs.append(symbol)
+                        add_optimization_log(
+                            f"✅ {symbol} - {len(data)} candles available")
+                    else:
+                        add_optimization_log(
+                            f"❌ {symbol} - Only {len(data)} candles (need {min_candles_val})")
                 else:
                     add_optimization_log(
-                        f"❌ {symbol} - Only {len(data)} candles (need {min_candles_val})")
-            else:
-                add_optimization_log(
-                    f"❌ {symbol} - No data found for date range")
-
-        except Exception as e:
-            add_optimization_log(f"❌ {symbol} - Error: {str(e)[:50]}...")
+                        f"❌ {symbol} - No data found for date range")
+            except Exception as e:
+                add_optimization_log(f"❌ {symbol} - Error: {str(e)[:50]}...")
 
     if not valid_pairs:
         add_optimization_log(
@@ -4468,6 +4504,26 @@ def run_optimization_task(n_intervals, settings):
 
 @app.callback(Output('opt-log-textarea', 'value'), Input('log-update-interval', 'n_intervals'))
 def update_logs(n): return "\n".join(OPTIMIZATION_LOGS)
+
+
+# Auto-scroll the optimization log to the newest line when the toggle is on.
+app.clientside_callback(
+    """
+    function(value, autoscroll) {
+        try {
+            if (autoscroll && autoscroll.indexOf('on') !== -1) {
+                const el = document.getElementById('opt-log-textarea');
+                if (el) { el.scrollTop = el.scrollHeight; }
+            }
+        } catch (e) {}
+        return '';
+    }
+    """,
+    Output('scroll-optimizer-dummy', 'children', allow_duplicate=True),
+    Input('opt-log-textarea', 'value'),
+    State('log-autoscroll-toggle', 'value'),
+    prevent_initial_call=True,
+)
 
 
 @app.callback(
