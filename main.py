@@ -281,6 +281,59 @@ TIMEFRAME_TO_ANNUALIZATION_FACTOR = {
 
 
 
+# ==============================================================================
+#  STRATEGY-AGNOSTIC PARAMETER HELPERS
+# ------------------------------------------------------------------------------
+#  Previously the optimizer hard-coded the Candlestick/ATR parameter names, so
+#  strategies like Moving Average Crossover and RSI had no optimizable params
+#  and produced zero combinations. These helpers derive the optimizer config
+#  from each strategy's own get_parameters() spec instead.
+# ==============================================================================
+
+# Sensible default search ranges for parameters the UI doesn't expose yet, so a
+# strategy still explores its space instead of testing a single default value.
+# Format matches the UI: "low,high,step".
+_DEFAULT_RANGE_HINTS = {
+    'fast_ma_period': '5,20,1',
+    'middle_ma_period': '15,50,5',
+    'slow_ma_period': '50,150,10',
+    'rsi_period': '7,21,1',
+    'oversold_threshold': '20,40,5',
+    'overbought_threshold': '60,80,5',
+}
+
+# Choices for categorical (text) parameters.
+_CATEGORICAL_CHOICES = {
+    'ma_type': ['EMA', 'SMA'],
+}
+
+
+def _build_param_map(default_params):
+    """Derive optimizer config from a strategy's own parameter spec so every
+    strategy — not just Candlestick — is optimizable. Integer vs float is
+    inferred from the declared step; 'text' params are treated as categorical."""
+    pmap = {}
+    for name, spec in default_params.items():
+        if spec.get('type') == 'text':
+            pmap[name] = {'is_int': False, 'categorical': True}
+        else:
+            step = spec.get('step', 1)
+            try:
+                is_int = float(step).is_integer()
+            except (TypeError, ValueError):
+                is_int = True
+            pmap[name] = {'is_int': is_int, 'categorical': False}
+    return pmap
+
+
+def _range_for(p_name, param_ranges):
+    """A user-supplied range (from the UI) wins; otherwise fall back to a
+    sensible built-in hint so params without a UI field still get optimized."""
+    if param_ranges and param_ranges.get(p_name):
+        return param_ranges[p_name]
+    return _DEFAULT_RANGE_HINTS.get(p_name)
+
+
 def add_optimization_log(message):
     """Adds a timestamped message to the global log list and writes to a file."""
     global LOG_FILENAME
@@ -892,32 +945,29 @@ class FuturesTrader:
             combinations = []
             param_values = {}
             
-            # Parse parameter ranges and generate value lists
-            param_map = {
-                'buy_signal_window': {'is_int': True}, 'buy_pattern_lookback': {'is_int': True},
-                'sell_signal_window': {'is_int': True}, 'sell_pattern_lookback': {'is_int': True},
-                'exit_minus_percent': {'is_int': False}, 'exit_plus_percent': {'is_int': False}
-            }
-            
-            # FIXED: Only process parameters that exist in the current strategy
+            # Build the parameter map from the strategy's OWN parameters, so
+            # every strategy (Candlestick, MA Crossover, RSI, SuperTrend) is
+            # optimizable rather than only the hard-coded Candlestick/ATR set.
+            param_map = _build_param_map(default_params)
+
             for p_name, p_config in param_map.items():
-                if p_name not in default_params:
-                    continue  # Skip parameters not in current strategy
-                    
-                if p_name in effective_params and param_ranges.get(p_name):
-                    low, high, step = parse_range_for_optuna(
-                        param_ranges[p_name], is_int=p_config['is_int'])
-                    if low is not None:
-                        if p_config['is_int']:
-                            param_values[p_name] = list(range(int(low), int(high) + 1, int(step)))
-                        else:
-                            param_values[p_name] = [round(v, 4) for v in np.arange(
-                                low, high + step / 2, step)]
+                # Categorical params (e.g. ma_type) — enumerate their choices.
+                if p_config.get('categorical'):
+                    param_values[p_name] = _CATEGORICAL_CHOICES.get(
+                        p_name, [default_params[p_name].get('default')])
+                    continue
+
+                range_str = _range_for(p_name, param_ranges)
+                low, high, step = parse_range_for_optuna(
+                    range_str, is_int=p_config['is_int'])
+                if low is not None:
+                    if p_config['is_int']:
+                        param_values[p_name] = list(range(int(low), int(high) + 1, int(step)))
                     else:
-                        # Use default value if range parsing failed
-                        param_values[p_name] = [default_params[p_name].get('default')]
+                        param_values[p_name] = [round(v, 4) for v in np.arange(
+                            low, high + step / 2, step)]
                 else:
-                    # Use default value for parameters not being optimized
+                    # No range supplied and no hint — pin to the default value.
                     param_values[p_name] = [default_params[p_name].get('default')]
             
             # FIXED: Ensure we have at least one parameter to optimize
@@ -990,19 +1040,18 @@ class FuturesTrader:
             
             tested_combinations.add(param_key)
             
-            # Suggest parameters to Optuna (for compatibility)
-            param_map = {
-                'buy_signal_window': {'is_int': True}, 'buy_pattern_lookback': {'is_int': True},
-                'sell_signal_window': {'is_int': True}, 'sell_pattern_lookback': {'is_int': True},
-                'exit_minus_percent': {'is_int': False}, 'exit_plus_percent': {'is_int': False}
-            }
+            # Suggest parameters to Optuna (for compatibility), derived from the
+            # strategy's own params so MA Crossover / RSI / etc. are optimizable.
+            param_map = _build_param_map(default_params)
             for p_name, p_config in param_map.items():
-                # SAFETY CHECK: Skip parameters not in current strategy
-                if p_name not in default_params:
-                    continue
-                if p_name in selected_params and param_ranges.get(p_name):
+                if p_config.get('categorical'):
+                    trial.suggest_categorical(
+                        p_name, _CATEGORICAL_CHOICES.get(
+                            p_name, [default_params[p_name].get('default')]))
+                else:
+                    range_str = _range_for(p_name, param_ranges)
                     low, high, step = parse_range_for_optuna(
-                        param_ranges[p_name], is_int=p_config['is_int'])
+                        range_str, is_int=p_config['is_int'])
                     if low is not None:
                         if p_config['is_int']:
                             trial.suggest_int(p_name, low, high, step=step)
@@ -1010,7 +1059,7 @@ class FuturesTrader:
                             choices = [round(v, 4) for v in np.arange(
                                 low, high + step / 2, step)]
                             trial.suggest_categorical(p_name, choices)
-                
+
                 # Set the actual parameter value from our pre-generated combination
                 trial.set_user_attr(f'param_{p_name}', params[p_name])
 
@@ -1435,25 +1484,24 @@ class FuturesTrader:
                 add_optimization_log(f"-> {symbol}: Study resumed.")
 
             params = {}
-            param_map = {
-                'buy_signal_window': {'is_int': True}, 'buy_pattern_lookback': {'is_int': True},
-                'sell_signal_window': {'is_int': True}, 'sell_pattern_lookback': {'is_int': True},
-                'exit_minus_percent': {'is_int': False}, 'exit_plus_percent': {'is_int': False}
-            }
-            
+            # Build from the strategy's own params so MA Crossover / RSI / etc.
+            # are all optimizable, not just the Candlestick/ATR set.
+            param_map = _build_param_map(default_params)
+
             for p_name, p_config in param_map.items():
-                if p_name not in default_params:
+                if p_config.get('categorical'):
+                    params[p_name] = trial.suggest_categorical(
+                        p_name, _CATEGORICAL_CHOICES.get(
+                            p_name, [default_params[p_name].get('default')]))
                     continue
-                if p_name in effective_params and param_ranges.get(p_name):
-                    low, high, step = parse_range_for_optuna(param_ranges[p_name], is_int=p_config['is_int'])
-                    if low is not None:
-                        if p_config['is_int']:
-                            params[p_name] = trial.suggest_int(p_name, low, high, step=step)
-                        else:
-                            choices = [round(v, 4) for v in np.arange(low, high + step / 2, step)]
-                            params[p_name] = trial.suggest_categorical(p_name, choices)
+                range_str = _range_for(p_name, param_ranges)
+                low, high, step = parse_range_for_optuna(range_str, is_int=p_config['is_int'])
+                if low is not None:
+                    if p_config['is_int']:
+                        params[p_name] = trial.suggest_int(p_name, low, high, step=step)
                     else:
-                        params[p_name] = default_params[p_name].get('default')
+                        choices = [round(v, 4) for v in np.arange(low, high + step / 2, step)]
+                        params[p_name] = trial.suggest_categorical(p_name, choices)
                 else:
                     params[p_name] = default_params[p_name].get('default')
 
