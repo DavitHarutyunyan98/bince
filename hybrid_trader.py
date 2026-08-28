@@ -261,19 +261,30 @@ class HybridSymbolTrader:
                 limit=500
             )
 
-            for kline in klines:
+            for i, kline in enumerate(klines):
                 start_time = pd.to_datetime(kline[0], unit="ms")
+                # The last kline is the still-forming candle: mark it incomplete
+                # so signals use only closed candles (matches the backtester).
+                is_latest_candle = (i == len(klines) - 1)
                 self.data.loc[start_time] = [
                     float(kline[1]),  # Open
                     float(kline[2]),  # High
                     float(kline[3]),  # Low
                     float(kline[4]),  # Close
                     float(kline[5]),  # Volume
-                    True  # Complete
+                    not is_latest_candle  # Complete only if not the forming candle
                 ]
 
             self.current_price = float(klines[-1][4])
-            self.last_candle_time = pd.to_datetime(klines[-1][0], unit="ms")
+            # Anchor to the last CLOSED candle (not the forming one) so that when
+            # the current candle closes it is detected as new and its signal is
+            # acted on the next candle's open — exactly like the backtest. Setting
+            # this to the forming candle would skip that first closed candle and
+            # make live trades lag the backtest by one candle.
+            if len(klines) >= 2:
+                self.last_candle_time = pd.to_datetime(klines[-2][0], unit="ms")
+            else:
+                self.last_candle_time = pd.to_datetime(klines[-1][0], unit="ms")
 
             logger.info(
                 f"[{self.symbol}] Loaded {len(klines)} historical candles")
