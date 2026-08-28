@@ -357,6 +357,78 @@ def _build_param_map(default_params):
     return pmap
 
 
+STRATEGY_DESCRIPTIONS = {
+    'Candlestick Patterns': {
+        'logic': "Trend-following on Three White Soldiers (3 rising candles = bullish) "
+                 "and Three Black Crows (3 falling candles = bearish) patterns.",
+        'signals': "Go LONG when at least `buy_pattern_lookback` White-Soldiers patterns "
+                   "occur within the last `buy_signal_window` candles; go SHORT on the same "
+                   "count of Black-Crows within `sell_signal_window`. An opposite pattern flips "
+                   "the position; the percent bands (`exit_minus_percent` / `exit_plus_percent`) "
+                   "close it early if price moves that far from entry.",
+        'example': "buy_signal_window=8, buy_pattern_lookback=1 → one White-Soldiers cluster in "
+                   "the last 8 candles opens a long. With exit_plus_percent=5, the long closes if "
+                   "price rises 5% above the entry candle's open before any opposite signal.",
+    },
+    'RSI Crossover': {
+        'logic': "Momentum mean-reversion using the Relative Strength Index (0–100).",
+        'signals': "Go LONG when RSI falls below `oversold_threshold` (e.g. 30 = oversold), go "
+                   "SHORT when RSI rises above `overbought_threshold` (e.g. 70 = overbought). The "
+                   "position is held (ffill) until the opposite threshold triggers.",
+        'example': "rsi_period=14, oversold=30, overbought=70 → RSI dips to 28 → open long; later "
+                   "RSI climbs to 72 → flip to short.",
+    },
+    'Moving Average Crossover': {
+        'logic': "Trend-following on the alignment of a fast, middle and slow moving average "
+                 "(EMA or SMA).",
+        'signals': "Go LONG when fast > middle > slow (uptrend stacked), go SHORT when fast < "
+                   "middle < slow (downtrend stacked). Opposite alignment flips; optional "
+                   "`exit_minus_percent` / `exit_plus_percent` bands close the trade early.",
+        'example': "fast=10, middle=20, slow=50, ma_type=EMA → when EMA10 > EMA20 > EMA50 the bot "
+                   "goes long; if price then drops exit_minus_percent=10% from entry it closes.",
+    },
+    'ATR SuperTrend': {
+        'logic': "Trend-following using the ATR-based SuperTrend band that flips with trend "
+                 "direction.",
+        'signals': "Go LONG when price closes above the SuperTrend line, SHORT when it closes "
+                   "below. `atr_period` sets the volatility window and `atr_multiplier` the band "
+                   "distance (wider = fewer, later flips).",
+        'example': "atr_period=10, atr_multiplier=3 → price crosses above the SuperTrend line → "
+                   "long, and stays long until a close back below the line flips it short.",
+    },
+    'Bollinger Bands': {
+        'logic': "Mean-reversion around a moving average with volatility bands.",
+        'signals': "Bands = SMA(`bb_period`) ± `bb_std`×std. Go LONG when Close crosses BELOW the "
+                   "lower band (stretched down), SHORT ABOVE the upper band. Exit to flat on "
+                   "reversion back to the middle band, the opposite band, or the optional "
+                   "`exit_minus_percent` / `exit_plus_percent` bands.",
+        'example': "bb_period=20, bb_std=2 → price pierces the lower band → open long; it closes "
+                   "when price reverts up to the 20-period average (middle band).",
+    },
+}
+
+
+def build_strategy_guide_panel():
+    """A show/hide button revealing how each strategy generates signals, with a
+    worked example per strategy."""
+    blocks = []
+    for name, d in STRATEGY_DESCRIPTIONS.items():
+        blocks.append(html.Div([
+            html.H4(name, style={'color': '#00BFFF', 'marginBottom': '4px'}),
+            html.P([html.B("How it works: "), d['logic']], style={'margin': '2px 0'}),
+            html.P([html.B("Signals: "), d['signals']], style={'margin': '2px 0'}),
+            html.P([html.B("Example: "), html.Span(d['example'], style={'color': '#9fd'})],
+                   style={'margin': '2px 0 10px 0'}),
+        ], style={'borderBottom': '1px solid #333', 'paddingBottom': '6px', 'marginBottom': '6px'}))
+    return html.Div([
+        html.Button("Show strategy guide ▾", id='strategy-guide-toggle', n_clicks=0,
+                    className='small-button'),
+        html.Div(blocks, id='strategy-guide-body',
+                 style={'display': 'none', 'marginTop': '10px', 'fontSize': '13px',
+                        'backgroundColor': '#1a1a1a', 'padding': '12px', 'borderRadius': '6px'}),
+    ], style={'marginBottom': '12px'})
+
+
 def _range_for(p_name, param_ranges):
     """A user-supplied range (from the UI) wins; otherwise fall back to a
     sensible built-in hint so params without a UI field still get optimized."""
@@ -2189,6 +2261,7 @@ def build_optimizer_panel():
                 ])
             ], className='control-panel-group'),
             html.Div([html.H4("Parameter Ranges (Multi-Strategy)"),
+                      build_strategy_guide_panel(),
                       html.Div([
                           html.Label("Select Parameters to Optimize:"),
                           dcc.Checklist(
@@ -4517,6 +4590,21 @@ def run_optimization_task(n_intervals, settings):
 
 @app.callback(Output('opt-log-textarea', 'value'), Input('log-update-interval', 'n_intervals'))
 def update_logs(n): return "\n".join(OPTIMIZATION_LOGS)
+
+
+@app.callback(
+    [Output('strategy-guide-body', 'style'),
+     Output('strategy-guide-toggle', 'children')],
+    Input('strategy-guide-toggle', 'n_clicks'),
+    State('strategy-guide-body', 'style'),
+    prevent_initial_call=True,
+)
+def toggle_strategy_guide(n_clicks, style):
+    """Show/hide the per-strategy signal-logic guide."""
+    style = dict(style or {})
+    hidden = style.get('display') == 'none'
+    style['display'] = 'block' if hidden else 'none'
+    return style, ("Hide strategy guide ▴" if hidden else "Show strategy guide ▾")
 
 
 # Auto-scroll the optimization log to the newest line when the toggle is on.
