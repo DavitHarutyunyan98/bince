@@ -450,6 +450,96 @@ class SuperTrendStrategy(BaseStrategy):
         return df
 
 
+class BollingerBandsStrategy(BaseStrategy):
+    """Mean-reversion strategy on Bollinger Bands.
+
+    Enters long when Close crosses below the lower band (oversold) and short
+    when it crosses above the upper band (overbought). Exits to flat on reversion
+    back to the middle band, on the opposite band, or via the optional
+    percent-range bands (exit_minus_percent / exit_plus_percent) — same exit
+    semantics as the Candlestick and MA strategies."""
+
+    @staticmethod
+    def name():
+        return "Bollinger Bands"
+
+    @staticmethod
+    def get_parameters():
+        return {
+            'bb_period': {'type': 'number', 'default': 20, 'step': 1},
+            'bb_std': {'type': 'number', 'default': 2.0, 'step': 0.1},
+            'exit_minus_percent': {'type': 'number', 'default': '', 'step': 0.25},
+            'exit_plus_percent': {'type': 'number', 'default': '', 'step': 0.25},
+        }
+
+    def generate_signals(self, data, params):
+        if data is None or data.empty:
+            return pd.DataFrame()
+        df = data.copy()
+
+        period = int(params.get('bb_period') or 20)
+        num_std = float(params.get('bb_std') or 2.0)
+
+        minus_raw = params.get('exit_minus_percent')
+        plus_raw = params.get('exit_plus_percent')
+        exit_minus = None
+        exit_plus = None
+        try:
+            if minus_raw is not None and minus_raw != '':
+                exit_minus = float(minus_raw)
+        except (TypeError, ValueError):
+            exit_minus = None
+        try:
+            if plus_raw is not None and plus_raw != '':
+                exit_plus = float(plus_raw)
+        except (TypeError, ValueError):
+            exit_plus = None
+
+        mid = df['Close'].rolling(window=period).mean()
+        std = df['Close'].rolling(window=period).std()
+        df['bb_middle'] = mid
+        df['bb_upper'] = mid + num_std * std
+        df['bb_lower'] = mid - num_std * std
+
+        close = df['Close'].to_numpy()
+        upper = df['bb_upper'].to_numpy()
+        lower = df['bb_lower'].to_numpy()
+        middle = df['bb_middle'].to_numpy()
+
+        n = len(df)
+        positions = np.zeros(n, dtype=int)
+        pos = 0
+        entry_price = 0.0
+        for i in range(n):
+            # Bands need a full window before they are valid.
+            if np.isnan(upper[i]) or np.isnan(lower[i]):
+                positions[i] = pos
+                continue
+            if pos == 0:
+                if close[i] <= lower[i]:
+                    pos, entry_price = 1, close[i]
+                elif close[i] >= upper[i]:
+                    pos, entry_price = -1, close[i]
+            else:
+                # Opposite band flips the position.
+                if pos == 1 and close[i] >= upper[i]:
+                    pos, entry_price = -1, close[i]
+                elif pos == -1 and close[i] <= lower[i]:
+                    pos, entry_price = 1, close[i]
+                # Reversion to the middle band closes the trade.
+                elif (pos == 1 and close[i] >= middle[i]) or (pos == -1 and close[i] <= middle[i]):
+                    pos, entry_price = 0, 0.0
+                elif entry_price > 0:
+                    hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
+                    hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
+                    if hit_lower or hit_upper:
+                        pos, entry_price = 0, 0.0
+            positions[i] = pos
+
+        df['position'] = positions
+        return df
+
+
 # ==============================================================================
 #  3. STRATEGY REGISTRY (THE ENGINE'S GEARBOX)
 # ==============================================================================
@@ -458,6 +548,7 @@ STRATEGY_REGISTRY = {
     RsiStrategy.name(): RsiStrategy,
     MACrossoverStrategy.name(): MACrossoverStrategy,
     SuperTrendStrategy.name(): SuperTrendStrategy,
+    BollingerBandsStrategy.name(): BollingerBandsStrategy,
 }
 
 

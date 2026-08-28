@@ -300,6 +300,8 @@ _DEFAULT_RANGE_HINTS = {
     'rsi_period': '7,21,1',
     'oversold_threshold': '20,40,5',
     'overbought_threshold': '60,80,5',
+    'bb_period': '10,30,2',
+    'bb_std': '1.5,3.0,0.5',
 }
 
 # Choices for categorical (text) parameters.
@@ -324,6 +326,8 @@ _PARAM_LABELS = {
     'ma_type': 'MA Type',
     'atr_period': 'ATR Period',
     'atr_multiplier': 'ATR Multiplier',
+    'bb_period': 'BB Period',
+    'bb_std': 'BB Std Dev',
 }
 
 # Default "min,max,step" ranges pre-filled into the optimizer UI per parameter.
@@ -3174,6 +3178,15 @@ def _build_price_signal_figure(df, title):
     if 'supertrend' in df.columns:
         fig.add_trace(go.Scatter(x=df.index, y=df['supertrend'], mode='lines',
                                  line=dict(color='#26a69a', width=1.5), name='SuperTrend'))
+    # Overlay Bollinger Bands if present.
+    if 'bb_upper' in df.columns and 'bb_lower' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['bb_upper'], mode='lines',
+                                 line=dict(color='#888', width=1, dash='dot'), name='BB Upper'))
+        fig.add_trace(go.Scatter(x=df.index, y=df['bb_lower'], mode='lines',
+                                 line=dict(color='#888', width=1, dash='dot'), name='BB Lower'))
+        if 'bb_middle' in df.columns:
+            fig.add_trace(go.Scatter(x=df.index, y=df['bb_middle'], mode='lines',
+                                     line=dict(color='#FFA500', width=1), name='BB Middle'))
     if 'ThreeWhiteSoldiers' in df.columns:
         tws = df[df['ThreeWhiteSoldiers'] == 1]
         if not tws.empty:
