@@ -338,6 +338,24 @@ _UI_RANGE_DEFAULTS = {
     **_DEFAULT_RANGE_HINTS,
 }
 
+# Trend-adaptive strategies duplicate every base parameter into _bull / _bear
+# variants and add a trend_period. Generate their labels and default ranges
+# from the base entries so the optimizer UI shows them clearly.
+_PARAM_LABELS['trend_period'] = 'Trend Period'
+_DEFAULT_RANGE_HINTS['trend_period'] = '30,150,10'
+_UI_RANGE_DEFAULTS['trend_period'] = '30,150,10'
+for _base in ('buy_signal_window', 'buy_pattern_lookback', 'sell_signal_window',
+              'sell_pattern_lookback', 'exit_minus_percent', 'exit_plus_percent',
+              'fast_ma_period', 'middle_ma_period', 'slow_ma_period',
+              'bb_period', 'bb_std'):
+    for _r, _tag in (('bull', 'Bull'), ('bear', 'Bear')):
+        _k = f'{_base}_{_r}'
+        _PARAM_LABELS[_k] = f'{_tag} · {_PARAM_LABELS.get(_base, _base)}'
+        _default = _UI_RANGE_DEFAULTS.get(_base)
+        if _default:
+            _DEFAULT_RANGE_HINTS[_k] = _default
+            _UI_RANGE_DEFAULTS[_k] = _default
+
 
 def _build_param_map(default_params):
     """Derive optimizer config from a strategy's own parameter spec so every
@@ -404,6 +422,31 @@ STRATEGY_DESCRIPTIONS = {
                    "`exit_minus_percent` / `exit_plus_percent` bands.",
         'example': "bb_period=20, bb_std=2 → price pierces the lower band → open long; it closes "
                    "when price reverts up to the 20-period average (middle band).",
+    },
+    'Candlestick (Trend-Adaptive)': {
+        'logic': "Same candlestick logic, but a `trend_period` SMA classifies each candle as a "
+                 "BULL (Close > SMA) or BEAR (Close < SMA) regime, and a SEPARATE parameter set "
+                 "is used in each regime.",
+        'signals': "In a bull regime it uses `*_bull` windows/lookbacks/exit bands; in a bear "
+                   "regime the `*_bear` set. Entries/exits otherwise identical to Candlestick.",
+        'example': "trend_period=50 → while price is above its 50-SMA, buy_signal_window_bull=8 "
+                   "controls longs; when it drops below, sell_signal_window_bear=5 takes over.",
+    },
+    'MA Crossover (Trend-Adaptive)': {
+        'logic': "MA-alignment logic with a `trend_period` SMA regime; each regime has its own "
+                 "fast/middle/slow periods and exit bands.",
+        'signals': "Bull regime uses `fast/middle/slow_ma_period_bull` (+ bull exits); bear regime "
+                   "the `*_bear` set. Long when fast>middle>slow, short when fast<middle<slow.",
+        'example': "trend_period=100 → in uptrends use faster MAs (5/15/40) to ride momentum; in "
+                   "downtrends slower MAs (8/21/55) to avoid whipsaw.",
+    },
+    'Bollinger Bands (Trend-Adaptive)': {
+        'logic': "Bollinger mean-reversion with a `trend_period` SMA regime; each regime has its "
+                 "own `bb_period` / `bb_std` and exit bands.",
+        'signals': "Bull regime uses `bb_period_bull` / `bb_std_bull` (+ bull exits); bear regime "
+                   "the `*_bear` set. Entry/exit rules identical to Bollinger Bands.",
+        'example': "trend_period=100 → wider bands (bb_std_bull=2.5) in calm uptrends, tighter "
+                   "bands (bb_std_bear=1.5) in volatile downtrends.",
     },
 }
 

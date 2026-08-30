@@ -541,6 +541,272 @@ class BollingerBandsStrategy(BaseStrategy):
 
 
 # ==============================================================================
+#  2b. TREND-ADAPTIVE STRATEGIES (separate params for bull vs bear regimes)
+# ------------------------------------------------------------------------------
+#  A trend_period SMA classifies each candle as a bull (Close > SMA) or bear
+#  (Close < SMA) regime, and the strategy applies a DIFFERENT parameter set in
+#  each regime. This doubles the parameter count, so validate hard on
+#  out-of-sample / segment-consistency to avoid overfitting.
+# ==============================================================================
+def _trend_regime(close, period):
+    """+1 bull / -1 bear per candle from Close vs its SMA(period); 0 (neutral)
+    while the SMA window is not yet full."""
+    try:
+        period = max(int(period), 1)
+    except (TypeError, ValueError):
+        period = 20
+    ma = close.rolling(window=period).mean().to_numpy()
+    c = close.to_numpy()
+    reg = np.where(c > ma, 1, -1)
+    reg[np.isnan(ma)] = 0
+    return reg
+
+
+def _opt_float(params, key):
+    """Parse an optional float param; '' / None / bad -> None."""
+    v = params.get(key)
+    if v is None or v == '':
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
+
+
+class TrendAdaptiveCandlestickStrategy(CandlestickStrategy):
+    """Candlestick patterns with independent parameters for bull vs bear
+    regimes (regime set by a trend_period SMA)."""
+
+    @staticmethod
+    def name():
+        return "Candlestick (Trend-Adaptive)"
+
+    @staticmethod
+    def get_parameters():
+        p = {'trend_period': {'type': 'number', 'default': 50, 'step': 1}}
+        for r in ('bull', 'bear'):
+            p[f'buy_signal_window_{r}'] = {'type': 'number', 'step': 1}
+            p[f'buy_pattern_lookback_{r}'] = {'type': 'number', 'step': 1}
+            p[f'sell_signal_window_{r}'] = {'type': 'number', 'step': 1}
+            p[f'sell_pattern_lookback_{r}'] = {'type': 'number', 'step': 1}
+            p[f'exit_minus_percent_{r}'] = {'type': 'number', 'step': 0.1}
+            p[f'exit_plus_percent_{r}'] = {'type': 'number', 'step': 0.1}
+        return p
+
+    def generate_signals(self, data, params):
+        if data is None or data.empty:
+            return pd.DataFrame()
+        df = data.copy()
+        tws = self._detect_pattern(df, is_bullish=True)
+        tbc = self._detect_pattern(df, is_bullish=False)
+        df['ThreeWhiteSoldiers'] = tws
+        df['ThreeBlackCrows'] = tbc
+        regime = _trend_regime(df['Close'], params.get('trend_period') or 50)
+        df['trend_ma'] = df['Close'].rolling(
+            window=max(int(params.get('trend_period') or 50), 1)).mean()
+
+        raw = {}
+        for r in ('bull', 'bear'):
+            bw = int(params.get(f'buy_signal_window_{r}') or 5)
+            bl = int(params.get(f'buy_pattern_lookback_{r}') or 1)
+            sw = int(params.get(f'sell_signal_window_{r}') or 5)
+            sl = int(params.get(f'sell_pattern_lookback_{r}') or 1)
+            raw[(r, 'buy')] = (tws.rolling(window=bw).sum() >= bl).to_numpy()
+            raw[(r, 'sell')] = (tbc.rolling(window=sw).sum() >= sl).to_numpy()
+        exits = {r: (_opt_float(params, f'exit_minus_percent_{r}'),
+                     _opt_float(params, f'exit_plus_percent_{r}')) for r in ('bull', 'bear')}
+
+        open_ = df['Open'].to_numpy()
+        close = df['Close'].to_numpy()
+        n = len(df)
+        positions = np.zeros(n, dtype=int)
+        pos = 0
+        entry_price = 0.0
+        for i in range(n):
+            r = 'bull' if regime[i] >= 0 else 'bear'
+            buy_i = raw[(r, 'buy')][i]
+            sell_i = raw[(r, 'sell')][i]
+            exit_minus, exit_plus = exits[r]
+            if pos == 0:
+                if buy_i:
+                    pos, entry_price = 1, open_[i]
+                elif sell_i:
+                    pos, entry_price = -1, open_[i]
+            else:
+                if pos == 1 and sell_i:
+                    pos, entry_price = -1, open_[i]
+                elif pos == -1 and buy_i:
+                    pos, entry_price = 1, open_[i]
+                elif entry_price > 0:
+                    hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
+                    hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
+                    if hit_lower or hit_upper:
+                        pos, entry_price = 0, 0.0
+            positions[i] = pos
+        df['position'] = positions
+        return df
+
+
+class TrendAdaptiveMACrossoverStrategy(BaseStrategy):
+    """MA crossover with independent fast/middle/slow periods and exits for bull
+    vs bear regimes (regime set by a trend_period SMA)."""
+
+    @staticmethod
+    def name():
+        return "MA Crossover (Trend-Adaptive)"
+
+    @staticmethod
+    def get_parameters():
+        p = {
+            'trend_period': {'type': 'number', 'default': 100, 'step': 1},
+            'ma_type': {'type': 'text', 'default': 'EMA'},
+        }
+        for r in ('bull', 'bear'):
+            p[f'fast_ma_period_{r}'] = {'type': 'number', 'step': 1}
+            p[f'middle_ma_period_{r}'] = {'type': 'number', 'step': 1}
+            p[f'slow_ma_period_{r}'] = {'type': 'number', 'step': 1}
+            p[f'exit_minus_percent_{r}'] = {'type': 'number', 'step': 0.25}
+            p[f'exit_plus_percent_{r}'] = {'type': 'number', 'step': 0.25}
+        return p
+
+    def generate_signals(self, data, params):
+        if data is None or data.empty:
+            return pd.DataFrame()
+        df = data.copy()
+        ma_type = str(params.get('ma_type') or 'EMA').upper()
+
+        def ma(period):
+            period = max(int(period), 1)
+            if ma_type == 'EMA':
+                return df['Close'].ewm(span=period, adjust=False).mean().to_numpy()
+            return df['Close'].rolling(window=period).mean().to_numpy()
+
+        regime = _trend_regime(df['Close'], params.get('trend_period') or 100)
+        df['trend_ma'] = df['Close'].rolling(
+            window=max(int(params.get('trend_period') or 100), 1)).mean()
+
+        mas = {}
+        for r in ('bull', 'bear'):
+            mas[(r, 'f')] = ma(params.get(f'fast_ma_period_{r}') or 10)
+            mas[(r, 'm')] = ma(params.get(f'middle_ma_period_{r}') or 20)
+            mas[(r, 's')] = ma(params.get(f'slow_ma_period_{r}') or 50)
+        exits = {r: (_opt_float(params, f'exit_minus_percent_{r}'),
+                     _opt_float(params, f'exit_plus_percent_{r}')) for r in ('bull', 'bear')}
+        # Expose the active-regime fast/mid/slow for the chart.
+        df['fast_ma'] = np.where(regime >= 0, mas[('bull', 'f')], mas[('bear', 'f')])
+        df['middle_ma'] = np.where(regime >= 0, mas[('bull', 'm')], mas[('bear', 'm')])
+        df['slow_ma'] = np.where(regime >= 0, mas[('bull', 's')], mas[('bear', 's')])
+
+        close = df['Close'].to_numpy()
+        n = len(df)
+        positions = np.zeros(n, dtype=int)
+        pos = 0
+        entry_price = 0.0
+        for i in range(n):
+            r = 'bull' if regime[i] >= 0 else 'bear'
+            f, m, s = mas[(r, 'f')][i], mas[(r, 'm')][i], mas[(r, 's')][i]
+            exit_minus, exit_plus = exits[r]
+            if np.isnan(f) or np.isnan(m) or np.isnan(s):
+                positions[i] = pos
+                continue
+            buy_i = f > m > s
+            sell_i = f < m < s
+            if pos == 0:
+                if buy_i:
+                    pos, entry_price = 1, close[i]
+                elif sell_i:
+                    pos, entry_price = -1, close[i]
+            else:
+                if pos == 1 and sell_i:
+                    pos, entry_price = -1, close[i]
+                elif pos == -1 and buy_i:
+                    pos, entry_price = 1, close[i]
+                elif entry_price > 0:
+                    hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
+                    hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
+                    if hit_lower or hit_upper:
+                        pos, entry_price = 0, 0.0
+            positions[i] = pos
+        df['position'] = positions
+        return df
+
+
+class TrendAdaptiveBollingerStrategy(BaseStrategy):
+    """Bollinger-band mean reversion with independent period/std and exits for
+    bull vs bear regimes (regime set by a trend_period SMA)."""
+
+    @staticmethod
+    def name():
+        return "Bollinger Bands (Trend-Adaptive)"
+
+    @staticmethod
+    def get_parameters():
+        p = {'trend_period': {'type': 'number', 'default': 100, 'step': 1}}
+        for r in ('bull', 'bear'):
+            p[f'bb_period_{r}'] = {'type': 'number', 'step': 1}
+            p[f'bb_std_{r}'] = {'type': 'number', 'step': 0.1}
+            p[f'exit_minus_percent_{r}'] = {'type': 'number', 'step': 0.25}
+            p[f'exit_plus_percent_{r}'] = {'type': 'number', 'step': 0.25}
+        return p
+
+    def generate_signals(self, data, params):
+        if data is None or data.empty:
+            return pd.DataFrame()
+        df = data.copy()
+        regime = _trend_regime(df['Close'], params.get('trend_period') or 100)
+        df['trend_ma'] = df['Close'].rolling(
+            window=max(int(params.get('trend_period') or 100), 1)).mean()
+
+        bands = {}
+        for r in ('bull', 'bear'):
+            period = max(int(params.get(f'bb_period_{r}') or 20), 1)
+            nstd = float(params.get(f'bb_std_{r}') or 2.0)
+            mid = df['Close'].rolling(window=period).mean()
+            sd = df['Close'].rolling(window=period).std()
+            bands[(r, 'u')] = (mid + nstd * sd).to_numpy()
+            bands[(r, 'l')] = (mid - nstd * sd).to_numpy()
+            bands[(r, 'm')] = mid.to_numpy()
+        exits = {r: (_opt_float(params, f'exit_minus_percent_{r}'),
+                     _opt_float(params, f'exit_plus_percent_{r}')) for r in ('bull', 'bear')}
+        df['bb_upper'] = np.where(regime >= 0, bands[('bull', 'u')], bands[('bear', 'u')])
+        df['bb_lower'] = np.where(regime >= 0, bands[('bull', 'l')], bands[('bear', 'l')])
+        df['bb_middle'] = np.where(regime >= 0, bands[('bull', 'm')], bands[('bear', 'm')])
+
+        close = df['Close'].to_numpy()
+        n = len(df)
+        positions = np.zeros(n, dtype=int)
+        pos = 0
+        entry_price = 0.0
+        for i in range(n):
+            r = 'bull' if regime[i] >= 0 else 'bear'
+            upper, lower, middle = bands[(r, 'u')][i], bands[(r, 'l')][i], bands[(r, 'm')][i]
+            exit_minus, exit_plus = exits[r]
+            if np.isnan(upper) or np.isnan(lower):
+                positions[i] = pos
+                continue
+            if pos == 0:
+                if close[i] <= lower:
+                    pos, entry_price = 1, close[i]
+                elif close[i] >= upper:
+                    pos, entry_price = -1, close[i]
+            else:
+                if pos == 1 and close[i] >= upper:
+                    pos, entry_price = -1, close[i]
+                elif pos == -1 and close[i] <= lower:
+                    pos, entry_price = 1, close[i]
+                elif (pos == 1 and close[i] >= middle) or (pos == -1 and close[i] <= middle):
+                    pos, entry_price = 0, 0.0
+                elif entry_price > 0:
+                    hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
+                    hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
+                    if hit_lower or hit_upper:
+                        pos, entry_price = 0, 0.0
+            positions[i] = pos
+        df['position'] = positions
+        return df
+
+
+# ==============================================================================
 #  3. STRATEGY REGISTRY (THE ENGINE'S GEARBOX)
 # ==============================================================================
 STRATEGY_REGISTRY = {
@@ -549,6 +815,9 @@ STRATEGY_REGISTRY = {
     MACrossoverStrategy.name(): MACrossoverStrategy,
     SuperTrendStrategy.name(): SuperTrendStrategy,
     BollingerBandsStrategy.name(): BollingerBandsStrategy,
+    TrendAdaptiveCandlestickStrategy.name(): TrendAdaptiveCandlestickStrategy,
+    TrendAdaptiveMACrossoverStrategy.name(): TrendAdaptiveMACrossoverStrategy,
+    TrendAdaptiveBollingerStrategy.name(): TrendAdaptiveBollingerStrategy,
 }
 
 
