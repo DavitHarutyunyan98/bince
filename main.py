@@ -2863,6 +2863,19 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
             dcc.Graph(id='attr-hourday-heatmap', style={'height': '42vh'}),
             dcc.Graph(id='attr-btc-graph', style={'height': '38vh'}),
             dcc.Graph(id='attr-fng-graph', style={'height': '38vh'}),
+            html.H4("Regime Statistics", style={'color': '#00BFFF', 'marginTop': '10px'}),
+            html.Div(dash_table.DataTable(
+                id='regime-stats-table',
+                sort_action='native',
+                style_cell={'backgroundColor': '#2c2c2c', 'color': '#f0f0f0',
+                            'border': '1px solid #444', 'textAlign': 'center'},
+                style_header={'backgroundColor': '#1c1c1c', 'fontWeight': 'bold'},
+                style_data_conditional=[
+                    {'if': {'column_id': 'Total PnL', 'filter_query': '{Total PnL} > 0'},
+                     'color': '#4caf50', 'fontWeight': 'bold'},
+                    {'if': {'column_id': 'Total PnL', 'filter_query': '{Total PnL} < 0'},
+                     'color': '#f44336', 'fontWeight': 'bold'},
+                ]), style={'overflowX': 'auto'}),
         ]),
         create_collapsible_container("Split Date-Range Results", "split-results", [
             html.Div([
@@ -3170,6 +3183,7 @@ def run_backtest_callback(n_clicks, capital, strategy_name, param_values, param_
             ))
     fig.update_layout(title='Portfolio Value Over Time with Trade Markers', template='plotly_dark', xaxis_title='Date',
                       yaxis_title='Portfolio Value ($)', hovermode='x unified', legend=dict(x=0.02, y=0.98))
+    _add_fng_overlay(fig, portfolio_df)
     trades_data, trades_cols = [], []
     if trades_df is not None and not trades_df.empty:
         trades_df_display = trades_df.copy()
@@ -3418,6 +3432,29 @@ def _attribution_bar(df, col, title, order=None):
     return fig
 
 
+def _add_fng_overlay(fig, portfolio_df):
+    """Overlay the daily Fear & Greed index on a portfolio figure's right axis,
+    so you can see which regime the equity was made in. No-op if unavailable."""
+    try:
+        if portfolio_df is None or portfolio_df.empty:
+            return fig
+        fng = _fetch_fng_history()
+        dates = pd.to_datetime(portfolio_df['Date'], utc=True)
+        vals = [fng.get(d.strftime('%Y-%m-%d')) for d in dates]
+        if all(v is None for v in vals):
+            return fig
+        fig.add_trace(go.Scatter(
+            x=portfolio_df['Date'], y=vals, mode='lines', name='Fear & Greed',
+            line=dict(color='#FFD700', width=1.5, dash='dot'),
+            yaxis='y2', connectgaps=True,
+            hovertemplate='F&G %{y:.0f}<extra></extra>'))
+        fig.update_layout(yaxis2=dict(title='Fear & Greed', overlaying='y',
+                                      side='right', range=[0, 100], showgrid=False))
+    except Exception:
+        pass
+    return fig
+
+
 def _build_price_signal_figure(df, title):
     """Candlestick chart with buy/sell + pattern markers (same look as manual)."""
     fig = go.Figure(data=[go.Candlestick(
@@ -3469,6 +3506,8 @@ def _build_price_signal_figure(df, title):
     [Output('attr-hourday-heatmap', 'figure'),
      Output('attr-btc-graph', 'figure'),
      Output('attr-fng-graph', 'figure'),
+     Output('regime-stats-table', 'data'),
+     Output('regime-stats-table', 'columns'),
      Output('attribution-status', 'children')],
     Input('analyze-attribution-btn', 'n_clicks'),
     State('trades-data-store', 'data'),
@@ -3478,16 +3517,16 @@ def build_trade_attribution(n_clicks, trades):
     """Break down backtest trades by hour×weekday, BTC regime and Fear & Greed."""
     empty = go.Figure().update_layout(template='plotly_dark')
     if not trades:
-        return empty, empty, empty, "No trades — run a backtest first."
+        return empty, empty, empty, [], [], "No trades — run a backtest first."
     df = pd.DataFrame(trades)
     datecol = 'Exit_Date' if 'Exit_Date' in df.columns else 'Entry_Date'
     if datecol not in df.columns or 'PnL' not in df.columns:
-        return empty, empty, empty, "Trades store missing date/PnL columns."
+        return empty, empty, empty, [], [], "Trades store missing date/PnL columns."
     df['_dt'] = pd.to_datetime(df[datecol], utc=True, errors='coerce')
     df['PnL'] = pd.to_numeric(df['PnL'], errors='coerce')
     df = df.dropna(subset=['_dt', 'PnL'])
     if df.empty:
-        return empty, empty, empty, "No trades with parseable dates."
+        return empty, empty, empty, [], [], "No trades with parseable dates."
 
     # 1. Hour (UTC) × weekday PnL heatmap.
     df['hour'] = df['_dt'].dt.hour
@@ -3528,8 +3567,33 @@ def build_trade_attribution(n_clicks, trades):
         fng_fig = empty
         notes.append(f"Fear & Greed unavailable ({str(e)[:40]})")
 
+    # 4. Regime statistics table (F&G + BTC).
+    stats_rows = []
+    for dim, label, order in [('fng', 'Fear & Greed',
+                               ['Extreme Fear', 'Fear', 'Neutral', 'Greed', 'Extreme Greed', 'Unknown']),
+                              ('btc', 'BTC Regime',
+                               ['BTC Uptrend', 'BTC Downtrend', 'Unknown'])]:
+        if dim not in df.columns:
+            continue
+        for bucket in [b for b in order if b in set(df[dim])]:
+            g = df[df[dim] == bucket]
+            n = len(g)
+            if n == 0:
+                continue
+            wins = int((g['PnL'] > 0).sum())
+            stats_rows.append({
+                'Regime Type': label, 'Regime': bucket, 'Trades': n,
+                'Win %': round(wins / n * 100, 1),
+                'Total PnL': round(float(g['PnL'].sum()), 2),
+                'Avg PnL': round(float(g['PnL'].mean()), 2),
+                'Best': round(float(g['PnL'].max()), 2),
+                'Worst': round(float(g['PnL'].min()), 2),
+            })
+    stats_cols = [{'name': c, 'id': c} for c in
+                  ['Regime Type', 'Regime', 'Trades', 'Win %', 'Total PnL', 'Avg PnL', 'Best', 'Worst']]
+
     msg = f"Analyzed {len(df)} trades." + ("  ⚠️ " + " | ".join(notes) if notes else "")
-    return heat, btc_fig, fng_fig, msg
+    return heat, btc_fig, fng_fig, stats_rows, stats_cols, msg
 
 
 def _build_portfolio_figure_and_trades(trades_df, portfolio_df):
@@ -3548,6 +3612,7 @@ def _build_portfolio_figure_and_trades(trades_df, portfolio_df):
     fig.update_layout(title='Portfolio Value Over Time with Trade Markers', template='plotly_dark',
                       xaxis_title='Date', yaxis_title='Portfolio Value ($)', hovermode='x unified',
                       legend=dict(x=0.02, y=0.98))
+    _add_fng_overlay(fig, portfolio_df)
     trades_data, trades_cols = [], []
     if trades_df is not None and not trades_df.empty:
         disp = trades_df.copy()
