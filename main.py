@@ -2814,6 +2814,18 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
                 style={'textAlign': 'center', 'color': '#4CAF50', 'margin': '20px'}),
         create_collapsible_container("Portfolio Value", "portfolio-graph",
                                      dcc.Graph(id='portfolio-graph', style={'height': '40vh'})),
+        create_collapsible_container("Trade Attribution", "trade-attribution", [
+            html.P("Break down the last backtest's trades by when they happened and by market "
+                   "regime — to see WHERE the edge lives. Uses each trade's exit time.",
+                   style={'fontSize': '13px', 'color': '#9aa'}),
+            html.Button("Analyze Trades", id='analyze-attribution-btn', n_clicks=0,
+                        className='custom-button'),
+            html.Div(id='attribution-status',
+                     style={'margin': '8px 0', 'color': '#9aa', 'fontSize': '13px'}),
+            dcc.Graph(id='attr-hourday-heatmap', style={'height': '42vh'}),
+            dcc.Graph(id='attr-btc-graph', style={'height': '38vh'}),
+            dcc.Graph(id='attr-fng-graph', style={'height': '38vh'}),
+        ]),
         create_collapsible_container("Split Date-Range Results", "split-results", [
             html.Div([
                 html.Label("Chart Metric:", style={'marginRight': '10px'}),
@@ -3270,6 +3282,104 @@ def update_split_chart(split_records, metric):
 
 
 # --- Click an Optimization Results row -> run a manual-style backtest ---
+_FNG_CACHE = {}
+_BTC_REGIME_CACHE = {}
+
+
+def _fetch_fng_history():
+    """Daily Fear & Greed index history keyed by 'YYYY-MM-DD' -> int(0..100).
+
+    Source: alternative.me (the same crypto Fear & Greed index Binance shows).
+    Cached for the process; raises on network failure so the caller degrades."""
+    global _FNG_CACHE
+    if _FNG_CACHE:
+        return _FNG_CACHE
+    import requests
+    r = requests.get('https://api.alternative.me/fng/?limit=0&format=json', timeout=12)
+    r.raise_for_status()
+    out = {}
+    for row in r.json().get('data', []):
+        try:
+            d = datetime.utcfromtimestamp(int(row['timestamp'])).strftime('%Y-%m-%d')
+            out[d] = int(row['value'])
+        except (KeyError, ValueError, TypeError):
+            continue
+    if not out:
+        raise ValueError("empty Fear & Greed response")
+    _FNG_CACHE = out
+    return out
+
+
+def _fng_bucket(value):
+    if value is None:
+        return 'Unknown'
+    v = int(value)
+    if v <= 24:
+        return 'Extreme Fear'
+    if v <= 44:
+        return 'Fear'
+    if v <= 55:
+        return 'Neutral'
+    if v <= 74:
+        return 'Greed'
+    return 'Extreme Greed'
+
+
+def _btc_regime_map(start_dt, end_dt):
+    """Map 'YYYY-MM-DD' -> 'BTC Uptrend'/'BTC Downtrend' from daily BTCUSDT vs
+    its 20-day SMA. Requires the Binance client; raises otherwise."""
+    if trader is None or getattr(trader, 'client', None) is None:
+        raise RuntimeError("Binance client unavailable")
+    key = (start_dt.strftime('%Y-%m-%d'), end_dt.strftime('%Y-%m-%d'))
+    if key in _BTC_REGIME_CACHE:
+        return _BTC_REGIME_CACHE[key]
+    start_ms = int((start_dt - timedelta(days=45)).timestamp() * 1000)
+    klines = trader.client.futures_klines(symbol='BTCUSDT', interval='1d',
+                                          startTime=start_ms, limit=1000)
+    if not klines:
+        raise RuntimeError("no BTC data")
+    bdf = pd.DataFrame(klines, columns=['t', 'o', 'h', 'l', 'c', 'v', 'ct',
+                                        'qav', 'n', 'tb', 'tq', 'ig'])
+    bdf['date'] = pd.to_datetime(bdf['t'], unit='ms', utc=True).dt.strftime('%Y-%m-%d')
+    bdf['close'] = bdf['c'].astype(float)
+    bdf['sma'] = bdf['close'].rolling(window=20).mean()
+    regmap = {}
+    for _, row in bdf.iterrows():
+        if pd.isna(row['sma']):
+            continue
+        regmap[row['date']] = 'BTC Uptrend' if row['close'] > row['sma'] else 'BTC Downtrend'
+    _BTC_REGIME_CACHE[key] = regmap
+    return regmap
+
+
+def _attribution_bar(df, col, title, order=None):
+    """Bar of total PnL per bucket with count / win-rate / avg in the hover."""
+    rows = []
+    for bucket, g in df.groupby(col):
+        n = len(g)
+        wins = int((g['PnL'] > 0).sum())
+        rows.append({'bucket': str(bucket), 'pnl': float(g['PnL'].sum()),
+                     'count': n, 'winrate': (wins / n * 100) if n else 0,
+                     'avg': float(g['PnL'].mean()) if n else 0})
+    bdf = pd.DataFrame(rows)
+    if bdf.empty:
+        return go.Figure().update_layout(template='plotly_dark', title=title + ' (no data)')
+    if order:
+        bdf['__o'] = bdf['bucket'].apply(lambda b: order.index(b) if b in order else len(order))
+        bdf = bdf.sort_values('__o')
+    else:
+        bdf = bdf.sort_values('pnl', ascending=False)
+    colors = ['#4caf50' if p >= 0 else '#f44336' for p in bdf['pnl']]
+    fig = go.Figure(go.Bar(
+        x=bdf['bucket'], y=bdf['pnl'], marker_color=colors,
+        customdata=np.stack([bdf['count'], bdf['winrate'], bdf['avg']], axis=-1),
+        hovertemplate='%{x}<br>Total PnL %{y:.2f}<br>Trades %{customdata[0]}<br>'
+                      'Win rate %{customdata[1]:.1f}%<br>Avg %{customdata[2]:.2f}<extra></extra>'))
+    fig.update_layout(template='plotly_dark', title=title,
+                      yaxis_title='Total PnL', xaxis_title='')
+    return fig
+
+
 def _build_price_signal_figure(df, title):
     """Candlestick chart with buy/sell + pattern markers (same look as manual)."""
     fig = go.Figure(data=[go.Candlestick(
@@ -3315,6 +3425,73 @@ def _build_price_signal_figure(df, title):
                                      marker=dict(color='red', size=13, symbol='circle'), name='Three Black Crows'))
     fig.update_layout(title=title, template='plotly_dark', xaxis_rangeslider_visible=False)
     return fig
+
+
+@app.callback(
+    [Output('attr-hourday-heatmap', 'figure'),
+     Output('attr-btc-graph', 'figure'),
+     Output('attr-fng-graph', 'figure'),
+     Output('attribution-status', 'children')],
+    Input('analyze-attribution-btn', 'n_clicks'),
+    State('trades-data-store', 'data'),
+    prevent_initial_call=True,
+)
+def build_trade_attribution(n_clicks, trades):
+    """Break down backtest trades by hour×weekday, BTC regime and Fear & Greed."""
+    empty = go.Figure().update_layout(template='plotly_dark')
+    if not trades:
+        return empty, empty, empty, "No trades — run a backtest first."
+    df = pd.DataFrame(trades)
+    datecol = 'Exit_Date' if 'Exit_Date' in df.columns else 'Entry_Date'
+    if datecol not in df.columns or 'PnL' not in df.columns:
+        return empty, empty, empty, "Trades store missing date/PnL columns."
+    df['_dt'] = pd.to_datetime(df[datecol], utc=True, errors='coerce')
+    df['PnL'] = pd.to_numeric(df['PnL'], errors='coerce')
+    df = df.dropna(subset=['_dt', 'PnL'])
+    if df.empty:
+        return empty, empty, empty, "No trades with parseable dates."
+
+    # 1. Hour (UTC) × weekday PnL heatmap.
+    df['hour'] = df['_dt'].dt.hour
+    df['wd'] = df['_dt'].dt.dayofweek
+    wd_names = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun']
+    pnl_mat = np.full((7, 24), np.nan)
+    cnt_mat = np.zeros((7, 24))
+    for (wd, hr), g in df.groupby(['wd', 'hour']):
+        pnl_mat[int(wd), int(hr)] = g['PnL'].sum()
+        cnt_mat[int(wd), int(hr)] = len(g)
+    heat = go.Figure(go.Heatmap(
+        z=pnl_mat, x=[f'{h:02d}' for h in range(24)], y=wd_names,
+        colorscale='RdYlGn', zmid=0, colorbar=dict(title='PnL'),
+        customdata=cnt_mat,
+        hovertemplate='%{y} %{x}:00 UTC<br>PnL %{z:.2f}<br>trades %{customdata}<extra></extra>'))
+    heat.update_layout(template='plotly_dark',
+                       title='PnL by Hour (UTC) × Weekday', xaxis_title='Hour (UTC)')
+
+    notes = []
+    # 2. BTC regime.
+    try:
+        regmap = _btc_regime_map(df['_dt'].min(), df['_dt'].max())
+        df['btc'] = df['_dt'].dt.strftime('%Y-%m-%d').map(regmap).fillna('Unknown')
+        btc_fig = _attribution_bar(df, 'btc', 'PnL by BTC Regime (BTC vs 20-day SMA)',
+                                   order=['BTC Uptrend', 'BTC Downtrend', 'Unknown'])
+    except Exception as e:
+        btc_fig = empty
+        notes.append(f"BTC regime unavailable ({str(e)[:40]})")
+
+    # 3. Fear & Greed.
+    try:
+        fng = _fetch_fng_history()
+        df['fng'] = df['_dt'].dt.strftime('%Y-%m-%d').map(lambda d: _fng_bucket(fng.get(d)))
+        fng_fig = _attribution_bar(df, 'fng', 'PnL by Fear & Greed Index',
+                                   order=['Extreme Fear', 'Fear', 'Neutral', 'Greed',
+                                          'Extreme Greed', 'Unknown'])
+    except Exception as e:
+        fng_fig = empty
+        notes.append(f"Fear & Greed unavailable ({str(e)[:40]})")
+
+    msg = f"Analyzed {len(df)} trades." + ("  ⚠️ " + " | ".join(notes) if notes else "")
+    return heat, btc_fig, fng_fig, msg
 
 
 def _build_portfolio_figure_and_trades(trades_df, portfolio_df):
