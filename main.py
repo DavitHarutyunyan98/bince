@@ -348,7 +348,8 @@ for _base in ('buy_signal_window', 'buy_pattern_lookback', 'sell_signal_window',
               'sell_pattern_lookback', 'exit_minus_percent', 'exit_plus_percent',
               'fast_ma_period', 'middle_ma_period', 'slow_ma_period',
               'bb_period', 'bb_std'):
-    for _r, _tag in (('bull', 'Bull'), ('bear', 'Bear')):
+    for _r, _tag in (('bull', 'Bull'), ('bear', 'Bear'),
+                     ('fear', 'Fear'), ('neutral', 'Neutral'), ('greed', 'Greed')):
         _k = f'{_base}_{_r}'
         _PARAM_LABELS[_k] = f'{_tag} · {_PARAM_LABELS.get(_base, _base)}'
         _default = _UI_RANGE_DEFAULTS.get(_base)
@@ -448,6 +449,23 @@ STRATEGY_DESCRIPTIONS = {
         'example': "trend_period=100 → wider bands (bb_std_bull=2.5) in calm uptrends, tighter "
                    "bands (bb_std_bear=1.5) in volatile downtrends.",
     },
+    'MA Crossover (F&G Regime)': {
+        'logic': "MA crossover with a SEPARATE parameter set per Fear & Greed regime "
+                 "(Fear 0–30, Neutral 30–60, Greed 60–100). Regime comes from the daily "
+                 "Fear & Greed index attached to the data.",
+        'signals': "In each regime it uses that regime's `fast/middle/slow_ma_period_<regime>` and "
+                   "exit bands; long when fast>middle>slow, short when fast<middle<slow.",
+        'example': "In Fear, slow defensive MAs (8/34/89); in Greed, faster MAs (5/13/34) to ride "
+                   "momentum. (Backtest/optimize only — the live bot does not yet apply F&G.)",
+    },
+    'Bollinger Bands (F&G Regime)': {
+        'logic': "Bollinger mean-reversion with a SEPARATE parameter set per Fear & Greed regime "
+                 "(Fear 0–30, Neutral 30–60, Greed 60–100).",
+        'signals': "Each regime uses its own `bb_period_<regime>` / `bb_std_<regime>` and exit "
+                   "bands; entry/exit rules identical to Bollinger Bands.",
+        'example': "Tighter bands in Fear (bb_std_fear=1.5, mean-revert hard), wider in Greed "
+                   "(bb_std_greed=2.5). (Backtest/optimize only for now.)",
+    },
 }
 
 
@@ -517,6 +535,23 @@ def add_optimization_log(message):
                 f.write(log_entry + '\n')
         except Exception as e:
             print(f"Error: Could not write to log file {LOG_FILENAME}: {e}")
+
+
+def attach_fng_column(df):
+    """Attach a daily Fear & Greed value column ('fng') to an OHLCV dataframe
+    indexed by datetime, so F&G-regime strategies can read it. Best-effort:
+    on any failure the column is set to NaN (strategies then treat all as
+    Neutral). Defined here so it runs in the data-fetch (parent) process."""
+    if df is None or getattr(df, 'empty', True):
+        return df
+    try:
+        fng = _fetch_fng_history()
+        dates = df.index.strftime('%Y-%m-%d')
+        vals = pd.Series([fng.get(d, np.nan) for d in dates], index=df.index)
+        df['fng'] = vals.ffill().bfill()
+    except Exception:
+        df['fng'] = np.nan
+    return df
 
 
 def send_telegram_notification(message, files=None):
@@ -774,6 +809,7 @@ class FuturesTrader:
             df = self._get_data_by_date_range(
                 symbol, bar_length, start_date, end_date)
             if df is not None and not df.empty:
+                df = attach_fng_column(df)  # daily Fear & Greed for regime strategies
                 self.data_cache[cache_key] = df
             return df
         except Exception as e:
@@ -792,6 +828,8 @@ class FuturesTrader:
                 self.symbol, bar_length, start_date, end_date)
             if self.data is None or self.data.empty:
                 self.last_error = f"Failed to fetch data for {self.symbol}."
+            else:
+                self.data = attach_fng_column(self.data)  # daily F&G for regime strategies
             return self.data
         except Exception as e:
             self.last_error = f"An unexpected error occurred: {e}"

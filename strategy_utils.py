@@ -807,6 +807,178 @@ class TrendAdaptiveBollingerStrategy(BaseStrategy):
 
 
 # ==============================================================================
+#  2c. FEAR & GREED REGIME STRATEGIES (params per fear / neutral / greed)
+# ------------------------------------------------------------------------------
+#  Regime comes from a daily Fear & Greed value carried in df['fng'] (attached
+#  upstream in the data-fetch path). Buckets: Fear 0-30, Neutral 30-60,
+#  Greed 60-100. A separate parameter set is applied in each bucket.
+# ==============================================================================
+_FNG_REGIMES = ('fear', 'neutral', 'greed')
+
+
+def _fng_regime_arr(df):
+    """Per-candle 'fear'/'neutral'/'greed' from df['fng'] (0-30/30-60/60-100).
+    Missing / no column -> 'neutral' so the strategy still runs."""
+    n = len(df)
+    if 'fng' not in df.columns:
+        return np.array(['neutral'] * n, dtype=object)
+    v = pd.to_numeric(df['fng'], errors='coerce').to_numpy(dtype=float)
+    reg = np.where(v < 30, 'fear', np.where(v < 60, 'neutral', 'greed')).astype(object)
+    reg[np.isnan(v)] = 'neutral'
+    return reg
+
+
+class FngRegimeMACrossoverStrategy(BaseStrategy):
+    """MA crossover with independent fast/middle/slow periods and exit bands for
+    Fear / Neutral / Greed regimes (regime from the daily Fear & Greed index)."""
+
+    @staticmethod
+    def name():
+        return "MA Crossover (F&G Regime)"
+
+    @staticmethod
+    def get_parameters():
+        p = {'ma_type': {'type': 'text', 'default': 'EMA'}}
+        for r in _FNG_REGIMES:
+            p[f'fast_ma_period_{r}'] = {'type': 'number', 'step': 1}
+            p[f'middle_ma_period_{r}'] = {'type': 'number', 'step': 1}
+            p[f'slow_ma_period_{r}'] = {'type': 'number', 'step': 1}
+            p[f'exit_minus_percent_{r}'] = {'type': 'number', 'step': 0.25}
+            p[f'exit_plus_percent_{r}'] = {'type': 'number', 'step': 0.25}
+        return p
+
+    def generate_signals(self, data, params):
+        if data is None or data.empty:
+            return pd.DataFrame()
+        df = data.copy()
+        ma_type = str(params.get('ma_type') or 'EMA').upper()
+
+        def ma(period):
+            period = max(int(period), 1)
+            if ma_type == 'EMA':
+                return df['Close'].ewm(span=period, adjust=False).mean().to_numpy()
+            return df['Close'].rolling(window=period).mean().to_numpy()
+
+        regime = _fng_regime_arr(df)
+        mas = {}
+        for r in _FNG_REGIMES:
+            mas[(r, 'f')] = ma(params.get(f'fast_ma_period_{r}') or 10)
+            mas[(r, 'm')] = ma(params.get(f'middle_ma_period_{r}') or 20)
+            mas[(r, 's')] = ma(params.get(f'slow_ma_period_{r}') or 50)
+        exits = {r: (_opt_float(params, f'exit_minus_percent_{r}'),
+                     _opt_float(params, f'exit_plus_percent_{r}')) for r in _FNG_REGIMES}
+        sel_f = np.select([regime == r for r in _FNG_REGIMES], [mas[(r, 'f')] for r in _FNG_REGIMES])
+        sel_m = np.select([regime == r for r in _FNG_REGIMES], [mas[(r, 'm')] for r in _FNG_REGIMES])
+        sel_s = np.select([regime == r for r in _FNG_REGIMES], [mas[(r, 's')] for r in _FNG_REGIMES])
+        df['fast_ma'], df['middle_ma'], df['slow_ma'] = sel_f, sel_m, sel_s
+
+        close = df['Close'].to_numpy()
+        n = len(df)
+        positions = np.zeros(n, dtype=int)
+        pos = 0
+        entry_price = 0.0
+        for i in range(n):
+            r = regime[i]
+            f, m, s = mas[(r, 'f')][i], mas[(r, 'm')][i], mas[(r, 's')][i]
+            exit_minus, exit_plus = exits[r]
+            if np.isnan(f) or np.isnan(m) or np.isnan(s):
+                positions[i] = pos
+                continue
+            buy_i = f > m > s
+            sell_i = f < m < s
+            if pos == 0:
+                if buy_i:
+                    pos, entry_price = 1, close[i]
+                elif sell_i:
+                    pos, entry_price = -1, close[i]
+            else:
+                if pos == 1 and sell_i:
+                    pos, entry_price = -1, close[i]
+                elif pos == -1 and buy_i:
+                    pos, entry_price = 1, close[i]
+                elif entry_price > 0:
+                    hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
+                    hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
+                    if hit_lower or hit_upper:
+                        pos, entry_price = 0, 0.0
+            positions[i] = pos
+        df['position'] = positions
+        return df
+
+
+class FngRegimeBollingerStrategy(BaseStrategy):
+    """Bollinger mean-reversion with independent period/std and exit bands for
+    Fear / Neutral / Greed regimes (regime from the daily Fear & Greed index)."""
+
+    @staticmethod
+    def name():
+        return "Bollinger Bands (F&G Regime)"
+
+    @staticmethod
+    def get_parameters():
+        p = {}
+        for r in _FNG_REGIMES:
+            p[f'bb_period_{r}'] = {'type': 'number', 'step': 1}
+            p[f'bb_std_{r}'] = {'type': 'number', 'step': 0.1}
+            p[f'exit_minus_percent_{r}'] = {'type': 'number', 'step': 0.25}
+            p[f'exit_plus_percent_{r}'] = {'type': 'number', 'step': 0.25}
+        return p
+
+    def generate_signals(self, data, params):
+        if data is None or data.empty:
+            return pd.DataFrame()
+        df = data.copy()
+        regime = _fng_regime_arr(df)
+        bands = {}
+        for r in _FNG_REGIMES:
+            period = max(int(params.get(f'bb_period_{r}') or 20), 1)
+            nstd = float(params.get(f'bb_std_{r}') or 2.0)
+            mid = df['Close'].rolling(window=period).mean()
+            sd = df['Close'].rolling(window=period).std()
+            bands[(r, 'u')] = (mid + nstd * sd).to_numpy()
+            bands[(r, 'l')] = (mid - nstd * sd).to_numpy()
+            bands[(r, 'm')] = mid.to_numpy()
+        exits = {r: (_opt_float(params, f'exit_minus_percent_{r}'),
+                     _opt_float(params, f'exit_plus_percent_{r}')) for r in _FNG_REGIMES}
+        df['bb_upper'] = np.select([regime == r for r in _FNG_REGIMES], [bands[(r, 'u')] for r in _FNG_REGIMES])
+        df['bb_lower'] = np.select([regime == r for r in _FNG_REGIMES], [bands[(r, 'l')] for r in _FNG_REGIMES])
+        df['bb_middle'] = np.select([regime == r for r in _FNG_REGIMES], [bands[(r, 'm')] for r in _FNG_REGIMES])
+
+        close = df['Close'].to_numpy()
+        n = len(df)
+        positions = np.zeros(n, dtype=int)
+        pos = 0
+        entry_price = 0.0
+        for i in range(n):
+            r = regime[i]
+            upper, lower, middle = bands[(r, 'u')][i], bands[(r, 'l')][i], bands[(r, 'm')][i]
+            exit_minus, exit_plus = exits[r]
+            if np.isnan(upper) or np.isnan(lower):
+                positions[i] = pos
+                continue
+            if pos == 0:
+                if close[i] <= lower:
+                    pos, entry_price = 1, close[i]
+                elif close[i] >= upper:
+                    pos, entry_price = -1, close[i]
+            else:
+                if pos == 1 and close[i] >= upper:
+                    pos, entry_price = -1, close[i]
+                elif pos == -1 and close[i] <= lower:
+                    pos, entry_price = 1, close[i]
+                elif (pos == 1 and close[i] >= middle) or (pos == -1 and close[i] <= middle):
+                    pos, entry_price = 0, 0.0
+                elif entry_price > 0:
+                    hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
+                    hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
+                    if hit_lower or hit_upper:
+                        pos, entry_price = 0, 0.0
+            positions[i] = pos
+        df['position'] = positions
+        return df
+
+
+# ==============================================================================
 #  3. STRATEGY REGISTRY (THE ENGINE'S GEARBOX)
 # ==============================================================================
 STRATEGY_REGISTRY = {
@@ -818,6 +990,8 @@ STRATEGY_REGISTRY = {
     TrendAdaptiveCandlestickStrategy.name(): TrendAdaptiveCandlestickStrategy,
     TrendAdaptiveMACrossoverStrategy.name(): TrendAdaptiveMACrossoverStrategy,
     TrendAdaptiveBollingerStrategy.name(): TrendAdaptiveBollingerStrategy,
+    FngRegimeMACrossoverStrategy.name(): FngRegimeMACrossoverStrategy,
+    FngRegimeBollingerStrategy.name(): FngRegimeBollingerStrategy,
 }
 
 
