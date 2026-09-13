@@ -302,6 +302,9 @@ _DEFAULT_RANGE_HINTS = {
     'overbought_threshold': '60,80,5',
     'bb_period': '10,30,2',
     'bb_std': '1.5,3.0,0.5',
+    'funding_lookback': '30,180,30',
+    'entry_z': '1.5,3.0,0.5',
+    'exit_z': '0.25,1.0,0.25',
 }
 
 # Choices for categorical (text) parameters.
@@ -328,6 +331,9 @@ _PARAM_LABELS = {
     'atr_multiplier': 'ATR Multiplier',
     'bb_period': 'BB Period',
     'bb_std': 'BB Std Dev',
+    'funding_lookback': 'Funding Z Lookback',
+    'entry_z': 'Entry Z-Score',
+    'exit_z': 'Exit Z-Score',
 }
 
 # Default "min,max,step" ranges pre-filled into the optimizer UI per parameter.
@@ -466,6 +472,16 @@ STRATEGY_DESCRIPTIONS = {
         'example': "Tighter bands in Fear (bb_std_fear=1.5, mean-revert hard), wider in Greed "
                    "(bb_std_greed=2.5). (Backtest/optimize only for now.)",
     },
+    'Funding Rate': {
+        'logic': "Contrarian on perpetual funding — fades crowded positioning. Uses the 8-hour "
+                 "funding rate standardized to a z-score over `funding_lookback`.",
+        'signals': "SHORT when funding z-score ≥ `entry_z` (crowded longs overpaying), LONG when "
+                   "≤ −`entry_z` (crowded shorts). Exit when funding normalizes (|z| < `exit_z`), "
+                   "on the opposite extreme, or via the optional exit_minus/plus % bands.",
+        'example': "entry_z=2, exit_z=0.5 → funding spikes 2σ above its 90-period norm → short; "
+                   "close when z falls back inside ±0.5. A slow (swing) signal since funding "
+                   "updates every 8h — use longer backtest windows. (Backtest/optimize only.)",
+    },
 }
 
 
@@ -551,6 +567,41 @@ def attach_fng_column(df):
         df['fng'] = vals.ffill().bfill()
     except Exception:
         df['fng'] = np.nan
+    return df
+
+
+def attach_funding_column(df, symbol, client):
+    """Attach the 8-hour perp funding rate as a 'funding' column (forward-filled
+    to each candle) for the Funding Rate strategy. Best-effort: NaN on failure
+    (strategy then makes no trades). Runs in the data-fetch (parent) process."""
+    if df is None or getattr(df, 'empty', True):
+        return df
+    if client is None:
+        df['funding'] = np.nan
+        return df
+    try:
+        start_ms = int(df.index[0].timestamp() * 1000) - 8 * 3600 * 1000 * 3
+        end_ms = int(df.index[-1].timestamp() * 1000) + 1
+        rows, cur = [], start_ms
+        while cur < end_ms:
+            batch = client.futures_funding_rate(symbol=symbol, startTime=cur, limit=1000)
+            if not batch:
+                break
+            rows.extend(batch)
+            last = batch[-1]['fundingTime']
+            if last <= cur or len(batch) < 1000:
+                break
+            cur = last + 1
+        if not rows:
+            df['funding'] = np.nan
+            return df
+        fr = pd.Series({pd.to_datetime(r['fundingTime'], unit='ms', utc=True): float(r['fundingRate'])
+                        for r in rows}).sort_index()
+        fr = fr[~fr.index.duplicated(keep='last')]
+        aligned = fr.reindex(fr.index.union(df.index)).sort_index().ffill().reindex(df.index)
+        df['funding'] = aligned.values
+    except Exception:
+        df['funding'] = np.nan
     return df
 
 
@@ -810,6 +861,7 @@ class FuturesTrader:
                 symbol, bar_length, start_date, end_date)
             if df is not None and not df.empty:
                 df = attach_fng_column(df)  # daily Fear & Greed for regime strategies
+                df = attach_funding_column(df, symbol, self.client)  # perp funding rate
                 self.data_cache[cache_key] = df
             return df
         except Exception as e:
@@ -830,6 +882,7 @@ class FuturesTrader:
                 self.last_error = f"Failed to fetch data for {self.symbol}."
             else:
                 self.data = attach_fng_column(self.data)  # daily F&G for regime strategies
+                self.data = attach_funding_column(self.data, self.symbol, self.client)  # perp funding
             return self.data
         except Exception as e:
             self.last_error = f"An unexpected error occurred: {e}"

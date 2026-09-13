@@ -978,6 +978,84 @@ class FngRegimeBollingerStrategy(BaseStrategy):
         return df
 
 
+class FundingRateStrategy(BaseStrategy):
+    """Perp funding-rate contrarian strategy.
+
+    Reads a per-candle 'funding' column (8-hour funding rate, attached upstream
+    in the data-fetch path). Standardizes it to a z-score over a lookback and
+    fades positioning extremes: SHORT when funding is unusually high (crowded
+    longs), LONG when unusually low (crowded shorts). Exits when funding
+    normalizes (|z| < exit_z), on the opposite extreme, or via optional
+    percent bands. If no funding data is present, it makes no trades."""
+
+    @staticmethod
+    def name():
+        return "Funding Rate"
+
+    @staticmethod
+    def get_parameters():
+        return {
+            'funding_lookback': {'type': 'number', 'default': 90, 'step': 1},
+            'entry_z': {'type': 'number', 'default': 2.0, 'step': 0.25},
+            'exit_z': {'type': 'number', 'default': 0.5, 'step': 0.25},
+            'exit_minus_percent': {'type': 'number', 'default': '', 'step': 0.25},
+            'exit_plus_percent': {'type': 'number', 'default': '', 'step': 0.25},
+        }
+
+    def generate_signals(self, data, params):
+        if data is None or data.empty:
+            return pd.DataFrame()
+        df = data.copy()
+        n = len(df)
+        if 'funding' not in df.columns:
+            df['position'] = 0
+            return df
+
+        lookback = max(int(params.get('funding_lookback') or 90), 5)
+        entry_z = float(params.get('entry_z') or 2.0)
+        exit_z = float(params.get('exit_z') or 0.5)
+        exit_minus = _opt_float(params, 'exit_minus_percent')
+        exit_plus = _opt_float(params, 'exit_plus_percent')
+
+        f = pd.to_numeric(df['funding'], errors='coerce')
+        mean = f.rolling(window=lookback).mean()
+        std = f.rolling(window=lookback).std()
+        z = ((f - mean) / std).to_numpy()
+        df['funding_z'] = z
+        close = df['Close'].to_numpy()
+
+        positions = np.zeros(n, dtype=int)
+        pos = 0
+        entry_price = 0.0
+        for i in range(n):
+            zi = z[i]
+            if np.isnan(zi):
+                positions[i] = pos
+                continue
+            if pos == 0:
+                if zi >= entry_z:
+                    pos, entry_price = -1, close[i]   # crowded longs -> short
+                elif zi <= -entry_z:
+                    pos, entry_price = 1, close[i]    # crowded shorts -> long
+            else:
+                # Opposite extreme flips.
+                if pos == -1 and zi <= -entry_z:
+                    pos, entry_price = 1, close[i]
+                elif pos == 1 and zi >= entry_z:
+                    pos, entry_price = -1, close[i]
+                # Normalization closes the trade.
+                elif abs(zi) < exit_z:
+                    pos, entry_price = 0, 0.0
+                elif entry_price > 0:
+                    hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
+                    hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
+                    if hit_lower or hit_upper:
+                        pos, entry_price = 0, 0.0
+            positions[i] = pos
+        df['position'] = positions
+        return df
+
+
 # ==============================================================================
 #  3. STRATEGY REGISTRY (THE ENGINE'S GEARBOX)
 # ==============================================================================
@@ -992,6 +1070,7 @@ STRATEGY_REGISTRY = {
     TrendAdaptiveBollingerStrategy.name(): TrendAdaptiveBollingerStrategy,
     FngRegimeMACrossoverStrategy.name(): FngRegimeMACrossoverStrategy,
     FngRegimeBollingerStrategy.name(): FngRegimeBollingerStrategy,
+    FundingRateStrategy.name(): FundingRateStrategy,
 }
 
 
