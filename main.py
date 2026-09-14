@@ -2852,6 +2852,148 @@ def build_trade_config_editor_panel():
     ])
 
 
+def run_cross_sectional_momentum(closes_df, lookback, rebalance_every, top_k,
+                                 bottom_k, long_only, vol_scale, fee_pct,
+                                 initial_capital, timeframe):
+    """Cross-sectional momentum portfolio backtest.
+
+    closes_df: DataFrame indexed by date, one Close column per symbol.
+    Each rebalance (every `rebalance_every` candles) ranks symbols by their
+    `lookback`-period return, goes long the top_k (and short the bottom_k unless
+    long_only), equal- or inverse-vol-weighted, and holds until the next
+    rebalance. Fees charged on turnover. Returns (equity_df, stats, holdings)."""
+    cols = list(closes_df.columns)
+    rets = closes_df.pct_change()
+    mom = closes_df.pct_change(lookback)
+    vol = rets.rolling(lookback).std()
+    fee = float(fee_pct) / 100.0
+
+    equity = 1.0
+    weights = pd.Series(0.0, index=cols)
+    curve, holdings, period_rets = [], [], []
+    last_rebalance_equity = 1.0
+
+    dates = closes_df.index
+    for i, dt in enumerate(dates):
+        if i > 0:
+            day_ret = float((weights * rets.iloc[i].fillna(0.0)).sum())
+            equity *= (1.0 + day_ret)
+        curve.append({'Date': dt, 'Portfolio_Value': equity * initial_capital})
+
+        if i >= lookback and (i % max(int(rebalance_every), 1) == 0):
+            m = mom.iloc[i].dropna()
+            need = top_k + (0 if long_only else bottom_k)
+            if len(m) >= max(need, 2):
+                ranked = m.sort_values(ascending=False)
+                longs = list(ranked.head(top_k).index)
+                shorts = [] if long_only else list(ranked.tail(bottom_k).index)
+                new_w = pd.Series(0.0, index=cols)
+
+                def _side_weights(names, sign):
+                    if not names:
+                        return
+                    if vol_scale:
+                        inv = {s: (1.0 / vol.iloc[i][s]) if vol.iloc[i].get(s, 0) and not np.isnan(vol.iloc[i][s]) and vol.iloc[i][s] > 0 else 0.0 for s in names}
+                        tot = sum(inv.values()) or 1.0
+                        for s in names:
+                            new_w[s] = sign * inv[s] / tot
+                    else:
+                        w = 1.0 / len(names)
+                        for s in names:
+                            new_w[s] = sign * w
+
+                _side_weights(longs, 1.0)
+                _side_weights(shorts, -1.0)
+                turnover = float((new_w - weights).abs().sum())
+                equity *= (1.0 - turnover * fee)
+                weights = new_w
+                # record the return of the completed holding period
+                period_rets.append(equity / last_rebalance_equity - 1.0)
+                last_rebalance_equity = equity
+                holdings.append({'Date': dt.strftime('%Y-%m-%d %H:%M'),
+                                 'Long': ', '.join(longs),
+                                 'Short': ', '.join(shorts) if shorts else '—'})
+
+    equity_df = pd.DataFrame(curve)
+    # Stats
+    stats = {}
+    if not equity_df.empty:
+        pv = equity_df['Portfolio_Value']
+        total_return = (pv.iloc[-1] / (initial_capital) - 1.0) * 100
+        pr = pv.pct_change().dropna()
+        af = TIMEFRAME_TO_ANNUALIZATION_FACTOR.get(timeframe, np.sqrt(365))
+        sharpe = (pr.mean() / pr.std() * af) if pr.std() > 0 else 0.0
+        peak = pv.cummax()
+        dd = ((peak - pv) / peak * 100)
+        max_dd = float(dd.max()) if len(dd) else 0.0
+        win_periods = (sum(1 for r in period_rets if r > 0) / len(period_rets) * 100) if period_rets else 0.0
+        stats = {'Total_Return': round(float(total_return), 2),
+                 'Sharpe': round(float(sharpe), 2),
+                 'Max_Drawdown': round(max_dd, 2),
+                 'Rebalances': len(holdings),
+                 'Win_Periods_%': round(win_periods, 1)}
+    return equity_df, stats, holdings
+
+
+def build_portfolio_backtest_panel():
+    """Cross-sectional momentum portfolio backtest — rank a universe of pairs and
+    hold a long/short basket. Separate from the single-pair tools."""
+    today = datetime.now().date()
+    return create_collapsible_container("Portfolio Backtest (Cross-Sectional Momentum)", "portfolio-backtest", [
+        html.P("Rank a universe of pairs by recent return and hold a rebalanced long "
+               "(and optional short) basket. This is a portfolio strategy, not a per-pair signal.",
+               style={'fontSize': '13px', 'color': '#9aa'}),
+        html.Div([
+            html.Div([html.Label('Universe (pairs):'),
+                      dcc.Dropdown(id='csm-universe-dropdown', multi=True, className='custom-input')],
+                     className='flex-item', style={'minWidth': '320px'}),
+            html.Div([html.Label('Timeframe:'),
+                      dcc.Dropdown(id='csm-timeframe', clearable=False, className='custom-input',
+                                   options=[{'label': t, 'value': t} for t in ['1h', '4h', '1d']], value='1d')],
+                     className='flex-item'),
+            html.Div([html.Label('Date Range:'),
+                      date_range_inputs('csm-date', today - timedelta(days=365), today)],
+                     className='flex-item'),
+        ], className='flex-container'),
+        html.Div([
+            html.Div([html.Label('Momentum Lookback (candles):'),
+                      dcc.Input(id='csm-lookback', type='number', value=30, min=2, className='custom-input')],
+                     className='flex-item'),
+            html.Div([html.Label('Rebalance Every (candles):'),
+                      dcc.Input(id='csm-rebalance', type='number', value=7, min=1, className='custom-input')],
+                     className='flex-item'),
+            html.Div([html.Label('Top K (long):'),
+                      dcc.Input(id='csm-topk', type='number', value=2, min=1, className='custom-input')],
+                     className='flex-item'),
+            html.Div([html.Label('Bottom K (short):'),
+                      dcc.Input(id='csm-bottomk', type='number', value=2, min=0, className='custom-input')],
+                     className='flex-item'),
+            html.Div([html.Label('Fee % / side:'),
+                      dcc.Input(id='csm-fee', type='number', value=0.05, min=0, step=0.01, className='custom-input')],
+                     className='flex-item'),
+            html.Div([html.Label('Initial Capital:'),
+                      dcc.Input(id='csm-capital', type='number', value=10000, min=1, className='custom-input')],
+                     className='flex-item'),
+        ], className='flex-container'),
+        dcc.Checklist(id='csm-options',
+                      options=[{'label': ' Long-only (ignore shorts)', 'value': 'long_only'},
+                               {'label': ' Inverse-volatility weighting', 'value': 'vol_scale'}],
+                      value=[], className='custom-checklist', style={'marginTop': '8px'}),
+        html.Button('Run Portfolio Backtest', id='csm-run-btn', n_clicks=0,
+                    className='custom-button', style={'marginTop': '10px'}),
+        html.Div(id='csm-status', style={'margin': '8px 0', 'color': '#9aa', 'fontSize': '13px'}),
+        html.H4(id='csm-summary', style={'textAlign': 'center', 'color': '#4CAF50'}),
+        dcc.Graph(id='csm-equity-graph', style={'height': '45vh'}),
+        html.H4("Rebalance Holdings", style={'color': '#00BFFF'}),
+        html.Div(dash_table.DataTable(
+            id='csm-holdings-table', page_size=15,
+            style_cell={'backgroundColor': '#2c2c2c', 'color': '#f0f0f0',
+                        'border': '1px solid #444', 'textAlign': 'center'},
+            style_header={'backgroundColor': '#1c1c1c', 'fontWeight': 'bold'}),
+            style={'overflowX': 'auto'}),
+    ])
+
+
 app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', 'padding': '10px'}, children=[
     dcc.Store(id='batch-config-store'),
     dcc.Store(id='trades-data-store'),
@@ -2878,6 +3020,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
         html.A('Manual Backtester', href='#manual-section', className='nav-link'),
         html.A('Trade Config', href='#trade-config-section', className='nav-link'),
         html.A('Batch Backtest', href='#batch-section', className='nav-link'),
+        html.A('Portfolio', href='#portfolio-section', className='nav-link'),
         html.A('Optimizer', href='#optimizer-section', className='nav-link'),
         html.A('Backtest Results', href='#manual-results-section',
                className='nav-link'),
@@ -2893,6 +3036,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
         html.Div(build_live_config_panel(), id='live-config-section'),
         html.Div(build_trade_config_editor_panel(), id='trade-config-section'),
         html.Div(build_batch_backtest_panel(), id='batch-section'),
+        html.Div(build_portfolio_backtest_panel(), id='portfolio-section'),
         html.Div(build_optimizer_panel(), id='optimizer-section'),
     ], className='main-container'),
     html.Hr(style={'borderColor': '#555', 'marginTop': '30px'}),
@@ -4966,6 +5110,87 @@ def run_optimization_task(n_intervals, settings):
 
 @app.callback(Output('opt-log-textarea', 'value'), Input('log-update-interval', 'n_intervals'))
 def update_logs(n): return "\n".join(OPTIMIZATION_LOGS)
+
+
+@app.callback(
+    Output('csm-universe-dropdown', 'options'),
+    Input('all-pairs-store', 'data'),
+    prevent_initial_call=True,
+)
+def populate_csm_universe(all_pairs):
+    """Fill the portfolio universe dropdown from the loaded pair list."""
+    if not all_pairs:
+        return []
+    return [{'label': p['symbol'], 'value': p['symbol']} for p in all_pairs]
+
+
+@app.callback(
+    [Output('csm-equity-graph', 'figure'),
+     Output('csm-summary', 'children'),
+     Output('csm-holdings-table', 'data'),
+     Output('csm-holdings-table', 'columns'),
+     Output('csm-status', 'children')],
+    Input('csm-run-btn', 'n_clicks'),
+    [State('csm-universe-dropdown', 'value'), State('csm-timeframe', 'value'),
+     State('csm-date-start', 'value'), State('csm-date-end', 'value'),
+     State('csm-lookback', 'value'), State('csm-rebalance', 'value'),
+     State('csm-topk', 'value'), State('csm-bottomk', 'value'),
+     State('csm-fee', 'value'), State('csm-capital', 'value'),
+     State('csm-options', 'value')],
+    prevent_initial_call=True,
+)
+def run_portfolio_backtest(n_clicks, universe, timeframe, start, end, lookback,
+                           rebalance, top_k, bottom_k, fee, capital, options):
+    empty = go.Figure().update_layout(template='plotly_dark')
+    if trader is None or trader.client is None:
+        return empty, "", [], [], "Binance client unavailable."
+    if not universe or len(universe) < 3:
+        return empty, "", [], [], "Select at least 3 pairs for the universe."
+    long_only = 'long_only' in (options or [])
+    vol_scale = 'vol_scale' in (options or [])
+    top_k = int(top_k or 2)
+    bottom_k = 0 if long_only else int(bottom_k or 0)
+    capital = float(capital or 10000)
+
+    # Fetch closes for each symbol and align on the common date index.
+    series = {}
+    missing = []
+    for sym in universe:
+        try:
+            d = trader.get_historical_data_for_symbol(sym, timeframe, start, end)
+        except Exception:
+            d = None
+        if d is not None and not d.empty:
+            series[sym] = d['Close']
+        else:
+            missing.append(sym)
+    if len(series) < 3:
+        return empty, "", [], [], f"Not enough pairs with data ({len(series)}). Missing: {', '.join(missing)}"
+
+    closes_df = pd.concat(series, axis=1)
+    closes_df.columns = list(series.keys())
+    closes_df = closes_df.sort_index().ffill().dropna()
+    if len(closes_df) <= int(lookback or 30) + 2:
+        return empty, "", [], [], "Not enough overlapping history for this lookback/date range."
+
+    equity_df, stats, holdings = run_cross_sectional_momentum(
+        closes_df, int(lookback or 30), int(rebalance or 7), top_k, bottom_k,
+        long_only, vol_scale, fee, capital, timeframe)
+
+    fig = go.Figure(go.Scatter(x=equity_df['Date'], y=equity_df['Portfolio_Value'],
+                               mode='lines', line=dict(color='#00BFFF', width=2),
+                               name='Portfolio'))
+    fig.update_layout(template='plotly_dark', title='Portfolio Equity (Cross-Sectional Momentum)',
+                      xaxis_title='Date', yaxis_title='Value')
+    _add_fng_overlay(fig, equity_df)
+
+    summary = (f"Return {stats.get('Total_Return', 0):+.2f}% · Sharpe {stats.get('Sharpe', 0)} · "
+               f"MaxDD {stats.get('Max_Drawdown', 0)}% · {stats.get('Rebalances', 0)} rebalances · "
+               f"Win periods {stats.get('Win_Periods_%', 0)}%") if stats else "No result."
+    hcols = [{'name': c, 'id': c} for c in ['Date', 'Long', 'Short']]
+    note = f"  ⚠️ no data: {', '.join(missing)}" if missing else ""
+    status = f"Universe {len(series)} pairs, {len(closes_df)} aligned candles.{note}"
+    return fig, summary, holdings, hcols, status
 
 
 @app.callback(
