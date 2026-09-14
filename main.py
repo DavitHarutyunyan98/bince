@@ -305,6 +305,9 @@ _DEFAULT_RANGE_HINTS = {
     'funding_lookback': '30,180,30',
     'entry_z': '1.5,3.0,0.5',
     'exit_z': '0.25,1.0,0.25',
+    'pivot_lookback': '3,10,1',
+    'tolerance_percent': '1.0,5.0,1.0',
+    'max_pattern_bars': '20,80,10',
 }
 
 # Choices for categorical (text) parameters.
@@ -334,6 +337,9 @@ _PARAM_LABELS = {
     'funding_lookback': 'Funding Z Lookback',
     'entry_z': 'Entry Z-Score',
     'exit_z': 'Exit Z-Score',
+    'pivot_lookback': 'Pivot Lookback',
+    'tolerance_percent': 'Peak Tolerance %',
+    'max_pattern_bars': 'Max Pattern Bars',
 }
 
 # Default "min,max,step" ranges pre-filled into the optimizer UI per parameter.
@@ -471,6 +477,17 @@ STRATEGY_DESCRIPTIONS = {
                    "bands; entry/exit rules identical to Bollinger Bands.",
         'example': "Tighter bands in Fear (bb_std_fear=1.5, mean-revert hard), wider in Greed "
                    "(bb_std_greed=2.5). (Backtest/optimize only for now.)",
+    },
+    'Double Top / Bottom': {
+        'logic': "Classic reversal patterns from swing points. A double bottom (two ~equal "
+                 "lows) is bullish; a double top (two ~equal highs) is bearish.",
+        'signals': "Swing highs/lows are found with `pivot_lookback` bars on each side (confirmed "
+                   "late, no lookahead). LONG when price breaks ABOVE the neckline between two "
+                   "lows within `tolerance_percent` of each other (≤ `max_pattern_bars` apart); "
+                   "SHORT when it breaks BELOW the neckline between two ~equal highs. Exit on the "
+                   "opposite pattern or the optional exit_minus/plus % bands.",
+        'example': "pivot_lookback=5, tolerance_percent=3 → two lows at 100 and 102 (within 3%) "
+                   "with a high of 110 between them → go long when close breaks above 110.",
     },
     'Funding Rate': {
         'logic': "Contrarian on perpetual funding — fades crowded positioning. Uses the 8-hour "

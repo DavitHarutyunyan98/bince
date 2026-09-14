@@ -1056,6 +1056,102 @@ class FundingRateStrategy(BaseStrategy):
         return df
 
 
+class DoubleTopBottomStrategy(BaseStrategy):
+    """Double Top / Double Bottom reversal patterns.
+
+    Double BOTTOM (bullish): two swing lows at ~equal price with a swing high
+    (neckline) between them; go LONG when price breaks ABOVE the neckline.
+    Double TOP (bearish): two ~equal swing highs with a swing low neckline
+    between them; go SHORT when price breaks BELOW the neckline. Swing points
+    are confirmed `pivot_lookback` bars late (no lookahead). Exits: opposite
+    pattern flip, or the optional exit_minus/plus percent bands."""
+
+    @staticmethod
+    def name():
+        return "Double Top / Bottom"
+
+    @staticmethod
+    def get_parameters():
+        return {
+            'pivot_lookback': {'type': 'number', 'default': 5, 'step': 1},
+            'tolerance_percent': {'type': 'number', 'default': 3.0, 'step': 0.5},
+            'max_pattern_bars': {'type': 'number', 'default': 60, 'step': 5},
+            'exit_minus_percent': {'type': 'number', 'default': '', 'step': 0.25},
+            'exit_plus_percent': {'type': 'number', 'default': '', 'step': 0.25},
+        }
+
+    def generate_signals(self, data, params):
+        if data is None or data.empty:
+            return pd.DataFrame()
+        df = data.copy()
+        order = max(int(params.get('pivot_lookback') or 5), 1)
+        tol = float(params.get('tolerance_percent') or 3.0) / 100.0
+        max_sep = max(int(params.get('max_pattern_bars') or 60), 2)
+        exit_minus = _opt_float(params, 'exit_minus_percent')
+        exit_plus = _opt_float(params, 'exit_plus_percent')
+
+        high = df['High'].to_numpy(dtype=float)
+        low = df['Low'].to_numpy(dtype=float)
+        close = df['Close'].to_numpy(dtype=float)
+        n = len(df)
+
+        pivot_lows = []   # (index, price)
+        pivot_highs = []
+        positions = np.zeros(n, dtype=int)
+        pos = 0
+        entry_price = 0.0
+
+        for i in range(n):
+            # Confirm a pivot at j = i-order using only data up to i (no lookahead).
+            j = i - order
+            if j - order >= 0:
+                lo_win = low[j - order:i + 1]
+                hi_win = high[j - order:i + 1]
+                # Dedupe adjacent duplicates (flat troughs/peaks) so the "last
+                # two" pivots are two DISTINCT swings, not the same one twice.
+                if low[j] == lo_win.min() and (not pivot_lows or j - pivot_lows[-1][0] > order):
+                    pivot_lows.append((j, low[j]))
+                if high[j] == hi_win.max() and (not pivot_highs or j - pivot_highs[-1][0] > order):
+                    pivot_highs.append((j, high[j]))
+
+            buy = sell = False
+            if i > 0:
+                # Double bottom: last two pivot lows ~equal, break above neckline.
+                if len(pivot_lows) >= 2:
+                    (i1, p1), (i2, p2) = pivot_lows[-2], pivot_lows[-1]
+                    if 0 < i2 - i1 <= max_sep and p1 > 0 and abs(p1 - p2) / p1 <= tol:
+                        neck = high[i1:i2 + 1].max()
+                        if close[i] > neck >= close[i - 1]:
+                            buy = True
+                # Double top: last two pivot highs ~equal, break below neckline.
+                if len(pivot_highs) >= 2:
+                    (i1, p1), (i2, p2) = pivot_highs[-2], pivot_highs[-1]
+                    if 0 < i2 - i1 <= max_sep and p1 > 0 and abs(p1 - p2) / p1 <= tol:
+                        neck = low[i1:i2 + 1].min()
+                        if close[i] < neck <= close[i - 1]:
+                            sell = True
+
+            if pos == 0:
+                if buy:
+                    pos, entry_price = 1, close[i]
+                elif sell:
+                    pos, entry_price = -1, close[i]
+            else:
+                if pos == 1 and sell:
+                    pos, entry_price = -1, close[i]
+                elif pos == -1 and buy:
+                    pos, entry_price = 1, close[i]
+                elif entry_price > 0:
+                    hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
+                    hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
+                    if hit_lower or hit_upper:
+                        pos, entry_price = 0, 0.0
+            positions[i] = pos
+
+        df['position'] = positions
+        return df
+
+
 # ==============================================================================
 #  3. STRATEGY REGISTRY (THE ENGINE'S GEARBOX)
 # ==============================================================================
@@ -1071,6 +1167,7 @@ STRATEGY_REGISTRY = {
     FngRegimeMACrossoverStrategy.name(): FngRegimeMACrossoverStrategy,
     FngRegimeBollingerStrategy.name(): FngRegimeBollingerStrategy,
     FundingRateStrategy.name(): FundingRateStrategy,
+    DoubleTopBottomStrategy.name(): DoubleTopBottomStrategy,
 }
 
 
