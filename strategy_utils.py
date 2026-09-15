@@ -1152,6 +1152,113 @@ class DoubleTopBottomStrategy(BaseStrategy):
         return df
 
 
+class ChartPatternsStrategy(BaseStrategy):
+    """Unified chart-pattern breakout strategy.
+
+    Nearly every classic pattern (triangles asc/desc/symmetric, rising/falling
+    wedges, rectangles, pennants, and the necklines of double tops/bottoms and
+    head-and-shoulders) reduces to the same mechanic: a RESISTANCE line fit
+    through recent swing highs and a SUPPORT line fit through recent swing lows.
+    You enter on the confirmed breakout — LONG when price closes above the
+    resistance line, SHORT when it closes below the support line — provided the
+    two lines are converging or flat (a real pattern, not an expanding mess).
+
+    Params: pivot_lookback (swing size), window_bars (how far back to fit the
+    lines), min_touches (min swing points per line), plus optional exit bands.
+    Swings are confirmed `pivot_lookback` bars late, so there is no lookahead."""
+
+    @staticmethod
+    def name():
+        return "Chart Patterns (All)"
+
+    @staticmethod
+    def get_parameters():
+        return {
+            'pivot_lookback': {'type': 'number', 'default': 5, 'step': 1},
+            'window_bars': {'type': 'number', 'default': 80, 'step': 5},
+            'min_touches': {'type': 'number', 'default': 2, 'step': 1},
+            'exit_minus_percent': {'type': 'number', 'default': '', 'step': 0.25},
+            'exit_plus_percent': {'type': 'number', 'default': '', 'step': 0.25},
+        }
+
+    def generate_signals(self, data, params):
+        if data is None or data.empty:
+            return pd.DataFrame()
+        df = data.copy()
+        order = max(int(params.get('pivot_lookback') or 5), 1)
+        window = max(int(params.get('window_bars') or 80), order * 2 + 2)
+        min_touches = max(int(params.get('min_touches') or 2), 2)
+        exit_minus = _opt_float(params, 'exit_minus_percent')
+        exit_plus = _opt_float(params, 'exit_plus_percent')
+
+        high = df['High'].to_numpy(dtype=float)
+        low = df['Low'].to_numpy(dtype=float)
+        close = df['Close'].to_numpy(dtype=float)
+        n = len(df)
+
+        pivot_highs = []  # (idx, price)
+        pivot_lows = []
+        res_line = np.full(n, np.nan)
+        sup_line = np.full(n, np.nan)
+        positions = np.zeros(n, dtype=int)
+        pos = 0
+        entry_price = 0.0
+
+        for i in range(n):
+            j = i - order
+            if j - order >= 0:
+                if high[j] == high[j - order:i + 1].max() and (not pivot_highs or j - pivot_highs[-1][0] > order):
+                    pivot_highs.append((j, high[j]))
+                if low[j] == low[j - order:i + 1].min() and (not pivot_lows or j - pivot_lows[-1][0] > order):
+                    pivot_lows.append((j, low[j]))
+
+            buy = sell = False
+            if i > 0:
+                lo_cut = i - window
+                H = [(x, p) for (x, p) in pivot_highs if x >= lo_cut]
+                L = [(x, p) for (x, p) in pivot_lows if x >= lo_cut]
+                if len(H) >= min_touches and len(L) >= min_touches:
+                    hx = np.array([x for x, _ in H], dtype=float)
+                    hp = np.array([p for _, p in H], dtype=float)
+                    lx = np.array([x for x, _ in L], dtype=float)
+                    lp = np.array([p for _, p in L], dtype=float)
+                    sh, ih = np.polyfit(hx, hp, 1)
+                    sl, il = np.polyfit(lx, lp, 1)
+                    res_now, res_prev = sh * i + ih, sh * (i - 1) + ih
+                    sup_now, sup_prev = sl * i + il, sl * (i - 1) + il
+                    res_line[i], sup_line[i] = res_now, sup_now
+                    # Converging or flat: support slope >= resistance slope (lines
+                    # not diverging). Filters out expanding, non-pattern noise.
+                    converging = sl >= sh - 1e-9
+                    if converging and res_now > 0 and sup_now > 0:
+                        if close[i] > res_now and close[i - 1] <= res_prev:
+                            buy = True
+                        elif close[i] < sup_now and close[i - 1] >= sup_prev:
+                            sell = True
+
+            if pos == 0:
+                if buy:
+                    pos, entry_price = 1, close[i]
+                elif sell:
+                    pos, entry_price = -1, close[i]
+            else:
+                if pos == 1 and sell:
+                    pos, entry_price = -1, close[i]
+                elif pos == -1 and buy:
+                    pos, entry_price = 1, close[i]
+                elif entry_price > 0:
+                    hit_lower = exit_minus is not None and close[i] <= entry_price * (1 - exit_minus / 100.0)
+                    hit_upper = exit_plus is not None and close[i] >= entry_price * (1 + exit_plus / 100.0)
+                    if hit_lower or hit_upper:
+                        pos, entry_price = 0, 0.0
+            positions[i] = pos
+
+        df['pattern_resistance'] = res_line
+        df['pattern_support'] = sup_line
+        df['position'] = positions
+        return df
+
+
 # ==============================================================================
 #  3. STRATEGY REGISTRY (THE ENGINE'S GEARBOX)
 # ==============================================================================
@@ -1168,6 +1275,7 @@ STRATEGY_REGISTRY = {
     FngRegimeBollingerStrategy.name(): FngRegimeBollingerStrategy,
     FundingRateStrategy.name(): FundingRateStrategy,
     DoubleTopBottomStrategy.name(): DoubleTopBottomStrategy,
+    ChartPatternsStrategy.name(): ChartPatternsStrategy,
 }
 
 

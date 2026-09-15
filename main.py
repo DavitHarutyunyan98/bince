@@ -308,6 +308,8 @@ _DEFAULT_RANGE_HINTS = {
     'pivot_lookback': '3,10,1',
     'tolerance_percent': '1.0,5.0,1.0',
     'max_pattern_bars': '20,80,10',
+    'window_bars': '40,120,20',
+    'min_touches': '2,3,1',
 }
 
 # Choices for categorical (text) parameters.
@@ -340,6 +342,8 @@ _PARAM_LABELS = {
     'pivot_lookback': 'Pivot Lookback',
     'tolerance_percent': 'Peak Tolerance %',
     'max_pattern_bars': 'Max Pattern Bars',
+    'window_bars': 'Trendline Window (bars)',
+    'min_touches': 'Min Trendline Touches',
 }
 
 # Default "min,max,step" ranges pre-filled into the optimizer UI per parameter.
@@ -477,6 +481,20 @@ STRATEGY_DESCRIPTIONS = {
                    "bands; entry/exit rules identical to Bollinger Bands.",
         'example': "Tighter bands in Fear (bb_std_fear=1.5, mean-revert hard), wider in Greed "
                    "(bb_std_greed=2.5). (Backtest/optimize only for now.)",
+    },
+    'Chart Patterns (All)': {
+        'logic': "Unified breakout across the whole pattern family — triangles (asc/desc/"
+                 "symmetric), rising/falling wedges, rectangles, pennants, and the necklines of "
+                 "double tops/bottoms and head-and-shoulders. All reduce to two trendlines: "
+                 "resistance through recent swing highs, support through recent swing lows.",
+        'signals': "Fit a resistance line through swing highs and a support line through swing "
+                   "lows over the last `window_bars` (swings sized by `pivot_lookback`, "
+                   "≥ `min_touches` each). When the lines are converging/flat (a real pattern), "
+                   "go LONG on a close above resistance, SHORT on a close below support. Exit on "
+                   "the opposite breakout or the optional exit_minus/plus % bands.",
+        'example': "Ascending triangle = flat highs + rising lows → long when price breaks the "
+                   "flat resistance. Rising wedge = both lines up but converging → short when it "
+                   "breaks support. Both are the same 'breakout of the trendline' rule.",
     },
     'Double Top / Bottom': {
         'logic': "Classic reversal patterns from swing points. A double bottom (two ~equal "
@@ -3693,6 +3711,13 @@ def _build_price_signal_figure(df, title):
     if 'supertrend' in df.columns:
         fig.add_trace(go.Scatter(x=df.index, y=df['supertrend'], mode='lines',
                                  line=dict(color='#26a69a', width=1.5), name='SuperTrend'))
+    # Overlay chart-pattern trendlines if present.
+    if 'pattern_resistance' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['pattern_resistance'], mode='lines',
+                                 line=dict(color='#ef5350', width=1, dash='dot'), name='Resistance'))
+    if 'pattern_support' in df.columns:
+        fig.add_trace(go.Scatter(x=df.index, y=df['pattern_support'], mode='lines',
+                                 line=dict(color='#66bb6a', width=1, dash='dot'), name='Support'))
     # Overlay Bollinger Bands if present.
     if 'bb_upper' in df.columns and 'bb_lower' in df.columns:
         fig.add_trace(go.Scatter(x=df.index, y=df['bb_upper'], mode='lines',
