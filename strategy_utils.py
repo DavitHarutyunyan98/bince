@@ -1285,14 +1285,34 @@ STRATEGY_REGISTRY = {
 # Global cost model applied by every Backtester unless overridden per instance.
 # Set from the dashboard's "Cost Model" inputs so backtests and optimizations
 # reflect real trading costs, not just exchange fees.
-COST_MODEL = {'slippage_percent': 0.05, 'charge_funding': True}
+COST_MODEL = {'slippage_percent': 0.05, 'charge_funding': True,
+              'order_mode': 'market', 'maker_fill_rate': 50.0}
+MAKER_FEE_PERCENT = 0.02  # Binance USDT-M VIP0 maker fee (taker is the fee_percent arg)
 
 
-def set_cost_model(slippage_percent=None, charge_funding=None):
+def set_cost_model(slippage_percent=None, charge_funding=None,
+                   order_mode=None, maker_fill_rate=None):
     if slippage_percent is not None:
         COST_MODEL['slippage_percent'] = max(float(slippage_percent), 0.0)
     if charge_funding is not None:
         COST_MODEL['charge_funding'] = bool(charge_funding)
+    if order_mode is not None:
+        COST_MODEL['order_mode'] = 'limit_fallback' if order_mode == 'limit_fallback' else 'market'
+    if maker_fill_rate is not None:
+        COST_MODEL['maker_fill_rate'] = min(max(float(maker_fill_rate), 0.0), 100.0)
+
+
+def effective_costs(taker_fee_percent, slippage_percent, order_mode, maker_fill_rate):
+    """Per-side (fee %, slippage %) after the order type.
+
+    Market: taker fee + full slippage.
+    Limit+fallback: a `maker_fill_rate`% share of orders fill as maker (maker fee,
+    no slippage); the rest fall back to market (taker fee + slippage)."""
+    if order_mode != 'limit_fallback':
+        return taker_fee_percent, slippage_percent
+    r = min(max(float(maker_fill_rate), 0.0), 100.0) / 100.0
+    fee = r * MAKER_FEE_PERCENT + (1 - r) * taker_fee_percent
+    return fee, (1 - r) * slippage_percent
 
 
 class Backtester:
@@ -1304,11 +1324,16 @@ class Backtester:
     (longs pay positive funding, shorts receive it)."""
 
     def __init__(self, initial_capital=10000, fee_percent=0.05, sizing_mode='fixed',
-                 slippage_percent=None, charge_funding=None):
+                 slippage_percent=None, charge_funding=None,
+                 order_mode=None, maker_fill_rate=None):
         self.initial_capital = initial_capital
-        self.fee_percent = fee_percent / 100
-        self.slippage = (COST_MODEL['slippage_percent'] if slippage_percent is None
-                         else float(slippage_percent)) / 100
+        slip_pct = (COST_MODEL['slippage_percent'] if slippage_percent is None
+                    else float(slippage_percent))
+        mode = COST_MODEL['order_mode'] if order_mode is None else order_mode
+        rate = COST_MODEL['maker_fill_rate'] if maker_fill_rate is None else maker_fill_rate
+        fee_pct, slip_pct = effective_costs(float(fee_percent), slip_pct, mode, rate)
+        self.fee_percent = fee_pct / 100
+        self.slippage = slip_pct / 100
         self.charge_funding = (COST_MODEL['charge_funding'] if charge_funding is None
                                else bool(charge_funding))
         # 'fixed'      -> every trade sized off the initial capital (no compounding)

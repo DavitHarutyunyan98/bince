@@ -1178,7 +1178,9 @@ class FuturesTrader:
         """Runs an Optuna study for a single trading pair with IS/OOS and returns all trial results."""
         # Apply the dashboard's cost model inside the worker process too.
         set_cost_model(getattr(self, 'slippage_percent', COST_MODEL['slippage_percent']),
-                       getattr(self, 'charge_funding', COST_MODEL['charge_funding']))
+                       getattr(self, 'charge_funding', COST_MODEL['charge_funding']),
+                       getattr(self, 'order_mode', COST_MODEL['order_mode']),
+                       getattr(self, 'maker_fill_rate', COST_MODEL['maker_fill_rate']))
         # Use specified strategy or fallback to dynamic selection
         if strategy_name:
             strategy_class = STRATEGY_REGISTRY.get(strategy_name)
@@ -1748,7 +1750,9 @@ class FuturesTrader:
         """Runs smart Bayesian optimization using TPE sampler."""
         # Apply the dashboard's cost model inside the worker process too.
         set_cost_model(getattr(self, 'slippage_percent', COST_MODEL['slippage_percent']),
-                       getattr(self, 'charge_funding', COST_MODEL['charge_funding']))
+                       getattr(self, 'charge_funding', COST_MODEL['charge_funding']),
+                       getattr(self, 'order_mode', COST_MODEL['order_mode']),
+                       getattr(self, 'maker_fill_rate', COST_MODEL['maker_fill_rate']))
         add_optimization_log(f"🧠 Running SMART optimization for {symbol}")
         
         # Use specified strategy or fallback to dynamic selection
@@ -2365,6 +2369,15 @@ def build_config_panel():
                                                       'value': 'on'}],
                                             value=['on'], className='custom-checklist')],
                              className='flex-item'),
+                    html.Div([html.Label('Order type (backtest model):'),
+                              dcc.RadioItems(id='cost-order-mode',
+                                             options=[{'label': ' Market', 'value': 'market'},
+                                                      {'label': ' Limit + market fallback', 'value': 'limit_fallback'}],
+                                             value='market', className='custom-checklist')],
+                             className='flex-item'),
+                    html.Div([html.Label('Assumed maker fill rate %:'),
+                              dcc.Input(id='cost-maker-rate', value=50, type='number', min=0, max=100, step=5,
+                                        className='custom-input')], className='flex-item'),
                     html.Div(id='cost-model-status', style={'fontSize': '12px', 'color': '#888'}),
                 ], className='flex-container', style={'marginTop': '8px'}),
             ], className='control-panel-group'),
@@ -2825,23 +2838,37 @@ def _coerce_trade_config_rows(rows):
         sym = str(r.get('symbol') or '').strip().upper()
         if not sym:
             continue
-        cfg = {
+        # Keep every other key (e.g. MA/Bollinger strategy params) as-is so
+        # saving never drops parameters of non-Candlestick strategies.
+        cfg = {k: v for k, v in r.items() if v is not None and v != ''}
+        cfg.update({
             'enabled': bool(r.get('enabled', True)),
             'strategy_name': r.get('strategy_name') or 'Candlestick Patterns',
             'symbol': sym,
             'bar_length': r.get('bar_length') or '15m',
             'units_usdt': 0.0, 'leverage': 1, 'sizing_mode': r.get('sizing_mode') or 'fixed',
-        }
+            'order_mode': r.get('order_mode') or 'market',
+        })
+        try:
+            cfg['limit_wait_seconds'] = max(int(float(r.get('limit_wait_seconds'))), 1)
+        except (TypeError, ValueError):
+            cfg['limit_wait_seconds'] = 30
+        # Type known numeric fields; leave blank ones OUT (a blank exit band must
+        # mean "no exit band", not 0% — which would close trades instantly).
         for k in TRADE_CONFIG_INT_FIELDS:
             try:
                 cfg[k] = int(float(r.get(k)))
             except (TypeError, ValueError):
-                cfg[k] = 0
+                cfg.pop(k, None)
+                if k == 'leverage':
+                    cfg[k] = 1
         for k in TRADE_CONFIG_FLOAT_FIELDS:
             try:
                 cfg[k] = float(r.get(k))
             except (TypeError, ValueError):
-                cfg[k] = 0.0
+                cfg.pop(k, None)
+                if k == 'units_usdt':
+                    cfg[k] = 0.0
         out.append(cfg)
     return out
 
@@ -2858,6 +2885,8 @@ def build_trade_config_editor_panel():
         {'name': 'Units USDT', 'id': 'units_usdt', 'type': 'numeric'},
         {'name': 'Leverage', 'id': 'leverage', 'type': 'numeric'},
         {'name': 'Sizing', 'id': 'sizing_mode', 'presentation': 'dropdown'},
+        {'name': 'Order Mode', 'id': 'order_mode', 'presentation': 'dropdown'},
+        {'name': 'Limit Wait (s)', 'id': 'limit_wait_seconds', 'type': 'numeric'},
         {'name': 'Buy Win', 'id': 'buy_signal_window', 'type': 'numeric'},
         {'name': 'Buy LB', 'id': 'buy_pattern_lookback', 'type': 'numeric'},
         {'name': 'Sell Win', 'id': 'sell_signal_window', 'type': 'numeric'},
@@ -2872,6 +2901,8 @@ def build_trade_config_editor_panel():
                                    for b in ['1m', '5m', '15m', '30m', '1h', '4h', '1d']]},
         'sizing_mode': {'options': [{'label': 'Fixed', 'value': 'fixed'},
                                     {'label': 'Compound', 'value': 'compound'}]},
+        'order_mode': {'options': [{'label': 'Market', 'value': 'market'},
+                                   {'label': 'Limit + fallback', 'value': 'limit_fallback'}]},
     }
     return create_collapsible_container("Trade Config Editor (trade_config.json)", "trade-config-editor", [
         html.P("Edit any cell inline, use the trash icon to remove a pair, or 'Add Pair' for a new row. "
@@ -4138,6 +4169,7 @@ def edit_trade_config_rows(add_clicks, reload_clicks, rows):
         'buy_signal_window': 5, 'buy_pattern_lookback': 2,
         'sell_signal_window': 5, 'sell_pattern_lookback': 2,
         'exit_minus_percent': 5.0, 'exit_plus_percent': 5.0,
+        'order_mode': 'market', 'limit_wait_seconds': 30,
     })
     return rows
 
@@ -5204,18 +5236,26 @@ def update_logs(n): return "\n".join(OPTIMIZATION_LOGS)
 
 @app.callback(
     Output('cost-model-status', 'children'),
-    [Input('cost-slippage-input', 'value'), Input('cost-funding-check', 'value')],
+    [Input('cost-slippage-input', 'value'), Input('cost-funding-check', 'value'),
+     Input('cost-order-mode', 'value'), Input('cost-maker-rate', 'value')],
 )
-def update_cost_model(slippage, funding):
+def update_cost_model(slippage, funding, order_mode, maker_rate):
     """Apply the cost model to every backtest and optimization (incl. workers)."""
+    from strategy_utils import effective_costs
     slip = float(slippage) if slippage not in (None, '') else 0.0
     charge = 'on' in (funding or [])
-    set_cost_model(slip, charge)
+    mode = order_mode or 'market'
+    rate = float(maker_rate) if maker_rate not in (None, '') else 0.0
+    set_cost_model(slip, charge, mode, rate)
     if trader is not None:
         trader.slippage_percent = slip
         trader.charge_funding = charge
-    return (f"Cost model: fee 0.05%/side + slippage {slip:.3f}%/side"
-            f"{' + funding' if charge else ''} ≈ {0.1 + 2 * slip:.2f}% per round trip before funding.")
+        trader.order_mode = mode
+        trader.maker_fill_rate = rate
+    fee, eff_slip = effective_costs(0.05, slip, mode, rate)
+    how = (f"limit+fallback @ {rate:.0f}% maker fills" if mode == 'limit_fallback' else "market orders")
+    return (f"Cost model ({how}): fee {fee:.3f}%/side + slippage {eff_slip:.3f}%/side"
+            f"{' + funding' if charge else ''} ≈ {2 * (fee + eff_slip):.3f}% per round trip before funding.")
 
 
 def _fetch_income_history(start_ms, end_ms):

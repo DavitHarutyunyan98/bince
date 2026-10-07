@@ -118,6 +118,15 @@ class HybridSymbolTrader:
             if self.sizing_mode == "compound" else 0.0
         )
         self.poll_interval = self._get_poll_interval()
+        # Order execution: 'market' (taker, instant) or 'limit_fallback'
+        # (post-only limit at best bid/ask; after limit_wait_seconds any
+        # unfilled remainder is sent as a market order).
+        self.order_mode = str(self.trade_config.get("order_mode", "market")).lower()
+        try:
+            self.limit_wait_seconds = max(int(self.trade_config.get("limit_wait_seconds", 30)), 1)
+        except (TypeError, ValueError):
+            self.limit_wait_seconds = 30
+        self.open_order_mode = 'market'
 
         # Position tracking
         self.entry_price = 0.0
@@ -458,8 +467,11 @@ class HybridSymbolTrader:
 
         # Close existing position
         if current_position != 0:
+            # A flip into the opposite side may use limit+fallback; an exit to
+            # flat can be a stop band, so it always goes out at market.
             self._close_position(
-                f"Signal flip: {current_position} -> {desired_position}")
+                f"Signal flip: {current_position} -> {desired_position}",
+                allow_limit=(desired_position != 0))
 
         # Open new position immediately with retry mechanism
         if desired_position != 0:
@@ -470,19 +482,24 @@ class HybridSymbolTrader:
         logger.info(f"[{self.symbol}] Position updated to: {self.position}")
 
     def _fill_info(self, order):
-        """Real execution details for a market order from Binance trade history:
-        (avg_fill_price, filled_qty, commission_usdt, realized_pnl). Falls back to
-        the last polled price with zero costs if the lookup fails."""
+        """Real execution details from Binance trade history for one order or a
+        list of orders (limit + fallback): (avg_fill_price, filled_qty,
+        commission_usdt, realized_pnl). Falls back to the last polled price with
+        zero costs if the lookup fails."""
         try:
-            order_id = order.get('orderId') if order else None
-            if not order_id:
+            orders = order if isinstance(order, list) else [order]
+            ids = [o.get('orderId') for o in orders if o and o.get('orderId')]
+            if not ids:
                 raise ValueError("no orderId")
             fills = []
-            for _ in range(3):  # fills can take a moment to appear
-                fills = self.client.futures_account_trades(symbol=self.symbol, orderId=order_id)
-                if fills:
-                    break
-                time.sleep(0.5)
+            for oid in ids:
+                got = []
+                for _ in range(3):  # fills can take a moment to appear
+                    got = self.client.futures_account_trades(symbol=self.symbol, orderId=oid)
+                    if got:
+                        break
+                    time.sleep(0.5)
+                fills.extend(got)
             if not fills:
                 raise ValueError("no fills")
             qty = sum(float(f['qty']) for f in fills)
@@ -496,6 +513,81 @@ class HybridSymbolTrader:
             logger.warning(f"[{self.symbol}] Could not read fills ({e}); using polled price.")
             return self.current_price, 0.0, 0.0, None
 
+    def _round_to_tick(self, price):
+        tick = getattr(self, 'tick_size', 0) or 0
+        if tick > 0:
+            price = round(round(price / tick) * tick, self.price_precision)
+        return float(f"{price:.{self.price_precision}f}")
+
+    def _place_order(self, side, quantity, reduce_only=False, allow_limit=True):
+        """Execute `quantity` on `side` according to the pair's order mode.
+
+        market:          one MARKET order (taker).
+        limit_fallback:  post-only LIMIT (GTX) at best bid (buy) / best ask
+                         (sell) so it can only fill as maker; poll up to
+                         limit_wait_seconds; cancel; send any unfilled remainder
+                         as a MARKET order. Returns (orders, how) where `how` is
+                         'market', 'maker', 'maker+fallback' or 'fallback'."""
+        orders = []
+        if allow_limit and self.order_mode == 'limit_fallback':
+            executed = 0.0
+            limit_order = None
+            try:
+                book = self.client.futures_orderbook_ticker(symbol=self.symbol)
+                price = float(book['bidPrice'] if side == 'BUY' else book['askPrice'])
+                params = dict(symbol=self.symbol, side=side, type='LIMIT', timeInForce='GTX',
+                              quantity=quantity, price=self._round_to_tick(price))
+                if reduce_only:
+                    params['reduceOnly'] = 'true'
+                limit_order = self.client.futures_create_order(**params)
+                orders.append(limit_order)
+                status = limit_order.get('status', 'NEW')
+                executed = float(limit_order.get('executedQty', 0) or 0)
+                deadline = time.time() + self.limit_wait_seconds
+                while status not in ('FILLED', 'CANCELED', 'EXPIRED', 'REJECTED') and time.time() < deadline:
+                    time.sleep(1)
+                    o = self.client.futures_get_order(symbol=self.symbol, orderId=limit_order['orderId'])
+                    status = o.get('status', status)
+                    executed = float(o.get('executedQty', 0) or 0)
+                if status not in ('FILLED', 'CANCELED', 'EXPIRED', 'REJECTED'):
+                    try:
+                        self.client.futures_cancel_order(symbol=self.symbol, orderId=limit_order['orderId'])
+                    except Exception:
+                        pass  # may have filled at the last moment
+                    o = self.client.futures_get_order(symbol=self.symbol, orderId=limit_order['orderId'])
+                    executed = float(o.get('executedQty', 0) or 0)
+            except Exception as e:
+                logger.warning(f"[{self.symbol}] Limit order failed ({e}); falling back to market.")
+                if limit_order:
+                    try:
+                        o = self.client.futures_get_order(symbol=self.symbol, orderId=limit_order['orderId'])
+                        executed = float(o.get('executedQty', 0) or 0)
+                    except Exception:
+                        pass
+            remaining = float(f"{max(quantity - executed, 0.0):.{self.quantity_precision}f}")
+            if remaining <= 0:
+                logger.info(f"[{self.symbol}] 🟢 MAKER fill {executed} @ limit (fee 0.02%)")
+                return orders, 'maker'
+            how = 'maker+fallback' if executed > 0 else 'fallback'
+            logger.info(f"[{self.symbol}] ⏱️ Limit {'partly ' if executed > 0 else 'not '}filled "
+                        f"after {self.limit_wait_seconds}s (maker {executed}); market for {remaining}")
+            quantity = remaining
+        else:
+            how = 'market'
+        params = dict(symbol=self.symbol, side=side, type='MARKET', quantity=quantity)
+        if reduce_only:
+            params['reduceOnly'] = 'true'
+        try:
+            orders.append(self.client.futures_create_order(**params))
+        except Exception:
+            if orders and how != 'market':
+                # Maker part filled but the tiny remainder was rejected (e.g. below
+                # min notional) — keep the partial fill rather than fail the trade.
+                logger.warning(f"[{self.symbol}] Fallback market order rejected; keeping partial maker fill.")
+                return orders, 'maker'
+            raise
+        return orders, how
+
     def _open_position(self, signal):
         """Open a new position."""
         try:
@@ -508,12 +600,8 @@ class HybridSymbolTrader:
 
             logger.info(f"[{self.symbol}] Opening {pos_type} position...")
 
-            order = self.client.futures_create_order(
-                symbol=self.symbol,
-                side=side,
-                type="MARKET",
-                quantity=quantity
-            )
+            order, how = self._place_order(side, quantity)
+            self.open_order_mode = how
 
             # Use the REAL average fill price + entry commission.
             signal_price = self.current_price
@@ -524,7 +612,7 @@ class HybridSymbolTrader:
             self.position_start_time = datetime.now(timezone.utc)
             self.session_trades += 1
             slip = (fill_price - signal_price) / signal_price * 100 * (1 if signal == 1 else -1) if signal_price else 0
-            logger.info(f"[{self.symbol}] Fill {fill_price:.{self.price_precision}f} vs signal "
+            logger.info(f"[{self.symbol}] [{how}] Fill {fill_price:.{self.price_precision}f} vs signal "
                         f"{signal_price:.{self.price_precision}f} (slippage {slip:+.3f}%), fee {open_fee:.4f} USDT")
 
             message = (
@@ -544,8 +632,10 @@ class HybridSymbolTrader:
         except Exception as e:
             logger.error(f"[{self.symbol}] Error opening position: {e}")
 
-    def _close_position(self, reason="Manual Close"):
-        """Close current position."""
+    def _close_position(self, reason="Manual Close", allow_limit=False):
+        """Close current position. allow_limit=True lets signal flips use the
+        pair's limit+fallback mode; exits to flat (which may be stop-loss bands)
+        and corrective closes always use market for speed."""
         if self.position == 0:
             return
 
@@ -559,12 +649,8 @@ class HybridSymbolTrader:
 
             logger.info(f"[{self.symbol}] Closing {pos_type} position...")
 
-            order = self.client.futures_create_order(
-                symbol=self.symbol,
-                side=side,
-                type="MARKET",
-                quantity=position_size
-            )
+            order, how = self._place_order(side, position_size, reduce_only=True,
+                                           allow_limit=allow_limit)
 
             # Paper PnL (old method: polled price, no costs) — kept for comparison.
             if self.position == 1:
@@ -581,7 +667,7 @@ class HybridSymbolTrader:
             fees = open_fee + close_fee
             pnl = realized - fees
             self.session_fees = getattr(self, 'session_fees', 0.0) + fees
-            logger.info(f"[{self.symbol}] Close fill {exit_price:.{self.price_precision}f} | "
+            logger.info(f"[{self.symbol}] [{how}] Close fill {exit_price:.{self.price_precision}f} | "
                         f"paper {paper_pnl:+.4f} | realized {realized:+.4f} | fees {fees:.4f} | "
                         f"NET {pnl:+.4f} USDT")
             self.open_commission = 0.0
@@ -811,17 +897,21 @@ class HybridSymbolTrader:
                 side = "BUY" if signal == 1 else "SELL"
                 pos_type = "LONG" if signal == 1 else "SHORT"
 
-                logger.info(f"[{self.symbol}] 🔄 Opening {pos_type} position (attempt {attempt + 1}/{max_retries})...")
+                if attempt > 0:
+                    # A previous attempt may have filled (fully/partly) before
+                    # erroring — never stack a second position on top.
+                    self._sync_position_with_exchange()
+                    if self.position == signal:
+                        logger.info(f"[{self.symbol}] Position already open from previous attempt.")
+                        return True
 
-                order = self.client.futures_create_order(
-                    symbol=self.symbol,
-                    side=side,
-                    type="MARKET",
-                    quantity=quantity
-                )
+                logger.info(f"[{self.symbol}] 🔄 Opening {pos_type} position (attempt {attempt + 1}/{max_retries}, {self.order_mode})...")
+
+                order, how = self._place_order(side, quantity)
+                self.open_order_mode = how
 
                 # Verify the order was successful
-                if order and order.get('orderId'):
+                if order and order[-1].get('orderId'):
                     # Use the REAL average fill price + entry commission.
                     signal_price = self.current_price
                     fill_price, _, open_fee, _ = self._fill_info(order)
@@ -829,7 +919,7 @@ class HybridSymbolTrader:
                     self.entry_price = fill_price
                     self.open_commission = open_fee
                     slip = (fill_price - signal_price) / signal_price * 100 * (1 if signal == 1 else -1) if signal_price else 0
-                    logger.info(f"[{self.symbol}] Fill {fill_price:.{self.price_precision}f} vs signal "
+                    logger.info(f"[{self.symbol}] [{how}] Fill {fill_price:.{self.price_precision}f} vs signal "
                                 f"{signal_price:.{self.price_precision}f} (slippage {slip:+.3f}%), fee {open_fee:.4f} USDT")
                     self.position_start_time = datetime.now(timezone.utc)
                     self.session_trades += 1
@@ -846,7 +936,7 @@ class HybridSymbolTrader:
                             f"<b>Position Size:</b> <code>{quantity:.{self.quantity_precision}f}</code> "
                             f"(<code>{quantity * self.current_price:.2f} USDT</code>)\n"
                             f"<b>Sizing:</b> <code>{self.sizing_mode}</code>\n"
-                            f"<b>Method:</b> <code>REST API Polling</code>\n"
+                            f"<b>Order:</b> <code>{how}</code>\n"
                             f"<b>Attempt:</b> <code>{attempt + 1}/{max_retries}</code>"
                         )
 
