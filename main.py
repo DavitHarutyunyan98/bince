@@ -2565,6 +2565,24 @@ def build_optimizer_panel():
                                         {'label': ' Compounding (off running equity)', 'value': 'compound'}],
                                value='fixed', className='custom-checklist'),
                 html.Hr(style={'margin': '12px 0'}),
+                html.Label("Order type (backtest model):"),
+                dcc.RadioItems(id='opt-cost-order-mode',
+                               options=[{'label': ' Market', 'value': 'market'},
+                                        {'label': ' Limit + market fallback', 'value': 'limit_fallback'}],
+                               value='market', className='custom-checklist'),
+                html.Div([
+                    html.Div([html.Label("Assumed maker fill rate %:"),
+                              dcc.Input(id='opt-cost-maker-rate', value=50, type='number', min=0, max=100,
+                                        step=5, className='custom-input')], className='flex-item'),
+                    html.Div([html.Label("Slippage % per side:"),
+                              dcc.Input(id='opt-cost-slippage', value=0.05, type='number', min=0,
+                                        step=0.01, className='custom-input')], className='flex-item'),
+                ], className='flex-container', style={'marginTop': '6px'}),
+                dcc.Checklist(id='opt-cost-funding',
+                              options=[{'label': ' Charge funding', 'value': 'on'}],
+                              value=['on'], className='custom-checklist'),
+                html.Div(id='opt-cost-status', style={'fontSize': '12px', 'color': '#888', 'marginTop': '4px'}),
+                html.Hr(style={'margin': '12px 0'}),
                 html.Label("Split Date-Range Results:"),
                 dcc.RadioItems(id='opt-split-mode',
                                options=[{'label': ' On row click only (per pair when you click a result)', 'value': 'onclick'},
@@ -3128,7 +3146,8 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
     html.Div(id='scroll-optrow-dummy', style={'display': 'none'}),
 
     html.Div([
-        html.H2("Futures Dashboard", style={'margin': '0', 'flex': '1'}),
+        html.H2("Futures Dashboard", className='nav-title'),
+        html.Div([
         html.A('Manual Backtester', href='#manual-section', className='nav-link'),
         html.A('Trade Config', href='#trade-config-section', className='nav-link'),
         html.A('Live PnL', href='#recon-section', className='nav-link'),
@@ -3139,10 +3158,11 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
                className='nav-link'),
         html.A('Optimizer Results', href='#optimizer-results-section',
                className='nav-link'),
+        ], className='nav-links'),
     ], className='nav-bar'),
 
     html.H1("Cryptocurrency Futures Trading Dashboard", style={
-            'textAlign': 'center', 'marginTop': '70px'}),
+            'textAlign': 'center', 'marginTop': '20px'}),
 
     html.Div([
         html.Div(build_config_panel(), id='manual-section'),
@@ -3963,10 +3983,13 @@ def _build_portfolio_figure_and_trades(trades_df, portfolio_df):
     [State('opt-results-table', 'derived_viewport_data'),
      State('is-date-start', 'value'), State('is-date-end', 'value'),
      State('capital-input', 'value'), State('opt-sizing-mode', 'value'),
-     State('opt-num-splits', 'value')],
+     State('opt-num-splits', 'value'),
+     State('opt-cost-order-mode', 'value'), State('opt-cost-maker-rate', 'value'),
+     State('opt-cost-slippage', 'value'), State('opt-cost-funding', 'value')],
     prevent_initial_call=True
 )
-def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, capital, sizing_mode, n_splits):
+def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, capital, sizing_mode, n_splits,
+                              cost_order_mode=None, cost_maker_rate=None, cost_slippage=None, cost_funding=None):
     no = no_update
     blank = (no,) * 13
     if not active_cell or not table_data or trader is None:
@@ -4017,7 +4040,12 @@ def backtest_selected_opt_row(active_cell, table_data, start_date, end_date, cap
                 [], [], [])
 
     df = strategy_class().generate_signals(data.copy(), params)
-    trades_df, portfolio_df = Backtester(initial_capital=cap, sizing_mode=sizing_mode or 'fixed').run_backtest(df)
+    trades_df, portfolio_df = Backtester(
+        initial_capital=cap, sizing_mode=sizing_mode or 'fixed',
+        slippage_percent=float(cost_slippage) if cost_slippage not in (None, '') else None,
+        charge_funding=('on' in (cost_funding or [])) if cost_funding is not None else None,
+        order_mode=cost_order_mode, maker_fill_rate=cost_maker_rate,
+    ).run_backtest(df)
 
     price_fig = _build_price_signal_figure(df, f"{pair} Chart ({timeframe})")
     pf_fig, trades_data, trades_cols, style = _build_portfolio_figure_and_trades(trades_df, portfolio_df)
@@ -4988,7 +5016,9 @@ def toggle_opt_buttons(status):
      State('opt-sizing-mode', 'value'),                         # sizing_mode
      State('opt-split-mode', 'value'),                          # split_mode
      State('opt-num-splits', 'value'),                          # n_splits
-     State('opt-skip-validation', 'value')],                    # skip_validation
+     State('opt-skip-validation', 'value'),                     # skip_validation
+     State('opt-cost-order-mode', 'value'), State('opt-cost-maker-rate', 'value'),
+     State('opt-cost-slippage', 'value'), State('opt-cost-funding', 'value')],
     prevent_initial_call=True
 )
 def start_optimization_trigger(n_clicks, pairs, selected_params, range_values, range_ids,
@@ -4996,7 +5026,8 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, range_values, r
                                strategy_name, timeframe, is_start, is_end, oos_start, oos_end,
                                weight_return, weight_winrate, weight_trades, weight_consistency,
                                weight_winloss, weight_oos, optimization_mode, sizing_mode, split_mode, n_splits,
-                               skip_validation):
+                               skip_validation, cost_order_mode=None, cost_maker_rate=None,
+                               cost_slippage=None, cost_funding=None):
     
     # DEBUG: Add explicit debug logging to verify date alignment
     print(f"DEBUG: Optimization Trigger Received")
@@ -5083,6 +5114,10 @@ def start_optimization_trigger(n_clicks, pairs, selected_params, range_values, r
             'weight_winloss': weight_winloss, 'weight_oos': weight_oos,
             'optimization_mode': optimization_mode or 'efficient',
             'sizing_mode': sizing_mode or 'fixed',
+            'cost_order_mode': cost_order_mode or 'market',
+            'cost_maker_rate': float(cost_maker_rate) if cost_maker_rate not in (None, '') else 0.0,
+            'cost_slippage': float(cost_slippage) if cost_slippage not in (None, '') else 0.0,
+            'cost_funding': 'on' in (cost_funding or []),
             'split_mode': split_mode or 'onclick',
             'n_splits': int(n_splits) if n_splits else 4,
         }
@@ -5144,19 +5179,41 @@ def run_optimization_task(n_intervals, settings):
     trader.split_columns = settings.get('split_mode', 'onclick') == 'columns'
     trader.split_n = settings.get('n_splits', 4)
 
-    add_optimization_log(f"📈 Using STANDARD optimization ({optimization_mode.upper()} mode, {trader.backtest_sizing_mode} sizing) with {strategy_name} strategy")
-    df_results = trader.optimize_trading_pairs(
-        trading_pairs=pairs, param_ranges=param_ranges, selected_params=settings['selected_params'],
-        is_start_date=settings['is_start'], is_end_date=settings['is_end'],
-        oos1_start_date=settings.get('oos_start') or settings['is_start'],
-        oos1_end_date=settings.get('oos_end') or settings['is_end'],
-        oos2_start_date=settings.get('oos_start') or settings['is_start'],
-        oos2_end_date=settings.get('oos_end') or settings['is_end'],
-        timeframe=settings['timeframe'], min_trades=settings['min_trades'], n_trials=settings['n_trials'],
-        weights=weights, min_candles=settings['min_candles'], stop_event=OPTIMIZATION_STOP_EVENT,
-        pause_event=OPTIMIZATION_PAUSE_EVENT, optimization_mode=optimization_mode, strategy_name=strategy_name
-    )
+    # Apply the OPTIMIZER's cost model for this run (workers read it from the
+    # trader attributes), then restore the manual backtester's settings.
+    _prev_cost = dict(COST_MODEL)
+    _prev_attrs = {a: getattr(trader, a, None) for a in
+                   ('slippage_percent', 'charge_funding', 'order_mode', 'maker_fill_rate')}
+    trader.slippage_percent = settings.get('cost_slippage', COST_MODEL['slippage_percent'])
+    trader.charge_funding = settings.get('cost_funding', COST_MODEL['charge_funding'])
+    trader.order_mode = settings.get('cost_order_mode', 'market')
+    trader.maker_fill_rate = settings.get('cost_maker_rate', COST_MODEL['maker_fill_rate'])
+    set_cost_model(trader.slippage_percent, trader.charge_funding,
+                   trader.order_mode, trader.maker_fill_rate)
+    add_optimization_log(
+        f"💸 Cost model: {trader.order_mode}"
+        + (f" @ {trader.maker_fill_rate:.0f}% maker fills" if trader.order_mode == 'limit_fallback' else "")
+        + f", slippage {trader.slippage_percent}%/side, funding {'on' if trader.charge_funding else 'off'}")
 
+    add_optimization_log(f"📈 Using STANDARD optimization ({optimization_mode.upper()} mode, {trader.backtest_sizing_mode} sizing) with {strategy_name} strategy")
+    try:
+        df_results = trader.optimize_trading_pairs(
+            trading_pairs=pairs, param_ranges=param_ranges, selected_params=settings['selected_params'],
+            is_start_date=settings['is_start'], is_end_date=settings['is_end'],
+            oos1_start_date=settings.get('oos_start') or settings['is_start'],
+            oos1_end_date=settings.get('oos_end') or settings['is_end'],
+            oos2_start_date=settings.get('oos_start') or settings['is_start'],
+            oos2_end_date=settings.get('oos_end') or settings['is_end'],
+            timeframe=settings['timeframe'], min_trades=settings['min_trades'], n_trials=settings['n_trials'],
+            weights=weights, min_candles=settings['min_candles'], stop_event=OPTIMIZATION_STOP_EVENT,
+            pause_event=OPTIMIZATION_PAUSE_EVENT, optimization_mode=optimization_mode, strategy_name=strategy_name
+        )
+    finally:
+        set_cost_model(_prev_cost['slippage_percent'], _prev_cost['charge_funding'],
+                       _prev_cost['order_mode'], _prev_cost['maker_fill_rate'])
+        for _a, _v in _prev_attrs.items():
+            if _v is not None:
+                setattr(trader, _a, _v)
 
     add_optimization_log("Main optimizer function has completed.")
     final_status = 'finished'
@@ -5256,6 +5313,23 @@ def update_cost_model(slippage, funding, order_mode, maker_rate):
     how = (f"limit+fallback @ {rate:.0f}% maker fills" if mode == 'limit_fallback' else "market orders")
     return (f"Cost model ({how}): fee {fee:.3f}%/side + slippage {eff_slip:.3f}%/side"
             f"{' + funding' if charge else ''} ≈ {2 * (fee + eff_slip):.3f}% per round trip before funding.")
+
+
+@app.callback(
+    Output('opt-cost-status', 'children'),
+    [Input('opt-cost-order-mode', 'value'), Input('opt-cost-maker-rate', 'value'),
+     Input('opt-cost-slippage', 'value'), Input('opt-cost-funding', 'value')],
+)
+def show_opt_cost_model(order_mode, maker_rate, slippage, funding):
+    """Explain the optimizer's per-trade cost assumption (applied to the run
+    and to result row-click backtests)."""
+    from strategy_utils import effective_costs
+    slip = float(slippage) if slippage not in (None, '') else 0.0
+    rate = float(maker_rate) if maker_rate not in (None, '') else 0.0
+    fee, eff_slip = effective_costs(0.05, slip, order_mode or 'market', rate)
+    return (f"Per side: fee {fee:.3f}% + slippage {eff_slip:.3f}% → "
+            f"≈ {2 * (fee + eff_slip):.3f}% per round trip"
+            f"{' + funding' if 'on' in (funding or []) else ''}.")
 
 
 def _fetch_income_history(start_ms, end_ms):
@@ -5517,38 +5591,61 @@ body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     background-color: #111111;
     color: #FFFFFF;
-    padding-top: 50px; /* Add padding to body to prevent content from hiding behind fixed nav bar */
+    padding-top: 0; /* nav bar is sticky, content flows below it */
+    margin: 0;
 }
-/* --- NEW: Pinned Navigation Bar --- */
+/* --- Pinned Navigation Bar ---
+   Sticky (not fixed) so the page content always starts below it, however many
+   rows the links wrap into. Title on the left, links wrap on the right. */
 .nav-bar {
+    position: sticky;
+    top: 0;
+    z-index: 1000;
     display: flex;
-    justify-content: center;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 25px;
-    background-color: rgba(30, 30, 30, 0.9);
+    justify-content: space-between;
+    gap: 6px 20px;
+    padding: 8px 16px;
+    margin: -10px -10px 10px -10px; /* cancel the page root's 10px padding: edge to edge */
+    background-color: rgba(30, 30, 30, 0.95);
     backdrop-filter: blur(10px);
     border-bottom: 1px solid #00BFFF;
-    padding: 10px;
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    z-index: 1000;
+}
+.nav-bar .nav-title {
+    color: #FFFFFF !important;
+    font-size: 20px !important;
+    line-height: 1.2 !important;
+    letter-spacing: 0 !important;
+    margin: 0 !important;
+    white-space: nowrap;
+    text-align: left;
+}
+.nav-bar .nav-links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px 6px;
 }
 .nav-bar .nav-link {
     color: #FFFFFF;
     text-decoration: none;
     font-weight: bold;
-    font-size: 16px;
-    transition: color 0.2s ease-in-out;
+    font-size: 14px;
+    line-height: 1.2;
+    white-space: nowrap;
+    padding: 5px 9px;
+    border-radius: 4px;
+    transition: color 0.2s ease-in-out, background-color 0.2s ease-in-out;
 }
 .nav-bar .nav-link:hover {
     color: #00BFFF;
+    background-color: rgba(0, 191, 255, 0.12);
 }
-.nav-bar h2 {
-    color: #FFFFFF !important;
-    position: absolute;
-    left: 20px;
+@media (max-width: 1100px) {
+    .nav-bar { justify-content: center; }
+    .nav-bar .nav-links { justify-content: center; }
 }
 h1, h2, h3, h4 {
     color: #00BFFF;
@@ -5631,6 +5728,15 @@ h1, h2, h3, h4 {
 }
 .custom-input .Select-placeholder, .custom-input .Select-value-label {
     color: #ccc !important;
+}
+/* --- Radio / checklist option labels ---
+   Dash renders options with a light-theme default text colour (dark navy),
+   which is unreadable on this dark UI. Force light text everywhere. */
+.dash-options-list-option,
+.dash-options-list-option label,
+.dash-options-list-option-wrapper,
+.custom-checklist label {
+    color: #e6e6e6 !important;
 }
 /* --- Global form control consistency: dark background, light text --- */
 #react-entry-point input,
@@ -5775,8 +5881,11 @@ input[id*="date"], input[id*="Date"] {
     color: #000 !important;
 }
     """
-    with open("assets/style.css", "w") as f:
-        f.write(style_css_content)
+    # assets/style.css (tracked in git) is the source of truth; only write this
+    # built-in copy if the file is missing, so CSS edits are not overwritten.
+    if not os.path.exists("assets/style.css"):
+        with open("assets/style.css", "w") as f:
+            f.write(style_css_content)
 
     scripts_js_content = """
     window.dash_clientside = Object.assign({}, window.dash_clientside, {
@@ -5797,8 +5906,9 @@ input[id*="date"], input[id*="Date"] {
         }
     });
     """
-    with open("assets/scripts.js", "w") as f:
-        f.write(scripts_js_content)
+    if not os.path.exists("assets/scripts.js"):
+        with open("assets/scripts.js", "w") as f:
+            f.write(scripts_js_content)
 
     config = {}
     try:

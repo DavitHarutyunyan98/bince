@@ -4,38 +4,61 @@ body {
     font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
     background-color: #111111;
     color: #FFFFFF;
-    padding-top: 50px; /* Add padding to body to prevent content from hiding behind fixed nav bar */
+    padding-top: 0; /* nav bar is sticky, content flows below it */
+    margin: 0;
 }
-/* --- NEW: Pinned Navigation Bar --- */
+/* --- Pinned Navigation Bar ---
+   Sticky (not fixed) so the page content always starts below it, however many
+   rows the links wrap into. Title on the left, links wrap on the right. */
 .nav-bar {
+    position: sticky;
+    top: 0;
+    z-index: 1000;
     display: flex;
-    justify-content: center;
+    flex-wrap: wrap;
     align-items: center;
-    gap: 25px;
-    background-color: rgba(30, 30, 30, 0.9);
+    justify-content: space-between;
+    gap: 6px 20px;
+    padding: 8px 16px;
+    margin: -10px -10px 10px -10px; /* cancel the page root's 10px padding: edge to edge */
+    background-color: rgba(30, 30, 30, 0.95);
     backdrop-filter: blur(10px);
     border-bottom: 1px solid #00BFFF;
-    padding: 10px;
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100%;
-    z-index: 1000;
+}
+.nav-bar .nav-title {
+    color: #FFFFFF !important;
+    font-size: 20px !important;
+    line-height: 1.2 !important;
+    letter-spacing: 0 !important;
+    margin: 0 !important;
+    white-space: nowrap;
+    text-align: left;
+}
+.nav-bar .nav-links {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 4px 6px;
 }
 .nav-bar .nav-link {
     color: #FFFFFF;
     text-decoration: none;
     font-weight: bold;
-    font-size: 16px;
-    transition: color 0.2s ease-in-out;
+    font-size: 14px;
+    line-height: 1.2;
+    white-space: nowrap;
+    padding: 5px 9px;
+    border-radius: 4px;
+    transition: color 0.2s ease-in-out, background-color 0.2s ease-in-out;
 }
 .nav-bar .nav-link:hover {
     color: #00BFFF;
+    background-color: rgba(0, 191, 255, 0.12);
 }
-.nav-bar h2 {
-    color: #FFFFFF !important;
-    position: absolute;
-    left: 20px;
+@media (max-width: 1100px) {
+    .nav-bar { justify-content: center; }
+    .nav-bar .nav-links { justify-content: center; }
 }
 h1, h2, h3, h4 {
     color: #00BFFF;
@@ -118,6 +141,15 @@ h1, h2, h3, h4 {
 }
 .custom-input .Select-placeholder, .custom-input .Select-value-label {
     color: #ccc !important;
+}
+/* --- Radio / checklist option labels ---
+   Dash renders options with a light-theme default text colour (dark navy),
+   which is unreadable on this dark UI. Force light text everywhere. */
+.dash-options-list-option,
+.dash-options-list-option label,
+.dash-options-list-option-wrapper,
+.custom-checklist label {
+    color: #e6e6e6 !important;
 }
 /* --- Global form control consistency: dark background, light text --- */
 #react-entry-point input,
