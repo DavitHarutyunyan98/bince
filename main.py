@@ -2892,38 +2892,21 @@ def _coerce_trade_config_rows(rows):
 
 
 def build_add_to_config_bar():
-    """Controls under the Best-per-Pair table: tick rows, choose order variant
-    and sizing, then add them to trade_config.json."""
+    """Controls under the Best-per-Pair table: tick rows, then add them to
+    trade_config.json. Order type and sizing are NOT chosen here - they are
+    taken from the optimizer settings the results were produced with, so the
+    live bot trades exactly the way the backtest/optimization modelled it."""
     lbl = {'color': '#ccc', 'fontSize': '13px', 'display': 'block'}
     return html.Div([
-        html.Div([
-            html.Label("Order mode:", style=lbl),
-            dcc.Dropdown(id='add-cfg-order-mode', clearable=False, value='market',
-                         options=[{'label': 'Market', 'value': 'market'},
-                                  {'label': 'Limit + market fallback', 'value': 'limit_fallback'}],
-                         className='custom-input', style={'width': '210px'})]),
-        html.Div([html.Label("Limit wait (s):", style=lbl),
-                  dcc.Input(id='add-cfg-limit-wait', type='number', value=30, min=1,
-                            className='custom-input', style={'width': '80px'})]),
         html.Div([html.Label("Units USDT:", style=lbl),
                   dcc.Input(id='add-cfg-units', type='number', value=50, min=0,
                             className='custom-input', style={'width': '90px'})]),
         html.Div([html.Label("Leverage:", style=lbl),
                   dcc.Input(id='add-cfg-leverage', type='number', value=10, min=1,
                             className='custom-input', style={'width': '70px'})]),
-        html.Div([html.Label("Sizing:", style=lbl),
-                  dcc.Dropdown(id='add-cfg-sizing', clearable=False, value='fixed',
-                               options=[{'label': 'Fixed', 'value': 'fixed'},
-                                        {'label': 'Compound', 'value': 'compound'}],
-                               className='custom-input', style={'width': '120px'})]),
-        html.Div([html.Label("Timeframe:", style=lbl),
-                  dcc.Dropdown(id='add-cfg-timeframe', clearable=False, value='row',
-                               options=[{'label': 'From row', 'value': 'row'}] +
-                                       [{'label': t, 'value': t} for t in
-                                        ['1m', '5m', '15m', '30m', '1h', '4h', '1d']],
-                               className='custom-input', style={'width': '110px'})]),
         html.Button("Add selected to Trade Config", id='add-selected-to-config-btn', n_clicks=0,
                     className='custom-button', style={'backgroundColor': '#28a745'}),
+        html.Div(id='add-cfg-info', style={'color': '#888', 'fontSize': '13px', 'flexBasis': '100%'}),
         html.Div(id='add-cfg-status', style={'color': '#ccc', 'fontSize': '13px', 'flexBasis': '100%'}),
     ], style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '10px 14px', 'alignItems': 'flex-end',
               'padding': '10px', 'margin': '0 0 15px 0', 'border': '1px solid #444',
@@ -4953,39 +4936,52 @@ def stop_optimization(n_clicks):
     return no_update
 
 
+def _order_mode_label(mode):
+    return 'Limit + market fallback' if mode == 'limit_fallback' else 'Market'
+
+
+@app.callback(
+    Output('add-cfg-info', 'children'),
+    [Input('opt-cost-order-mode', 'value'), Input('opt-sizing-mode', 'value')]
+)
+def show_add_cfg_info(order_mode, sizing):
+    return (f"Uses the optimizer settings: order type = {_order_mode_label(order_mode)}, "
+            f"sizing = {sizing or 'fixed'}, timeframe/strategy/params = from each row.")
+
+
 @app.callback(
     [Output('add-cfg-status', 'children'),
      Output('trade-config-table', 'data', allow_duplicate=True),
      Output('opt-results-table', 'selected_rows')],
     Input('add-selected-to-config-btn', 'n_clicks'),
     [State('opt-results-table', 'data'), State('opt-results-table', 'selected_rows'),
-     State('add-cfg-order-mode', 'value'), State('add-cfg-limit-wait', 'value'),
-     State('add-cfg-units', 'value'), State('add-cfg-leverage', 'value'),
-     State('add-cfg-sizing', 'value'), State('add-cfg-timeframe', 'value')],
+     State('opt-cost-order-mode', 'value'), State('opt-sizing-mode', 'value'),
+     State('add-cfg-units', 'value'), State('add-cfg-leverage', 'value')],
     prevent_initial_call=True
 )
-def add_selected_to_trade_config(n_clicks, data, selected, order_mode, limit_wait, units,
-                                 leverage, sizing, timeframe):
+def add_selected_to_trade_config(n_clicks, data, selected, order_mode, sizing, units, leverage):
     if not n_clicks:
         return no_update, no_update, no_update
     if not data or not selected:
         return "Tick at least one row first.", no_update, no_update
+    order_mode = order_mode or 'market'
     try:
-        new = [_opt_row_to_trade_config(data[i], order_mode, limit_wait, units, leverage,
-                                        sizing, timeframe)
+        # limit_wait_seconds is a live-bot detail with no backtest equivalent;
+        # keep the bot default (30 s).
+        new = [_opt_row_to_trade_config(data[i], order_mode, 30, units, leverage, sizing, 'row')
                for i in selected if 0 <= i < len(data) and data[i].get('Trading_Pair')]
         existing = _load_trade_config_rows()
         new_syms = {c['symbol'] for c in new}
         replaced = [c.get('symbol') for c in existing if str(c.get('symbol', '')).upper() in new_syms]
         merged = [c for c in existing if str(c.get('symbol', '')).upper() not in new_syms]
-        # Later ticks win if the same symbol was selected twice.
         merged += list({c['symbol']: c for c in new}.values())
         merged = _coerce_trade_config_rows(merged)
         with open('trade_config.json', 'w') as f:
             json.dump(merged, f, indent=4)
     except Exception as e:
         return f"❌ Failed to update trade_config.json: {e}", no_update, no_update
-    msg = (f"✅ Added {len(new_syms)} pair(s) ({order_mode}) to trade_config.json: "
+    msg = (f"✅ Added {len(new_syms)} pair(s) to trade_config.json "
+           f"(order type: {_order_mode_label(order_mode)}, sizing: {sizing or 'fixed'}): "
            f"{', '.join(sorted(new_syms))}")
     if replaced:
         msg += f" — replaced existing: {', '.join(replaced)}"
