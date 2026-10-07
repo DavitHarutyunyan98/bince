@@ -2891,6 +2891,77 @@ def _coerce_trade_config_rows(rows):
     return out
 
 
+def build_add_to_config_bar():
+    """Controls under the Best-per-Pair table: tick rows, choose order variant
+    and sizing, then add them to trade_config.json."""
+    lbl = {'color': '#ccc', 'fontSize': '13px', 'display': 'block'}
+    return html.Div([
+        html.Div([
+            html.Label("Order mode:", style=lbl),
+            dcc.Dropdown(id='add-cfg-order-mode', clearable=False, value='market',
+                         options=[{'label': 'Market', 'value': 'market'},
+                                  {'label': 'Limit + market fallback', 'value': 'limit_fallback'}],
+                         className='custom-input', style={'width': '210px'})]),
+        html.Div([html.Label("Limit wait (s):", style=lbl),
+                  dcc.Input(id='add-cfg-limit-wait', type='number', value=30, min=1,
+                            className='custom-input', style={'width': '80px'})]),
+        html.Div([html.Label("Units USDT:", style=lbl),
+                  dcc.Input(id='add-cfg-units', type='number', value=50, min=0,
+                            className='custom-input', style={'width': '90px'})]),
+        html.Div([html.Label("Leverage:", style=lbl),
+                  dcc.Input(id='add-cfg-leverage', type='number', value=10, min=1,
+                            className='custom-input', style={'width': '70px'})]),
+        html.Div([html.Label("Sizing:", style=lbl),
+                  dcc.Dropdown(id='add-cfg-sizing', clearable=False, value='fixed',
+                               options=[{'label': 'Fixed', 'value': 'fixed'},
+                                        {'label': 'Compound', 'value': 'compound'}],
+                               className='custom-input', style={'width': '120px'})]),
+        html.Div([html.Label("Timeframe:", style=lbl),
+                  dcc.Dropdown(id='add-cfg-timeframe', clearable=False, value='row',
+                               options=[{'label': 'From row', 'value': 'row'}] +
+                                       [{'label': t, 'value': t} for t in
+                                        ['1m', '5m', '15m', '30m', '1h', '4h', '1d']],
+                               className='custom-input', style={'width': '110px'})]),
+        html.Button("Add selected to Trade Config", id='add-selected-to-config-btn', n_clicks=0,
+                    className='custom-button', style={'backgroundColor': '#28a745'}),
+        html.Div(id='add-cfg-status', style={'color': '#ccc', 'fontSize': '13px', 'flexBasis': '100%'}),
+    ], style={'display': 'flex', 'flexWrap': 'wrap', 'gap': '10px 14px', 'alignItems': 'flex-end',
+              'padding': '10px', 'margin': '0 0 15px 0', 'border': '1px solid #444',
+              'borderRadius': '6px'})
+
+
+def _opt_row_to_trade_config(row, order_mode, limit_wait, units, leverage, sizing, timeframe):
+    """One Best-per-Pair row -> trade_config entry (strategy + its params + order variant)."""
+    strategy_name = row.get('Strategy')
+    scls = STRATEGY_REGISTRY.get(strategy_name) if strategy_name else None
+    if scls is None:
+        best = 0
+        for sname, c in STRATEGY_REGISTRY.items():
+            n = sum(1 for k in c.get_parameters()
+                    if row.get(_result_col(k)) not in (None, ''))
+            if n > best:
+                best, strategy_name, scls = n, sname, c
+    if scls is None:
+        strategy_name, scls = 'Candlestick Patterns', STRATEGY_REGISTRY['Candlestick Patterns']
+    tf = row.get('Timeframe') if timeframe in (None, 'row') else timeframe
+    cfg = {
+        'enabled': True, 'strategy_name': strategy_name,
+        'symbol': str(row['Trading_Pair']).upper(), 'bar_length': tf or '15m',
+        'units_usdt': float(units or 0), 'leverage': int(leverage or 1),
+        'sizing_mode': sizing or 'fixed', 'order_mode': order_mode or 'market',
+        'limit_wait_seconds': max(int(limit_wait or 30), 1),
+    }
+    for k, spec in scls.get_parameters().items():
+        val = row.get(_result_col(k))
+        if val in (None, ''):
+            continue
+        try:
+            cfg[k] = int(round(float(val))) if spec.get('step', 1) == 1 else float(val)
+        except (TypeError, ValueError):
+            cfg[k] = val
+    return cfg
+
+
 def build_trade_config_editor_panel():
     """Edit trade_config.json in-place: change any pair's parameters, add a new
     pair, delete pairs (row trash icon), then save back to the file the live
@@ -3267,6 +3338,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
                                      html.Div(
                                          dash_table.DataTable(
                                              id='opt-results-table',
+                                             row_selectable='multi', selected_rows=[],
                                              sort_action='native', page_size=15, filter_action='native',
                                              style_cell={'backgroundColor': '#2c2c2c', 'color': '#f0f0f0',
                                                          'border': '1px solid #444'},
@@ -3285,6 +3357,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
                                          ),
                                          className='dash-table-container'),
                                      export_info={'button_id': 'export-opt-results-btn'}),
+        build_add_to_config_bar(),
         create_collapsible_container("Segment Metrics (per date split)", "opt-segment-tables-panel",
                                      html.Div(id='opt-segment-tables')),
         build_param_heatmap_panel(),
@@ -4878,6 +4951,56 @@ def stop_optimization(n_clicks):
             "!! STOP request received. Finishing current trials...")
         return ['stopped']
     return no_update
+
+
+@app.callback(
+    [Output('add-cfg-status', 'children'),
+     Output('trade-config-table', 'data', allow_duplicate=True),
+     Output('opt-results-table', 'selected_rows')],
+    Input('add-selected-to-config-btn', 'n_clicks'),
+    [State('opt-results-table', 'data'), State('opt-results-table', 'selected_rows'),
+     State('add-cfg-order-mode', 'value'), State('add-cfg-limit-wait', 'value'),
+     State('add-cfg-units', 'value'), State('add-cfg-leverage', 'value'),
+     State('add-cfg-sizing', 'value'), State('add-cfg-timeframe', 'value')],
+    prevent_initial_call=True
+)
+def add_selected_to_trade_config(n_clicks, data, selected, order_mode, limit_wait, units,
+                                 leverage, sizing, timeframe):
+    if not n_clicks:
+        return no_update, no_update, no_update
+    if not data or not selected:
+        return "Tick at least one row first.", no_update, no_update
+    try:
+        new = [_opt_row_to_trade_config(data[i], order_mode, limit_wait, units, leverage,
+                                        sizing, timeframe)
+               for i in selected if 0 <= i < len(data) and data[i].get('Trading_Pair')]
+        existing = _load_trade_config_rows()
+        new_syms = {c['symbol'] for c in new}
+        replaced = [c.get('symbol') for c in existing if str(c.get('symbol', '')).upper() in new_syms]
+        merged = [c for c in existing if str(c.get('symbol', '')).upper() not in new_syms]
+        # Later ticks win if the same symbol was selected twice.
+        merged += list({c['symbol']: c for c in new}.values())
+        merged = _coerce_trade_config_rows(merged)
+        with open('trade_config.json', 'w') as f:
+            json.dump(merged, f, indent=4)
+    except Exception as e:
+        return f"❌ Failed to update trade_config.json: {e}", no_update, no_update
+    msg = (f"✅ Added {len(new_syms)} pair(s) ({order_mode}) to trade_config.json: "
+           f"{', '.join(sorted(new_syms))}")
+    if replaced:
+        msg += f" — replaced existing: {', '.join(replaced)}"
+    msg += ". Restart hybrid_trader.py to apply."
+    return msg, merged, []
+
+
+@app.callback(
+    Output('opt-results-table', 'selected_rows', allow_duplicate=True),
+    Input('opt-results-table', 'data'),
+    prevent_initial_call=True
+)
+def reset_opt_selection(_data):
+    # Row indices point into `data`; a new result set invalidates them.
+    return []
 
 
 @app.callback(
