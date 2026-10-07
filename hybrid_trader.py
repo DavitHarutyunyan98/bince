@@ -14,7 +14,8 @@ import numpy as np
 from datetime import datetime, timezone, timedelta
 
 from binance.client import Client
-from strategy_utils import STRATEGY_REGISTRY
+import html
+from strategy_utils import STRATEGY_REGISTRY, describe_signal_state
 
 # Persisted per-symbol realized PnL for compounding. To mirror the backtester
 # (which sizes every trade off that one symbol's running realized equity), each
@@ -513,6 +514,37 @@ class HybridSymbolTrader:
             logger.warning(f"[{self.symbol}] Could not read fills ({e}); using polled price.")
             return self.current_price, 0.0, 0.0, None
 
+    def next_signal_lines(self):
+        """Current indicator state + what triggers this pair's next signal."""
+        try:
+            return describe_signal_state(self.prepared_data, self.strategy_params,
+                                         self.position, self.entry_price)
+        except Exception as e:
+            return [f"(could not describe next signal: {e})"]
+
+    def next_signal_block(self, title="Next signal"):
+        """HTML-safe Telegram block with the next-signal conditions."""
+        lines = "\n".join(f"• {html.escape(l)}" for l in self.next_signal_lines())
+        return f"\n\n<b>{title}:</b>\n{lines}"
+
+    def startup_summary(self):
+        """HTML-safe per-pair block for the startup message."""
+        e = html.escape
+        cfg = self.trade_config
+        pos = {1: "🟢 LONG", -1: "🔴 SHORT"}.get(self.position, "⚪ FLAT")
+        pos_txt = pos
+        if self.position != 0 and self.entry_price:
+            pos_txt += (f" @ {self.entry_price:.{self.price_precision}f}"
+                        f" ({self.get_position_notional_usdt():.2f} USDT)")
+        params = ", ".join(f"{k}={v}" for k, v in self.strategy_params.items()
+                           if v not in (None, ''))
+        order = self.order_mode + (f" ({self.limit_wait_seconds}s)" if self.order_mode == 'limit_fallback' else "")
+        return (f"<b>{e(self.symbol)}</b> — {pos_txt}\n"
+                f"Strategy: <code>{e(str(cfg.get('strategy_name')))}</code> · {e(self.bar_length)} · "
+                f"{self.units_usdt:g} USDT x{self.leverage} · {e(self.sizing_mode)} · order: {e(order)}\n"
+                f"Params: <code>{e(params) or '-'}</code>"
+                + self.next_signal_block())
+
     def _round_to_tick(self, price):
         tick = getattr(self, 'tick_size', 0) or 0
         if tick > 0:
@@ -623,6 +655,7 @@ class HybridSymbolTrader:
                 f"(<code>{quantity * self.current_price:.2f} USDT</code>)\n"
                 f"<b>Sizing:</b> <code>{self.sizing_mode}</code>\n"
                 f"<b>Method:</b> <code>REST API Polling</code>"
+                + self.next_signal_block("Exit / flip conditions")
             )
 
             logger.info(
@@ -687,7 +720,8 @@ class HybridSymbolTrader:
                 f"<b>Exit Price:</b> <code>{exit_price:.{self.price_precision}f}</code>\n"
                 f"<b>Net PnL:</b> <code>{pnl:+.2f} USDT</code> "
                 f"(realized {realized:+.2f}, fees {fees:.2f})\n"
-                f"<b>Reason:</b> <code>{reason}</code>"
+                f"<b>Reason:</b> <code>{html.escape(reason)}</code>"
+                + self.next_signal_block("Next entry conditions")
             )
 
             logger.info(
@@ -938,6 +972,7 @@ class HybridSymbolTrader:
                             f"<b>Sizing:</b> <code>{self.sizing_mode}</code>\n"
                             f"<b>Order:</b> <code>{how}</code>\n"
                             f"<b>Attempt:</b> <code>{attempt + 1}/{max_retries}</code>"
+                            + self.next_signal_block("Exit / flip conditions")
                         )
 
                         logger.info(f"[{self.symbol}] ✅ {pos_type} position opened successfully at {self.entry_price:.{self.price_precision}f}")
@@ -1011,23 +1046,26 @@ class HybridTraderManager:
         logger.info("HYBRID TRADING SESSION STARTED")
         logger.info(f"Log File: {os.path.basename(self.log_file_path)}")
 
-        enabled_symbols = [config['symbol'] for config in self.trade_configs]
-
-        startup_message = (
-            f"[HYBRID] <b>Multi-Symbol Trader Started</b>\n\n"
-            f"<b>Method:</b> <code>REST API Polling</code>\n"
-            f"<b>Symbols:</b> <code>{', '.join(enabled_symbols)}</code>\n"
-            f"<b>Total Pairs:</b> <code>{len(enabled_symbols)}</code>\n\n"
-            f"[BOT] Bot is now monitoring via REST API polling..."
-        )
-        self.send_telegram_notification(startup_message)
-
         # Initialize traders
         for config in self.trade_configs:
             symbol = config["symbol"]
             self.traders[symbol] = HybridSymbolTrader(
                 config, self.client, self.send_telegram_notification)
             self.traders[symbol].initialize()
+
+        # Detailed startup message: account, every pair's setup, current
+        # position and the conditions for its next signal.
+        balance = self._futures_balance()
+        active = sum(1 for t in self.traders.values() if t.position != 0)
+        header = (
+            f"🚀 <b>Hybrid Trader Started</b>\n"
+            f"<b>Time:</b> {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
+            f"<b>Futures balance:</b> <code>{balance:.2f} USDT</code>\n"
+            f"<b>Pairs:</b> {len(self.traders)} · <b>Open positions:</b> {active}\n"
+            f"<b>Method:</b> REST API polling"
+        )
+        blocks = [t.startup_summary() for t in self.traders.values()]
+        self.send_telegram_notification(header + "\n\n" + "\n\n".join(blocks))
 
         # Start polling threads
         threads = []
@@ -1122,8 +1160,9 @@ class HybridTraderManager:
                     f"{status_icon} {symbol}: {position_type} | Signal: {signal:+.1f} | "
                     f"Size: {notional_usdt:.2f} USDT | "
                     f"PnL: {unrealized_pnl:+.2f} | Trades: {trader.session_trades}{fix_info}{miss_info}\n"
-                    f"└─ Strategy: {trader.trade_config.get('strategy_name', 'Unknown')} | "
-                    f"Params: {params_str}"
+                    f"└─ Strategy: {html.escape(str(trader.trade_config.get('strategy_name', 'Unknown')))} | "
+                    f"Params: {html.escape(params_str)}"
+                    + "".join(f"\n   ↳ {html.escape(l)}" for l in trader.next_signal_lines())
                 )
 
                 pair_reports.append(pair_report)
@@ -1177,23 +1216,54 @@ class HybridTraderManager:
         """Send immediate status report."""
         self._send_report()  # CHANGED: Updated method call
 
+    def _futures_balance(self):
+        try:
+            for b in self.client.futures_account_balance():
+                if b.get('asset') == 'USDT':
+                    return float(b.get('balance', 0.0))
+        except Exception as e:
+            logger.warning(f"[BOT] Could not fetch futures balance: {e}")
+        return 0.0
+
+    @staticmethod
+    def _split_message(message, limit=3900):
+        """Split on line boundaries so each part fits Telegram's 4096-char limit
+        (HTML tags never span lines here, so parts stay valid HTML)."""
+        parts, cur = [], ""
+        for line in message.split("\n"):
+            while len(line) > limit:  # pathological single long line
+                if cur:
+                    parts.append(cur)
+                    cur = ""
+                parts.append(line[:limit])
+                line = line[limit:]
+            if len(cur) + len(line) + 1 > limit:
+                parts.append(cur)
+                cur = line
+            else:
+                cur = f"{cur}\n{line}" if cur else line
+        if cur:
+            parts.append(cur)
+        return parts
+
     def send_telegram_notification(self, message):
-        """Send Telegram notification."""
+        """Send Telegram notification (auto-split if longer than Telegram allows)."""
         if not self.telegram_bot_token or not self.telegram_chat_id:
             return
 
         try:
             import requests
             url = f"https://api.telegram.org/bot{self.telegram_bot_token}/sendMessage"
-            payload = {
-                'chat_id': self.telegram_chat_id,
-                'text': message,
-                'parse_mode': 'HTML'  # Changed to HTML for better formatting
-            }
-            response = requests.post(url, json=payload, timeout=10)
-            if response.status_code != 200:
-                logger.warning(
-                    f"Telegram API returned status {response.status_code}")
+            for part in self._split_message(message):
+                payload = {
+                    'chat_id': self.telegram_chat_id,
+                    'text': part,
+                    'parse_mode': 'HTML'  # Changed to HTML for better formatting
+                }
+                response = requests.post(url, json=payload, timeout=10)
+                if response.status_code != 200:
+                    logger.warning(
+                        f"Telegram API returned status {response.status_code}: {response.text[:200]}")
         except Exception as e:
             logger.error(f"Telegram notification failed: {e}")
 

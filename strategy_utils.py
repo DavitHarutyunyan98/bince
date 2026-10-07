@@ -1282,6 +1282,142 @@ STRATEGY_REGISTRY = {
 # ==============================================================================
 #  4. BACKTESTER CLASS (fixed initial-capital sizing, no compounding)
 # ==============================================================================
+def _fmt_px(x):
+    """Readable price with enough significant digits for low-priced alts."""
+    try:
+        x = float(x)
+    except (TypeError, ValueError):
+        return "n/a"
+    if x == 0 or np.isnan(x):
+        return "n/a"
+    a = abs(x)
+    digits = 2 if a >= 100 else 4 if a >= 1 else 6 if a >= 0.01 else 8
+    return f"{x:.{digits}f}"
+
+
+def _pct_away(target, close):
+    try:
+        return (float(target) / float(close) - 1.0) * 100.0
+    except (TypeError, ValueError, ZeroDivisionError):
+        return float('nan')
+
+
+def describe_signal_state(df, params, position=0, entry_price=0.0):
+    """Human-readable lines: current indicator state and what triggers the NEXT
+    signal, for any strategy. Works off the indicator columns each strategy
+    writes (MA lines, Bollinger bands, RSI, funding z, pattern trendlines,
+    candlestick pattern counts, SuperTrend trend), plus regime context and the
+    position's exit bands."""
+    if df is None or len(df) == 0:
+        return ["Warming up — not enough candles yet."]
+    params = params or {}
+    cols = set(df.columns)
+    last = df.iloc[-1]
+    close = float(last['Close'])
+    lines = []
+
+    def val(c):
+        v = last.get(c) if hasattr(last, 'get') else None
+        try:
+            v = float(v)
+            return None if np.isnan(v) else v
+        except (TypeError, ValueError):
+            return None
+
+    # --- regime context + which parameter suffix is active
+    suffix = None
+    keys = list(params.keys())
+    tm = val('trend_ma') if 'trend_ma' in cols else None
+    if tm is not None:
+        reg = 'bull' if close > tm else 'bear'
+        lines.append(f"Regime: {'BULL' if reg == 'bull' else 'BEAR'} (close {_fmt_px(close)} vs trend MA {_fmt_px(tm)})")
+        if any(k.endswith('_bull') for k in keys):
+            suffix = reg
+    fg = val('fng') if 'fng' in cols else None
+    if fg is not None:
+        reg = 'fear' if fg < 30 else 'neutral' if fg < 60 else 'greed'
+        lines.append(f"Fear & Greed: {fg:.0f} ({reg.upper()})")
+        if any(k.endswith('_fear') for k in keys):
+            suffix = reg
+
+    def p(base, default=None):
+        v = params.get(f"{base}_{suffix}") if suffix else None
+        if v in (None, ''):
+            v = params.get(base, default)
+        return default if v in (None, '') else v
+
+    # --- strategy-specific "next signal" conditions
+    if {'fast_ma', 'middle_ma', 'slow_ma'} <= cols and val('fast_ma') is not None:
+        f, m, sl = val('fast_ma'), val('middle_ma'), val('slow_ma')
+        if f is not None and m is not None and sl is not None:
+            state = ('bullish stack (fast>mid>slow)' if f > m > sl else
+                     'bearish stack (fast<mid<slow)' if f < m < sl else 'mixed (no stack)')
+            lines.append(f"MA fast {_fmt_px(f)} | mid {_fmt_px(m)} | slow {_fmt_px(sl)} → {state}")
+            lines.append("LONG when fast > mid > slow · SHORT when fast < mid < slow")
+    elif 'bb_upper' in cols and val('bb_upper') is not None:
+        u, lo, mid = val('bb_upper'), val('bb_lower'), val('bb_middle')
+        lines.append(f"Bands: lower {_fmt_px(lo)} | mid {_fmt_px(mid)} | upper {_fmt_px(u)} (close {_fmt_px(close)})")
+        lines.append(f"LONG when close ≤ {_fmt_px(lo)} ({_pct_away(lo, close):+.2f}%) · "
+                     f"SHORT when close ≥ {_fmt_px(u)} ({_pct_away(u, close):+.2f}%)")
+        if position != 0 and mid is not None:
+            lines.append(f"Exit to flat when close returns to middle {_fmt_px(mid)}")
+    elif 'RSI' in cols and val('RSI') is not None:
+        lines.append(f"RSI {val('RSI'):.1f} → LONG when < {p('oversold_threshold', 30)} · "
+                     f"SHORT when > {p('overbought_threshold', 70)}")
+    elif 'funding_z' in cols:
+        z = val('funding_z')
+        ez, xz = float(p('entry_z', 2.0)), float(p('exit_z', 0.5))
+        fr = val('funding')
+        lines.append(f"Funding {fr * 100:.4f}% · z-score {z:+.2f}" if (z is not None and fr is not None)
+                     else "Funding z-score not available yet")
+        lines.append(f"SHORT when z ≥ {ez:+.2f} · LONG when z ≤ {-ez:+.2f}"
+                     + (f" · exit when |z| < {xz:.2f}" if position != 0 else ""))
+    elif 'pattern_resistance' in cols:
+        r, sp = val('pattern_resistance'), val('pattern_support')
+        if r is None or sp is None:
+            lines.append("No valid converging pattern right now — waiting for enough swing points.")
+        else:
+            lines.append(f"Resistance {_fmt_px(r)} ({_pct_away(r, close):+.2f}%) · "
+                         f"Support {_fmt_px(sp)} ({_pct_away(sp, close):+.2f}%)")
+            lines.append(f"LONG on close above {_fmt_px(r)} · SHORT on close below {_fmt_px(sp)}")
+    elif 'ThreeWhiteSoldiers' in cols:
+        bw, bl = int(float(p('buy_signal_window', 5))), int(float(p('buy_pattern_lookback', 1)))
+        sw, sl2 = int(float(p('sell_signal_window', 5))), int(float(p('sell_pattern_lookback', 1)))
+        tws = int(df['ThreeWhiteSoldiers'].tail(bw).sum())
+        tbc = int(df['ThreeBlackCrows'].tail(sw).sum())
+        lines.append(f"LONG when ≥ {bl} White-Soldiers in last {bw} candles (now {tws})")
+        lines.append(f"SHORT when ≥ {sl2} Black-Crows in last {sw} candles (now {tbc})")
+    elif 'trend' in cols:
+        t = val('trend')
+        lines.append(f"SuperTrend direction: {'UP' if (t or 0) > 0 else 'DOWN'} — position flips when it reverses")
+    elif 'pivot_lookback' in params:
+        lines.append(f"Waiting for a double top/bottom: two swings within {p('tolerance_percent', 3)}% "
+                     f"(pivot {p('pivot_lookback', 5)}), then a neckline breakout")
+    else:
+        lines.append("Waiting for the strategy's next entry condition.")
+
+    # --- exit bands of the open position
+    if position != 0 and entry_price and entry_price > 0:
+        em, ep = p('exit_minus_percent'), p('exit_plus_percent')
+        band = []
+        try:
+            if em not in (None, ''):
+                band.append(f"close ≤ {_fmt_px(entry_price * (1 - float(em) / 100))} (−{float(em)}%)")
+            if ep not in (None, ''):
+                band.append(f"close ≥ {_fmt_px(entry_price * (1 + float(ep) / 100))} (+{float(ep)}%)")
+        except (TypeError, ValueError):
+            band = []
+        if band:
+            lines.append("Exit band (from entry " + _fmt_px(entry_price) + "): " + " or ".join(band))
+
+    try:
+        sig = int(last.get('position', 0))
+        lines.append(f"Strategy signal now: {'LONG' if sig == 1 else 'SHORT' if sig == -1 else 'FLAT'}")
+    except (TypeError, ValueError):
+        pass
+    return lines
+
+
 # Global cost model applied by every Backtester unless overridden per instance.
 # Set from the dashboard's "Cost Model" inputs so backtests and optimizations
 # reflect real trading costs, not just exchange fees.
