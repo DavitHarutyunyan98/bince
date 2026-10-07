@@ -16,7 +16,7 @@ import re
 import telegram
 import asyncio
 from dash.dependencies import Input, Output, State, ALL, MATCH
-from strategy_utils import Backtester, STRATEGY_REGISTRY, CandlestickStrategy, SuperTrendStrategy
+from strategy_utils import Backtester, STRATEGY_REGISTRY, CandlestickStrategy, SuperTrendStrategy, set_cost_model, COST_MODEL
 import optuna
 import threading
 import time
@@ -1176,6 +1176,9 @@ class FuturesTrader:
                                        n_trials, weights, is_start_date, is_end_date, oos1_start_date, oos1_end_date, oos2_start_date, oos2_end_date,
                                        stop_event, pause_event, strategy_name=None):
         """Runs an Optuna study for a single trading pair with IS/OOS and returns all trial results."""
+        # Apply the dashboard's cost model inside the worker process too.
+        set_cost_model(getattr(self, 'slippage_percent', COST_MODEL['slippage_percent']),
+                       getattr(self, 'charge_funding', COST_MODEL['charge_funding']))
         # Use specified strategy or fallback to dynamic selection
         if strategy_name:
             strategy_class = STRATEGY_REGISTRY.get(strategy_name)
@@ -1743,6 +1746,9 @@ class FuturesTrader:
                                       n_trials, weights, is_start_date, is_end_date, oos1_start_date, oos1_end_date, oos2_start_date, oos2_end_date,
                                       stop_event, pause_event, strategy_name=None):
         """Runs smart Bayesian optimization using TPE sampler."""
+        # Apply the dashboard's cost model inside the worker process too.
+        set_cost_model(getattr(self, 'slippage_percent', COST_MODEL['slippage_percent']),
+                       getattr(self, 'charge_funding', COST_MODEL['charge_funding']))
         add_optimization_log(f"🧠 Running SMART optimization for {symbol}")
         
         # Use specified strategy or fallback to dynamic selection
@@ -2349,7 +2355,18 @@ def build_config_panel():
                     html.Div([html.Label('Number of Date Splits:'),
                               dcc.Input(id='num-splits-input', value=4, type='number', min=1, max=50, step=1,
                                         className='custom-input')], className='flex-item'),
-                ], className='flex-container')
+                ], className='flex-container'),
+                html.Div([
+                    html.Div([html.Label('Slippage % per side (all backtests & optimizer):'),
+                              dcc.Input(id='cost-slippage-input', value=0.05, type='number', min=0, step=0.01,
+                                        className='custom-input')], className='flex-item'),
+                    html.Div([dcc.Checklist(id='cost-funding-check',
+                                            options=[{'label': ' Charge funding (from Binance funding history)',
+                                                      'value': 'on'}],
+                                            value=['on'], className='custom-checklist')],
+                             className='flex-item'),
+                    html.Div(id='cost-model-status', style={'fontSize': '12px', 'color': '#888'}),
+                ], className='flex-container', style={'marginTop': '8px'}),
             ], className='control-panel-group'),
             html.Div([
                 dcc.Checklist(id='live-update-checklist',
@@ -2970,6 +2987,35 @@ def run_cross_sectional_momentum(closes_df, lookback, rebalance_every, top_k,
     return equity_df, stats, holdings
 
 
+def build_reconciliation_panel():
+    """Live account reconciliation: what you REALLY made, split into price PnL,
+    trading fees and funding, per symbol — straight from Binance income history."""
+    today = datetime.now().date()
+    return create_collapsible_container("Live PnL Reconciliation (Binance)", "reconciliation", [
+        html.P("Pulls your futures income history and splits real results into realized price "
+               "PnL, commission (fees) and funding per symbol. Compare with the bot's logged PnL "
+               "and with a backtest over the same period.",
+               style={'fontSize': '13px', 'color': '#9aa'}),
+        html.Div([html.Label('Date Range:'),
+                  date_range_inputs('recon-date', today - timedelta(days=30), today)],
+                 className='flex-item'),
+        html.Button('Load Live Income', id='recon-run-btn', n_clicks=0,
+                    className='custom-button', style={'marginTop': '8px'}),
+        html.Div(id='recon-status', style={'margin': '8px 0', 'color': '#9aa', 'fontSize': '13px'}),
+        html.H4(id='recon-summary', style={'textAlign': 'center', 'color': '#4CAF50'}),
+        html.Div(dash_table.DataTable(
+            id='recon-table', sort_action='native', page_size=25,
+            style_cell={'backgroundColor': '#2c2c2c', 'color': '#f0f0f0',
+                        'border': '1px solid #444', 'textAlign': 'center'},
+            style_header={'backgroundColor': '#1c1c1c', 'fontWeight': 'bold'},
+            style_data_conditional=[
+                {'if': {'column_id': 'Net', 'filter_query': '{Net} > 0'}, 'color': '#4caf50', 'fontWeight': 'bold'},
+                {'if': {'column_id': 'Net', 'filter_query': '{Net} < 0'}, 'color': '#f44336', 'fontWeight': 'bold'},
+                {'if': {'filter_query': '{Symbol} = "TOTAL"'}, 'backgroundColor': '#1c1c1c', 'fontWeight': 'bold'},
+            ]), style={'overflowX': 'auto'}),
+    ])
+
+
 def build_portfolio_backtest_panel():
     """Cross-sectional momentum portfolio backtest — rank a universe of pairs and
     hold a long/short basket. Separate from the single-pair tools."""
@@ -3054,6 +3100,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
         html.H2("Futures Dashboard", style={'margin': '0', 'flex': '1'}),
         html.A('Manual Backtester', href='#manual-section', className='nav-link'),
         html.A('Trade Config', href='#trade-config-section', className='nav-link'),
+        html.A('Live PnL', href='#recon-section', className='nav-link'),
         html.A('Batch Backtest', href='#batch-section', className='nav-link'),
         html.A('Portfolio', href='#portfolio-section', className='nav-link'),
         html.A('Optimizer', href='#optimizer-section', className='nav-link'),
@@ -3070,6 +3117,7 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
         html.Div(build_config_panel(), id='manual-section'),
         html.Div(build_live_config_panel(), id='live-config-section'),
         html.Div(build_trade_config_editor_panel(), id='trade-config-section'),
+        html.Div(build_reconciliation_panel(), id='recon-section'),
         html.Div(build_batch_backtest_panel(), id='batch-section'),
         html.Div(build_portfolio_backtest_panel(), id='portfolio-section'),
         html.Div(build_optimizer_panel(), id='optimizer-section'),
@@ -5152,6 +5200,83 @@ def run_optimization_task(n_intervals, settings):
 
 @app.callback(Output('opt-log-textarea', 'value'), Input('log-update-interval', 'n_intervals'))
 def update_logs(n): return "\n".join(OPTIMIZATION_LOGS)
+
+
+@app.callback(
+    Output('cost-model-status', 'children'),
+    [Input('cost-slippage-input', 'value'), Input('cost-funding-check', 'value')],
+)
+def update_cost_model(slippage, funding):
+    """Apply the cost model to every backtest and optimization (incl. workers)."""
+    slip = float(slippage) if slippage not in (None, '') else 0.0
+    charge = 'on' in (funding or [])
+    set_cost_model(slip, charge)
+    if trader is not None:
+        trader.slippage_percent = slip
+        trader.charge_funding = charge
+    return (f"Cost model: fee 0.05%/side + slippage {slip:.3f}%/side"
+            f"{' + funding' if charge else ''} ≈ {0.1 + 2 * slip:.2f}% per round trip before funding.")
+
+
+def _fetch_income_history(start_ms, end_ms):
+    """All futures income records in [start_ms, end_ms], paginated."""
+    rows, cur = [], start_ms
+    while cur < end_ms:
+        batch = trader.client.futures_income_history(startTime=cur, endTime=end_ms, limit=1000)
+        if not batch:
+            break
+        rows.extend(batch)
+        last = int(batch[-1]['time'])
+        if len(batch) < 1000 or last <= cur:
+            break
+        cur = last + 1
+    return rows
+
+
+@app.callback(
+    [Output('recon-table', 'data'), Output('recon-table', 'columns'),
+     Output('recon-summary', 'children'), Output('recon-status', 'children')],
+    Input('recon-run-btn', 'n_clicks'),
+    [State('recon-date-start', 'value'), State('recon-date-end', 'value')],
+    prevent_initial_call=True,
+)
+def run_reconciliation(n_clicks, start, end):
+    if trader is None or trader.client is None:
+        return [], [], "", "Binance client unavailable."
+    try:
+        start_ms = int(pd.Timestamp(start, tz='UTC').timestamp() * 1000)
+        end_ms = int((pd.Timestamp(end, tz='UTC') + pd.Timedelta(days=1)).timestamp() * 1000)
+        rows = _fetch_income_history(start_ms, end_ms)
+    except Exception as e:
+        return [], [], "", f"❌ Could not load income history: {e}"
+    if not rows:
+        return [], [], "", "No income records in this period."
+
+    df = pd.DataFrame(rows)
+    df['income'] = pd.to_numeric(df['income'], errors='coerce').fillna(0.0)
+    df['symbol'] = df['symbol'].replace('', 'ACCOUNT')
+    out = []
+    for sym, g in df.groupby('symbol'):
+        by = g.groupby('incomeType')['income'].sum()
+        realized = float(by.get('REALIZED_PNL', 0.0))
+        fees = float(by.get('COMMISSION', 0.0))
+        funding = float(by.get('FUNDING_FEE', 0.0))
+        other = float(g['income'].sum()) - realized - fees - funding
+        closes = int((g['incomeType'] == 'REALIZED_PNL').sum())
+        out.append({'Symbol': sym, 'Closing Fills': closes,
+                    'Realized PnL': round(realized, 2), 'Fees': round(fees, 2),
+                    'Funding': round(funding, 2), 'Other': round(other, 2),
+                    'Net': round(realized + fees + funding + other, 2)})
+    out.sort(key=lambda r: r['Net'])
+    tot = {k: round(sum(r[k] for r in out), 2) for k in ['Realized PnL', 'Fees', 'Funding', 'Other', 'Net']}
+    tot.update({'Symbol': 'TOTAL', 'Closing Fills': sum(r['Closing Fills'] for r in out)})
+    out.append(tot)
+    cols = [{'name': c, 'id': c} for c in
+            ['Symbol', 'Closing Fills', 'Realized PnL', 'Fees', 'Funding', 'Other', 'Net']]
+    summary = (f"Net {tot['Net']:+.2f} USDT = realized {tot['Realized PnL']:+.2f} "
+               f"+ fees {tot['Fees']:+.2f} + funding {tot['Funding']:+.2f}"
+               f" + other {tot['Other']:+.2f}")
+    return out, cols, summary, f"Loaded {len(rows)} income records ({start} → {end})."
 
 
 @app.callback(

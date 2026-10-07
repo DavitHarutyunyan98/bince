@@ -469,6 +469,33 @@ class HybridSymbolTrader:
         self.position = desired_position
         logger.info(f"[{self.symbol}] Position updated to: {self.position}")
 
+    def _fill_info(self, order):
+        """Real execution details for a market order from Binance trade history:
+        (avg_fill_price, filled_qty, commission_usdt, realized_pnl). Falls back to
+        the last polled price with zero costs if the lookup fails."""
+        try:
+            order_id = order.get('orderId') if order else None
+            if not order_id:
+                raise ValueError("no orderId")
+            fills = []
+            for _ in range(3):  # fills can take a moment to appear
+                fills = self.client.futures_account_trades(symbol=self.symbol, orderId=order_id)
+                if fills:
+                    break
+                time.sleep(0.5)
+            if not fills:
+                raise ValueError("no fills")
+            qty = sum(float(f['qty']) for f in fills)
+            notional = sum(float(f['qty']) * float(f['price']) for f in fills)
+            avg_price = notional / qty if qty else self.current_price
+            commission = sum(float(f['commission']) for f in fills
+                             if f.get('commissionAsset', 'USDT') == 'USDT')
+            realized = sum(float(f.get('realizedPnl', 0)) for f in fills)
+            return avg_price, qty, commission, realized
+        except Exception as e:
+            logger.warning(f"[{self.symbol}] Could not read fills ({e}); using polled price.")
+            return self.current_price, 0.0, 0.0, None
+
     def _open_position(self, signal):
         """Open a new position."""
         try:
@@ -488,11 +515,17 @@ class HybridSymbolTrader:
                 quantity=quantity
             )
 
-            # Update position tracking immediately after order
+            # Use the REAL average fill price + entry commission.
+            signal_price = self.current_price
+            fill_price, _, open_fee, _ = self._fill_info(order)
             self.position = signal
-            self.entry_price = self.current_price
+            self.entry_price = fill_price
+            self.open_commission = open_fee
             self.position_start_time = datetime.now(timezone.utc)
             self.session_trades += 1
+            slip = (fill_price - signal_price) / signal_price * 100 * (1 if signal == 1 else -1) if signal_price else 0
+            logger.info(f"[{self.symbol}] Fill {fill_price:.{self.price_precision}f} vs signal "
+                        f"{signal_price:.{self.price_precision}f} (slippage {slip:+.3f}%), fee {open_fee:.4f} USDT")
 
             message = (
                 f"[HYBRID] <b>{pos_type} Position Opened</b>\n\n"
@@ -533,11 +566,25 @@ class HybridSymbolTrader:
                 quantity=position_size
             )
 
-            # Calculate PnL
+            # Paper PnL (old method: polled price, no costs) — kept for comparison.
             if self.position == 1:
-                pnl = (self.current_price - self.entry_price) * position_size
+                paper_pnl = (self.current_price - self.entry_price) * position_size
             else:
-                pnl = (self.entry_price - self.current_price) * position_size
+                paper_pnl = (self.entry_price - self.current_price) * position_size
+
+            # REAL PnL from Binance fills: realized price PnL minus both fees.
+            exit_price, _, close_fee, realized = self._fill_info(order)
+            if realized is None:  # fill lookup failed -> recompute from fill price
+                realized = ((exit_price - self.entry_price) if self.position == 1
+                            else (self.entry_price - exit_price)) * position_size
+            open_fee = getattr(self, 'open_commission', 0.0) or 0.0
+            fees = open_fee + close_fee
+            pnl = realized - fees
+            self.session_fees = getattr(self, 'session_fees', 0.0) + fees
+            logger.info(f"[{self.symbol}] Close fill {exit_price:.{self.price_precision}f} | "
+                        f"paper {paper_pnl:+.4f} | realized {realized:+.4f} | fees {fees:.4f} | "
+                        f"NET {pnl:+.4f} USDT")
+            self.open_commission = 0.0
 
             self.session_pnl += pnl
             # Accumulate realized PnL for compound sizing so the next entry is
@@ -551,8 +598,9 @@ class HybridSymbolTrader:
             message = (
                 f"[HYBRID] <b>{pos_type} Position Closed</b>\n\n"
                 f"<b>Symbol:</b> <code>{self.symbol}</code>\n"
-                f"<b>Exit Price:</b> <code>{self.current_price:.{self.price_precision}f}</code>\n"
-                f"<b>PnL:</b> <code>{pnl:+.2f} USDT</code>\n"
+                f"<b>Exit Price:</b> <code>{exit_price:.{self.price_precision}f}</code>\n"
+                f"<b>Net PnL:</b> <code>{pnl:+.2f} USDT</code> "
+                f"(realized {realized:+.2f}, fees {fees:.2f})\n"
                 f"<b>Reason:</b> <code>{reason}</code>"
             )
 
@@ -774,9 +822,15 @@ class HybridSymbolTrader:
 
                 # Verify the order was successful
                 if order and order.get('orderId'):
-                    # Update position tracking immediately after order
+                    # Use the REAL average fill price + entry commission.
+                    signal_price = self.current_price
+                    fill_price, _, open_fee, _ = self._fill_info(order)
                     self.position = signal
-                    self.entry_price = self.current_price
+                    self.entry_price = fill_price
+                    self.open_commission = open_fee
+                    slip = (fill_price - signal_price) / signal_price * 100 * (1 if signal == 1 else -1) if signal_price else 0
+                    logger.info(f"[{self.symbol}] Fill {fill_price:.{self.price_precision}f} vs signal "
+                                f"{signal_price:.{self.price_precision}f} (slippage {slip:+.3f}%), fee {open_fee:.4f} USDT")
                     self.position_start_time = datetime.now(timezone.utc)
                     self.session_trades += 1
 

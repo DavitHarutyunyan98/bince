@@ -1282,12 +1282,35 @@ STRATEGY_REGISTRY = {
 # ==============================================================================
 #  4. BACKTESTER CLASS (fixed initial-capital sizing, no compounding)
 # ==============================================================================
-class Backtester:
-    """Handles the logic for running a backtest on historical data with trading signals."""
+# Global cost model applied by every Backtester unless overridden per instance.
+# Set from the dashboard's "Cost Model" inputs so backtests and optimizations
+# reflect real trading costs, not just exchange fees.
+COST_MODEL = {'slippage_percent': 0.05, 'charge_funding': True}
 
-    def __init__(self, initial_capital=10000, fee_percent=0.05, sizing_mode='fixed'):
+
+def set_cost_model(slippage_percent=None, charge_funding=None):
+    if slippage_percent is not None:
+        COST_MODEL['slippage_percent'] = max(float(slippage_percent), 0.0)
+    if charge_funding is not None:
+        COST_MODEL['charge_funding'] = bool(charge_funding)
+
+
+class Backtester:
+    """Handles the logic for running a backtest on historical data with trading signals.
+
+    Costs: taker fee on both sides, plus (from COST_MODEL) slippage per side —
+    entries/exits filled slightly worse than the candle open — and funding,
+    accrued every candle a position is held from the data's 'funding' column
+    (longs pay positive funding, shorts receive it)."""
+
+    def __init__(self, initial_capital=10000, fee_percent=0.05, sizing_mode='fixed',
+                 slippage_percent=None, charge_funding=None):
         self.initial_capital = initial_capital
         self.fee_percent = fee_percent / 100
+        self.slippage = (COST_MODEL['slippage_percent'] if slippage_percent is None
+                         else float(slippage_percent)) / 100
+        self.charge_funding = (COST_MODEL['charge_funding'] if charge_funding is None
+                               else bool(charge_funding))
         # 'fixed'      -> every trade sized off the initial capital (no compounding)
         # 'compound'   -> every trade sized off the running equity (compounding)
         self.sizing_mode = 'compound' if str(sizing_mode).lower() == 'compound' else 'fixed'
@@ -1311,9 +1334,18 @@ class Backtester:
         entry_price = 0
         entry_date = None
         entry_base = self.initial_capital  # size of the open trade
+        funding_cost = 0.0  # funding accrued on the open trade
+        slip = self.slippage
 
         # Convert to list for index-based access
         df_list = list(df_with_signals.itertuples())
+        # Candle length in hours, to prorate 8-hour funding per candle.
+        try:
+            diffs = pd.Series(df_with_signals.index).diff().dropna()
+            candle_hours = diffs.median().total_seconds() / 3600.0 if len(diffs) else 1.0
+        except Exception:
+            candle_hours = 1.0
+        has_funding = self.charge_funding and 'funding' in df_with_signals.columns
 
         for i, row in enumerate(df_list):
             date = row.Index  # Get the date from the index
@@ -1331,6 +1363,12 @@ class Backtester:
                 'Date': date,
                 'Portfolio_Value': portfolio_val
             })
+
+            # Accrue funding while a position is open (long pays +funding).
+            if position != 0 and has_funding:
+                fr = getattr(row, 'funding', None)
+                if fr is not None and not pd.isna(fr):
+                    funding_cost += position * float(fr) * entry_base * candle_hours / 8.0
 
             exit_triggered = False
             exit_reason = None
@@ -1355,6 +1393,8 @@ class Backtester:
                         # Fallback for last candle
                         exit_price = current_price
                         exit_date = date
+                    # Slippage: exits fill slightly worse than the open.
+                    exit_price = exit_price * (1 - slip * position)
                     
                     if position == 1:
                         position_value = entry_base * (exit_price / entry_price)
@@ -1365,7 +1405,7 @@ class Backtester:
 
                     # Round-trip fees: charge on both entry (base) and exit (proceeds).
                     fee = self.calculate_trading_fee(entry_base) + self.calculate_trading_fee(position_value)
-                    net_value = position_value - fee
+                    net_value = position_value - fee - funding_cost
                     pnl = net_value - entry_base
                     pnl_percent = (pnl / entry_base) * 100 if entry_base > 0 else 0
 
@@ -1377,10 +1417,13 @@ class Backtester:
                         'Position': 'Long' if position == 1 else 'Short',
                         'PnL': pnl,
                         'PnL %': pnl_percent,
+                        'Fees': round(fee, 4),
+                        'Funding': round(funding_cost, 4),
                         'Exit_Reason': exit_reason
                     })
                     capital = capital + pnl  # accumulate realized PnL (linear)
                     position = 0
+                    funding_cost = 0.0
 
             # Check for new position entries - FIXED: Next-candle execution
             if position == 0:
@@ -1391,6 +1434,9 @@ class Backtester:
                         # Execute trade on NEXT candle to eliminate lookahead bias
                         position = current_signal
                         entry_price = getattr(next_row, 'Open', next_row.Close)  # Use next candle's OPEN price
+                        # Slippage: entries fill slightly worse than the open.
+                        entry_price = entry_price * (1 + slip * position)
+                        funding_cost = 0.0
                         entry_date = next_row.Index  # Use next candle's timestamp
                         # Compounding sizes off current equity; fixed off initial.
                         entry_base = capital if compounding else self.initial_capital
@@ -1402,6 +1448,7 @@ class Backtester:
             exit_price = last_row['Close']
             exit_date = last_row.name
             exit_reason = 'End of Data'
+            exit_price = exit_price * (1 - slip * position)
             if position == 1:
                 position_value = entry_base * (exit_price / entry_price)
             else:
@@ -1409,7 +1456,7 @@ class Backtester:
                     1 + (entry_price - exit_price) / entry_price
                 )
             fee = self.calculate_trading_fee(entry_base) + self.calculate_trading_fee(position_value)
-            net_value = position_value - fee
+            net_value = position_value - fee - funding_cost
             pnl = net_value - entry_base
             pnl_percent = (pnl / entry_base) * 100 if entry_base > 0 else 0
             capital = capital + pnl
@@ -1422,6 +1469,8 @@ class Backtester:
                 'Position': pos_type,
                 'PnL': pnl,
                 'PnL %': pnl_percent,
+                'Fees': round(fee, 4),
+                'Funding': round(funding_cost, 4),
                 'Exit_Reason': exit_reason
             })
 
