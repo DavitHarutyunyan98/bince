@@ -316,8 +316,11 @@ def run_price_backtest(universe, p, progress=None, data=None):
     """
     say = progress or (lambda *_: None)
     start, end = int(p["start_ms"]), int(p["end_ms"])
-    grid = np.arange((start // MIN_MS + 1) * MIN_MS, end, MIN_MS)
+    tf_min = max(int(p.get("tf_min", 1)), 1)          # bar size in minutes (built from 1m data)
+    STEP = tf_min * MIN_MS
+    grid = np.arange((start // STEP + 1) * STEP, end, STEP)
     T = len(grid)
+    bars = lambda minutes: max(int(np.ceil(float(minutes) / tf_min)), 0)
     if data is None:
         data = {"px": {}, "fund": {}}
         n = len(universe)
@@ -330,6 +333,13 @@ def run_price_backtest(universe, p, progress=None, data=None):
                     continue
                 if len(k) < 60:
                     continue
+                if tf_min > 1:
+                    # Aggregate 1m -> tf bars. A bar is labelled by its START (like
+                    # exchange candles); its close is the last 1m close inside it.
+                    k = k.assign(b=(k.ts // STEP) * STEP).groupby("b").agg(
+                        high=("high", "max"), low=("low", "min"), close=("close", "last"))
+                    k.index.name = "ts"
+                    k = k.reset_index()
                 k = k.set_index("ts").reindex(grid)
                 stale = k.close.isna().values
                 k = k.ffill()
@@ -366,7 +376,7 @@ def run_price_backtest(universe, p, progress=None, data=None):
         g[px[(coin, a)][3] | px[(coin, b)][3]] = np.nan
         G[r] = g
 
-    n_need = max(int(p.get("gap_minutes", 3)), 1)
+    n_need = max(bars(p.get("gap_minutes", 3)), 1)
     ge, gx, max_gap = p["gap_entry"], p["gap_exit"], p.get("max_gap", 3.0)
 
     def persistent(M):
@@ -388,9 +398,9 @@ def run_price_backtest(universe, p, progress=None, data=None):
     margin = p["capital"] / slots if p["cross"] else notional / p["leverage"]
     liq_move = max(margin / notional - p["mmr"] / 100.0, 0.001)
     fees, slip = p["fees"], p["slippage"] / 100.0
-    delay = max(int(p.get("delay_min", 1)), 0)
-    max_hold = int(p.get("max_hold_min", 24 * 60))
-    cooldown = int(p.get("cooldown_min", 30))
+    delay = bars(p.get("delay_min", 1))
+    max_hold = max(bars(p.get("max_hold_min", 24 * 60)), 1)
+    cooldown = bars(p.get("cooldown_min", 30))
 
     say("Simulating…")
     open_pos, trades, last_close = [], [], {}
@@ -443,12 +453,12 @@ def run_price_backtest(universe, p, progress=None, data=None):
                     "Coin": pos["coin"], "Long @": pos["long"], "Short @": pos["short"],
                     "Signal": pd.to_datetime(grid[pos["t_sig"]], unit="ms", utc=True).strftime("%m-%d %H:%M"),
                     "Exit": pd.to_datetime(grid[t], unit="ms", utc=True).strftime("%m-%d %H:%M"),
-                    "Minutes": int(t - pos["t0"]),
+                    "Minutes": int((t - pos["t0"]) * tf_min),
                     "Gap at signal %": round(float(pos["g_sig"]), 3),
                     "Gap at fill %": round(float(pos["g_fill"]), 3),
-                    "Funding $": round(pos["funding"], 2), "Price PnL $": round(price_pnl, 2),
-                    "Fees $": round(pos["entry_fee"] + exit_fee + liq_cost, 2),
-                    "Net $": round(net, 2), "Exit reason": reason,
+                    "Funding $": round(float(pos["funding"]), 2), "Price PnL $": round(float(price_pnl), 2),
+                    "Fees $": round(float(pos["entry_fee"] + exit_fee + liq_cost), 2),
+                    "Net $": round(float(net), 2), "Exit reason": reason,
                 })
             else:
                 still.append(pos)
@@ -513,7 +523,8 @@ def run_price_backtest(universe, p, progress=None, data=None):
     dd = float(((eq + total_cap) / peak - 1).min() * 100)
     net_total = float(tr["Net $"].sum()) if not tr.empty else 0.0
     summary = {
-        "Leverage": p["leverage"], "Gap must last (min)": n_need,
+        "Timeframe": f"{tf_min}m" if tf_min < 60 else f"{tf_min // 60}h",
+        "Leverage": p["leverage"], "Gap must last (min)": n_need * tf_min,
         "Notional per leg $": round(notional, 0), "Liq. move per leg %": round(liq_move * 100, 1),
         "Trades": len(tr),
         "Liquidations": int(tr["Exit reason"].str.startswith("LIQ").sum()) if not tr.empty else 0,

@@ -432,6 +432,11 @@ def config_warnings(p, min_vol):
     if p["gap_entry"] - p["gap_exit"] <= cost:
         w.append(f"Gap entry − Gap exit ({p['gap_entry'] - p['gap_exit']:.2f}%) ≤ round-trip costs (~{cost:.2f}%): "
                  f"trades lose money even when the gap closes")
+    if p.get("max_gap", 3) > 5:
+        w.append(f"Max gap {p['max_gap']:g}%: gaps that big are almost always bad data or a different "
+                 f"token with the same name; use ≤ 3")
+    if p.get("gap_minutes", 3) < p.get("tf_min", 1):
+        w.append("Gap must last is shorter than one candle: it is rounded up to 1 candle")
     if p["delay_min"] < 1:
         w.append("Bot delay 0: fills at the same minute the gap is seen — optimistic")
     if p["usage"] > 0.9:
@@ -477,7 +482,8 @@ def _bt_worker(params, exchanges, min_vol, top_n, exclude=(), warns=()):
             r.pop("data", None)
             compare.append({"Selected": "◀" if lev == sel_lev else "", **r["summary"]})
             equities[f"{lev:g}x, last {sel_n}m"] = r["equity"]
-        for n in sorted({1, 2, 3, 5, 10} - {sel_n}):
+        tf = int(params.get("tf_min", 1))
+        for n in sorted({tf * k for k in (1, 2, 3, 5, 10)} - {sel_n}):
             say(f"Comparing 'gap must last' {n} min…")
             r = bt.run_price_backtest(universe, {**params, "gap_minutes": n}, data=data)
             r.pop("data", None)
@@ -576,6 +582,11 @@ def build_app():
             field("Exchanges", dcc.Checklist(id="bt-exchanges", value=EXCHANGES, inline=True,
                                              options=[{"label": f" {e} ", "value": e} for e in EXCHANGES],
                                              style={"color": "#eee"})),
+            field("Timeframe", dcc.Dropdown(id="bt-tf", value=1, clearable=False,
+                                            options=[{"label": l, "value": v} for l, v in
+                                                     [("1m", 1), ("3m", 3), ("5m", 5), ("15m", 15),
+                                                      ("30m", 30), ("1h", 60)]],
+                                            style={"width": "90px", "color": "#000"})),
             field("Gap entry %", num("bt-gap-entry", 0.7, step=0.05)),
             field("Gap exit %", num("bt-gap-exit", 0.1, step=0.05)),
             field("Gap must last (min)", num("bt-gap-min", 3, min=1)),
@@ -668,10 +679,11 @@ def build_app():
                    State("bt-lev", "value"), State("bt-usage", "value"), State("bt-slip", "value"),
                    State("bt-liqfee", "value"), State("bt-cross", "value"), State("bt-minvol", "value"),
                    State("bt-topn", "value"), State("bt-exclude", "value"),
-                   State("fee-binance", "value"), State("fee-bybit", "value"), State("fee-bitget", "value")],
+                   State("fee-binance", "value"), State("fee-bybit", "value"), State("fee-bitget", "value"),
+                   State("bt-tf", "value")],
                   prevent_initial_call=True)
     def start_bt(_n, start, end, exs, g_in, g_out, g_min, delay, max_gap, hold, cooldown, pairs, cap,
-                 lev, usage, slip, liqfee, cross, minvol, topn, exclude, fb, fy, fg):
+                 lev, usage, slip, liqfee, cross, minvol, topn, exclude, fb, fy, fg, tf):
         if BT_JOB.get("running"):
             return "A backtest is already running…"
         if not start or not end:
@@ -681,6 +693,7 @@ def build_app():
             params = dict(
                 start_ms=bt.ms(start),
                 end_ms=min(bt.ms(end, end_of_day=True), int(time.time() * 1000) - 600_000),
+                tf_min=int(val(tf, 1)),
                 gap_entry=float(val(g_in, 0.7)), gap_exit=float(val(g_out, 0.1)),
                 gap_minutes=int(val(g_min, 3)), delay_min=int(val(delay, 1)),
                 max_gap=float(val(max_gap, 3)), max_hold_min=int(val(hold, 1440)),
