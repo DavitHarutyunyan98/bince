@@ -320,6 +320,20 @@ def run_backtest(universe, params, progress=None):
         return kl_cache[key]
 
     gap_entry, gap_exit = p.get("gap_entry", 0.5), p.get("gap_exit", 0.1)
+    min_settle = int(p.get("min_settlements", 1))      # funding: hold through N payments
+    exit_confirm = max(int(p.get("exit_confirm_h", 4)), 1)
+    max_move = float(p.get("max_1h_move", 8.0)) / 100   # skip coins that jumped this much in 1h
+
+    def too_wild(k, t):
+        """True if this leg moved more than max_move in any hour of the last 24h."""
+        if not max_move:
+            return False
+        c = k[2][max(t - 24, 0):t + 1]
+        if len(c) < 2:
+            return False
+        with np.errstate(invalid="ignore", divide="ignore"):
+            mv = np.nanmax(np.abs(c[1:] / c[:-1] - 1))
+        return bool(mv > max_move)
     # Price basis per pair from 1h closes: (close_a - close_b) / close_b in %.
     basis = {}
     if slots["price"]:
@@ -348,7 +362,10 @@ def run_backtest(universe, params, progress=None):
         for pos in open_pos:
             coin, lex, sex, u, eng = pos["coin"], pos["long"], pos["short"], pos["u"], pos["engine"]
             # Funding is real money on every hedge, whichever engine opened it.
-            pos["funding"] += notional * (series[(coin, sex)][1][t] - series[(coin, lex)][1][t])
+            paid_s, paid_l = series[(coin, sex)][1][t], series[(coin, lex)][1][t]
+            pos["funding"] += notional * (paid_s - paid_l)
+            if paid_s != 0 or paid_l != 0:
+                pos["settlements"] += 1
             lk, sk = pos["lk"], pos["sk"]
             liq = None
             if lk[1][t] <= pos["l0"] * (1 - liq_move):
@@ -359,7 +376,11 @@ def run_backtest(universe, params, progress=None):
             if eng == "price":
                 done = np.isnan(b_now) or b_now <= gap_exit
             else:
-                done = np.isnan(s_now) or s_now < p["exit"]
+                # Exit only after the spread stays below Exit for exit_confirm hours AND
+                # at least min_settle funding payments were collected (no 1-hour flips).
+                below = np.isnan(s_now) or s_now < p["exit"]
+                pos["below_h"] = pos["below_h"] + 1 if below else 0
+                done = pos["below_h"] >= exit_confirm and pos["settlements"] >= min_settle
             held_h = t - pos["t0"]
             reason = None
             if liq:
@@ -432,12 +453,14 @@ def run_backtest(universe, params, progress=None):
                     lk, sk = closes(coin, lex, u), closes(coin, sex, u)
                     if lk is None or sk is None or np.isnan(lk[2][t]) or np.isnan(sk[2][t]):
                         continue
+                    if too_wild(lk, t) or too_wild(sk, t):
+                        continue
                     f0, g0 = oriented(coin, lex, sex, t)
                     open_pos.append({
                         "engine": eng, "coin": coin, "long": lex, "short": sex, "u": u, "t0": t,
                         "f_entry": f0, "g_entry": g0,
                         "lk": lk, "sk": sk, "l0": lk[2][t] * (1 + slip), "s0": sk[2][t] * (1 - slip),
-                        "funding": 0.0,
+                        "funding": 0.0, "settlements": 0, "below_h": 0,
                         "entry_fee": notional * (fees[lex] + fees[sex]) / 100,
                     })
                     busy.add(coin)
