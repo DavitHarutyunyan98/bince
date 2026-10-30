@@ -506,7 +506,7 @@ def build_app():
 
         def fmt_pers(key):
             v = pers.get(key)
-            return (f"{v[1]:.1f}h now / {v[2]:.1f}h in 7d") if v else "—"
+            return (f"{_dur(v[1])} now / {_dur(v[2])} in 7d") if v else "—"
 
         def fmt_depth(key):
             v = depth.get(key, "")
@@ -592,6 +592,13 @@ def build_app():
     return app
 
 
+def _dur(hours):
+    """0.4 -> '24m', 5.5 -> '5.5h', 50 -> '2.1d'."""
+    if hours < 1:
+        return f"{hours * 60:.0f}m"
+    return f"{hours:.1f}h" if hours < 48 else f"{hours / 24:.1f}d"
+
+
 def summarise(kind, threshold):
     """Pairs that stayed above threshold the longest over the last 7 days."""
     pers = persistence(kind, threshold)
@@ -606,7 +613,7 @@ def summarise(kind, threshold):
     from dash import html
     return html.Div([
         html.Div(f"{n_scans} scans recorded since {first}. Pairs with the most hours ≥ {threshold}{unit}:"),
-        html.Ul([html.Li(f"{c}  {a} → {b}: {tot:.1f}h total, current streak {cur:.1f}h")
+        html.Ul([html.Li(f"{c}  {a} → {b}: {_dur(tot)} total, current streak {_dur(cur)}")
                  for (c, a, b), (_s, cur, tot) in top]),
     ])
 
