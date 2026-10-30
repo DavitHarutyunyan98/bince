@@ -504,6 +504,82 @@ def _bt_worker(params, exchanges, min_vol, top_n, exclude=(), warns=()):
         BT_JOB["running"] = False
 
 
+OPT_JOB = {}
+
+
+def _parse_list(text, cast=float):
+    out = []
+    for x in str(text or "").replace(";", ",").split(","):
+        x = x.strip().replace(" ", "")
+        if x:
+            try:
+                out.append(cast(x.replace(",", ".")))
+            except ValueError:
+                pass
+    return sorted(set(out))
+
+
+def _opt_worker(params, exchanges, min_vol, top_n, exclude, grid, train_pct):
+    """Try every combination on the first `train_pct`% of the period (train),
+    then re-run each on the remaining days it never saw (test)."""
+    OPT_JOB.update(running=True, result=None, msg="Preparing coins…", job_id=OPT_JOB.get("job_id", 0) + 1)
+    try:
+        with LOCK:
+            frames = dict(STATE["rows"])
+        if len(frames) < 2:
+            frames = {name: FETCHERS[name]() for name in exchanges}
+        universe = [u for u in bt.build_universe(frames, exchanges, min_vol, top_n * 2)
+                    if u["coin"] not in exclude][:top_n]
+        if not universe:
+            OPT_JOB["result"] = {"error": "No coins on 2+ exchanges pass the volume filter."}
+            return
+        s0, e0 = params["start_ms"], params["end_ms"]
+        split = s0 + int((e0 - s0) * train_pct / 100) // 60_000 * 60_000
+        combos = [(tf, ge, gx, gm) for tf in grid["tf"] for ge in grid["entry"] for gx in grid["exit"]
+                  for gm in grid["last"] if gx < ge]
+        total, done, rows, t0 = len(combos), 0, [], time.time()
+        for tf in grid["tf"]:
+            data = {}
+            for part, (a, b) in (("train", (s0, split)), ("test", (split, e0))):
+                OPT_JOB["msg"] = f"Loading {tf}m data ({part})…"
+                r = bt.run_price_backtest(universe, {**params, "tf_min": tf, "start_ms": a, "end_ms": b},
+                                          lambda m: OPT_JOB.update(msg=f"{tf}m {part}: {m}"))
+                data[part] = r.get("data")
+            for (ctf, ge, gx, gm) in [c for c in combos if c[0] == tf]:
+                res = {}
+                for part, (a, b) in (("train", (s0, split)), ("test", (split, e0))):
+                    if data[part] is None:
+                        res[part] = None
+                        continue
+                    r = bt.run_price_backtest(universe, {**params, "tf_min": tf, "start_ms": a, "end_ms": b,
+                                                         "gap_entry": ge, "gap_exit": gx, "gap_minutes": gm},
+                                              data=data[part])
+                    res[part] = r.get("summary")
+                done += 1
+                OPT_JOB["msg"] = f"Combination {done}/{total} ({time.time() - t0:.0f}s)"
+                tr, te = res["train"] or {}, res["test"] or {}
+                rows.append({
+                    "Timeframe": f"{tf}m" if tf < 60 else f"{tf // 60}h", "Gap entry %": ge, "Gap exit %": gx,
+                    "Gap must last (min)": tr.get("Gap must last (min)", gm),
+                    "Train net $": tr.get("Net $", 0), "Train trades": tr.get("Trades", 0),
+                    "Train win %": tr.get("Win rate %", 0), "Train liq.": tr.get("Liquidations", 0),
+                    "Test net $": te.get("Net $", 0), "Test trades": te.get("Trades", 0),
+                    "Test win %": te.get("Win rate %", 0), "Test liq.": te.get("Liquidations", 0),
+                    "Both positive": "YES" if tr.get("Net $", 0) > 0 and te.get("Net $", 0) > 0 else "",
+                })
+        rows.sort(key=lambda r: r["Train net $"], reverse=True)
+        n_both = sum(1 for r in rows if r["Both positive"])
+        OPT_JOB["result"] = {"rows": rows}
+        OPT_JOB["msg"] = (f"✅ {total} combinations in {time.time() - t0:.0f}s. Train = first {train_pct:g}% of "
+                          f"the period, test = the rest (never seen while ranking). {n_both} combination(s) "
+                          f"made money in BOTH parts.")
+    except Exception as e:
+        logger.exception("optimizer failed")
+        OPT_JOB["result"] = {"error": str(e)}
+    finally:
+        OPT_JOB["running"] = False
+
+
 def build_app():
     from dash import Dash, html, dcc, dash_table, Input, Output, State, no_update
     import plotly.graph_objects as go
@@ -616,6 +692,41 @@ def build_app():
                                "padding": "8px 16px", "borderRadius": "4px", "cursor": "pointer"}),
         ]),
         html.Div(id="bt-progress", style={"fontSize": "13px", "color": "#ffcc66", "marginBottom": "8px"}),
+        html.Div(style={"border": "1px solid #444", "borderRadius": "6px", "padding": "10px",
+                        "margin": "4px 0 14px 0"}, children=[
+            html.H3("Optimizer: try every combination, check it on unseen days", style={"marginTop": 0}),
+            html.Div("Uses all settings above (leverage, capital, fees, coins…) except the four lists below. "
+                     "Ranks by the TRAIN part; the TEST part shows how the same settings did on later days "
+                     "they were not chosen on. Trust only rows that are positive in both.",
+                     style={"color": "#999", "fontSize": "12px", "marginBottom": "8px"}),
+            html.Div(style={"display": "flex", "flexWrap": "wrap", "gap": "10px 16px", "alignItems": "flex-end"},
+                     children=[
+                field("Timeframes (min)", dcc.Input(id="opt-tf", type="text", value="1, 3, 5",
+                                                    style={**inp, "width": "120px"})),
+                field("Gap entry % list", dcc.Input(id="opt-entry", type="text", value="0.5, 0.7, 1.0, 1.5",
+                                                    style={**inp, "width": "150px"})),
+                field("Gap exit % list", dcc.Input(id="opt-exit", type="text", value="0.05, 0.1, 0.2, 0.3",
+                                                   style={**inp, "width": "150px"})),
+                field("Gap must last (min) list", dcc.Input(id="opt-last", type="text", value="1, 3, 5, 10",
+                                                            style={**inp, "width": "130px"})),
+                field("Train %", num("opt-train", 70, min=30, max=90)),
+                html.Button("Run optimizer", id="opt-run", n_clicks=0,
+                            style={"backgroundColor": "#007bff", "color": "#fff", "border": "none",
+                                   "padding": "8px 16px", "borderRadius": "4px", "cursor": "pointer"}),
+            ]),
+            html.Div(id="opt-progress", style={"fontSize": "13px", "color": "#ffcc66", "margin": "8px 0"}),
+            dash_table.DataTable(id="opt-table", **{**table_style, "page_size": 20,
+                                                    "style_data_conditional": [
+                                                        {"if": {"filter_query": '{Both positive} = "YES"'},
+                                                         "backgroundColor": "#1e4d2e"},
+                                                        {"if": {"filter_query": "{Test net $} < 0",
+                                                                "column_id": "Test net $"}, "color": "#f44336"},
+                                                        {"if": {"filter_query": "{Train net $} < 0",
+                                                                "column_id": "Train net $"}, "color": "#f44336"}]}),
+            html.Div("Click a row to copy its settings into the backtest controls above, then press Run backtest "
+                     "to see its trades.", style={"color": "#888", "fontSize": "12px", "marginTop": "6px"}),
+            dcc.Interval(id="opt-tick", interval=2000),
+        ]),
         html.H3("Comparison: leverages (selected 'gap must last') and 'gap must last' (selected leverage)"),
         dash_table.DataTable(id="bt-compare", **{**table_style, "page_size": 12,
                                                  "style_data_conditional": [
@@ -716,6 +827,72 @@ def build_app():
         threading.Thread(target=_bt_worker, args=(params, exs or EXCHANGES, minvol, int(val(topn, 40)),
                                                   excl, warns), daemon=True).start()
         return "Starting…" + ((" ⚠ " + " | ".join(warns)) if warns else "")
+
+    @app.callback(Output("opt-progress", "children"),
+                  Input("opt-run", "n_clicks"),
+                  [State("bt-dates", "start_date"), State("bt-dates", "end_date"), State("bt-exchanges", "value"),
+                   State("bt-delay", "value"), State("bt-max-gap", "value"), State("bt-hold", "value"),
+                   State("bt-cooldown", "value"), State("bt-pairs", "value"), State("bt-capital", "value"),
+                   State("bt-lev", "value"), State("bt-usage", "value"), State("bt-slip", "value"),
+                   State("bt-liqfee", "value"), State("bt-cross", "value"), State("bt-minvol", "value"),
+                   State("bt-topn", "value"), State("bt-exclude", "value"),
+                   State("fee-binance", "value"), State("fee-bybit", "value"), State("fee-bitget", "value"),
+                   State("opt-tf", "value"), State("opt-entry", "value"), State("opt-exit", "value"),
+                   State("opt-last", "value"), State("opt-train", "value")],
+                  prevent_initial_call=True)
+    def start_opt(_n, start, end, exs, delay, max_gap, hold, cooldown, pairs, cap, lev, usage, slip, liqfee,
+                  cross, minvol, topn, exclude, fb, fy, fg, tfs, entries, exits, lasts, train):
+        if OPT_JOB.get("running") or BT_JOB.get("running"):
+            return "Something is already running…"
+        if not start or not end:
+            return "❌ Pick a start and end date."
+        val = lambda v, d: d if v is None else v
+        grid = {"tf": [int(x) for x in _parse_list(tfs, float) if x >= 1],
+                "entry": _parse_list(entries), "exit": _parse_list(exits),
+                "last": [int(x) for x in _parse_list(lasts, float) if x >= 1]}
+        if not all(grid.values()):
+            return "❌ Every list needs at least one number (e.g. 0.5, 0.7, 1.0)."
+        n = sum(1 for _ in grid["tf"] for e in grid["entry"] for x in grid["exit"] for _l in grid["last"] if x < e)
+        params = dict(
+            start_ms=bt.ms(start), end_ms=min(bt.ms(end, end_of_day=True), int(time.time() * 1000) - 600_000),
+            delay_min=int(val(delay, 1)), max_gap=float(val(max_gap, 3)), max_hold_min=int(val(hold, 1440)),
+            cooldown_min=int(val(cooldown, 30)), max_pairs=int(val(pairs, 2)), capital=float(val(cap, 500)),
+            leverage=float(val(lev, 10)), usage=float(val(usage, 80)) / 100, slippage=float(val(slip, 0.05)),
+            liq_fee=float(val(liqfee, 1.0)), cross=(cross == "cross"), mmr=0.5,
+            fees={"binance": val(fb, DEFAULT_FEES["binance"]), "bybit": val(fy, DEFAULT_FEES["bybit"]),
+                  "bitget": val(fg, DEFAULT_FEES["bitget"])})
+        excl = {c.strip().upper() for c in (exclude or "").replace(";", ",").split(",") if c.strip()}
+        threading.Thread(target=_opt_worker, args=(params, exs or EXCHANGES, float(val(minvol, 5)) * 1e6,
+                                                   int(val(topn, 40)), excl, grid, float(val(train, 70))),
+                         daemon=True).start()
+        return f"Starting {n} combinations…"
+
+    @app.callback([Output("opt-progress", "children", allow_duplicate=True),
+                   Output("opt-table", "data"), Output("opt-table", "columns")],
+                  Input("opt-tick", "n_intervals"), State("tabs", "value"), prevent_initial_call=True)
+    def poll_opt(_n, tab):
+        if tab != "bt":
+            return no_update, no_update, no_update
+        res = OPT_JOB.get("result")
+        if res is None or OPT_JOB.get("shown") == OPT_JOB.get("job_id"):
+            return OPT_JOB.get("msg", ""), no_update, no_update
+        OPT_JOB["shown"] = OPT_JOB.get("job_id")
+        if "error" in res:
+            return f"❌ {res['error']}", no_update, no_update
+        rows = res["rows"]
+        return OPT_JOB.get("msg", ""), rows, [{"name": c, "id": c} for c in (rows[0].keys() if rows else ["—"])]
+
+    @app.callback([Output("bt-tf", "value"), Output("bt-gap-entry", "value"), Output("bt-gap-exit", "value"),
+                   Output("bt-gap-min", "value")],
+                  Input("opt-table", "active_cell"), State("opt-table", "derived_viewport_data"),
+                  prevent_initial_call=True)
+    def use_opt_row(cell, rows):
+        if not cell or not rows:
+            return (no_update,) * 4
+        r = rows[cell["row"]]
+        tf = r["Timeframe"]
+        tf_min = int(tf[:-1]) * (60 if tf.endswith("h") else 1)
+        return tf_min, r["Gap entry %"], r["Gap exit %"], r["Gap must last (min)"]
 
     @app.callback([Output("bt-progress", "children", allow_duplicate=True),
                    Output("bt-compare", "data"), Output("bt-compare", "columns"),
