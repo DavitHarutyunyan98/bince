@@ -322,7 +322,9 @@ def run_backtest(universe, params, progress=None):
     gap_entry, gap_exit = p.get("gap_entry", 0.5), p.get("gap_exit", 0.1)
     min_settle = int(p.get("min_settlements", 1))      # funding: hold through N payments
     exit_confirm = max(int(p.get("exit_confirm_h", 4)), 1)
-    max_move = float(p.get("max_1h_move", 8.0)) / 100   # skip coins that jumped this much in 1h
+    max_move = float(p.get("max_1h_move", 8.0)) / 100
+    max_spread = float(p.get("max_entry_spread", 1.5))     # %/day; above = short-lived spike
+    max_adverse = float(p.get("max_adverse_basis", 0.2))   # % price gap against the hedge at entry   # skip coins that jumped this much in 1h
 
     def too_wild(k, t):
         """True if this leg moved more than max_move in any hour of the last 24h."""
@@ -336,7 +338,7 @@ def run_backtest(universe, params, progress=None):
         return bool(mv > max_move)
     # Price basis per pair from 1h closes: (close_a - close_b) / close_b in %.
     basis = {}
-    if slots["price"]:
+    if slots["price"] or p.get("max_adverse_basis", 0.2) is not None:
         for i, (coin, a, b, u) in enumerate(pairs):
             say(f"Price history {i + 1}/{len(pairs)}: {coin} {a}/{b}")
             ka, kb = closes(coin, a, u), closes(coin, b, u)
@@ -439,6 +441,11 @@ def run_backtest(universe, params, progress=None):
                             if not np.isnan(gap) and gap >= gap_entry:
                                 cands.append((gap, coin, lex, sex))
                         elif not np.isnan(w).any() and (sgn * w).min() >= p["entry"]:
+                            if max_spread and sgn * arr[t] > max_spread:
+                                continue                      # spike: rarely lasts
+                            gap = sgn * bs[t] if bs is not None else 0.0
+                            if not np.isnan(gap) and gap < -max_adverse:
+                                continue                      # would start with a price loss
                             cands.append((sgn * arr[t], coin, lex, sex))
                 for score, coin, lex, sex in sorted(cands, reverse=True):
                     if sum(1 for x in open_pos if x["engine"] == eng) >= slots[eng]:

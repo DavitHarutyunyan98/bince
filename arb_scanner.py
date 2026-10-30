@@ -605,6 +605,8 @@ def build_app():
             field("Confirm hours", dcc.Input(id="bt-confirm", type="number", value=8, min=1, style=inp)),
             field("Funding: min payments", dcc.Input(id="bt-min-settle", type="number", value=1, min=0, style=inp)),
             field("Funding: exit confirm h", dcc.Input(id="bt-exit-confirm", type="number", value=4, min=1, style=inp)),
+            field("Funding: max entry %/day", dcc.Input(id="bt-max-spread", type="number", value=1.5, min=0, step=0.1, style=inp)),
+            field("Funding: max adverse gap %", dcc.Input(id="bt-max-adverse", type="number", value=0.2, min=0, step=0.05, style=inp)),
             field("Skip coin if 1h move > %", dcc.Input(id="bt-max-move", type="number", value=8, min=0, style=inp)),
             field("Exclude coins", dcc.Input(id="bt-exclude", type="text", value=DEFAULT_EXCLUDE,
                                              style={**inp, "width": "330px"})),
@@ -701,11 +703,13 @@ def build_app():
                    State("bt-funding-slots", "value"), State("bt-price-hold", "value"),
                    State("bt-cd-price", "value"), State("bt-cd-funding", "value"),
                    State("bt-min-settle", "value"), State("bt-exit-confirm", "value"),
-                   State("bt-max-move", "value"), State("bt-exclude", "value")],
+                   State("bt-max-move", "value"), State("bt-exclude", "value"),
+                   State("bt-max-spread", "value"), State("bt-max-adverse", "value")],
                   prevent_initial_call=True)
     def start_bt(_n, start, end, exs, cap, lev, usage, pairs, entry, exit_, confirm, hold, slip,
                  liqfee, cross, minvol, topn, fb, fy, fg, mode, gap_entry, gap_exit, pslots, fslots,
-                 phold, cd_price, cd_funding, min_settle, exit_confirm, max_move, exclude):
+                 phold, cd_price, cd_funding, min_settle, exit_confirm, max_move, exclude,
+                 max_spread, max_adverse):
         if not start or not end:
             return "❌ Pick a start and end date."
         if BT_JOB.get("running"):
@@ -730,6 +734,8 @@ def build_app():
                 min_settlements=int(min_settle if min_settle is not None else 1),
                 exit_confirm_h=int(exit_confirm or 4),
                 max_1h_move=float(max_move if max_move is not None else 8),
+                max_entry_spread=float(max_spread if max_spread is not None else 1.5),
+                max_adverse_basis=float(max_adverse if max_adverse is not None else 0.2),
                 fees={"binance": fb if fb is not None else DEFAULT_FEES["binance"],
                       "bybit": fy if fy is not None else DEFAULT_FEES["bybit"],
                       "bitget": fg if fg is not None else DEFAULT_FEES["bitget"]})
