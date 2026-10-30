@@ -475,14 +475,17 @@ def _bt_worker(params, exchanges, min_vol, top_n, exclude=(), warns=()):
             return
         data = main.pop("data")
         compare, equities = [], {}
-        sel_lev, sel_n = float(params["leverage"]), int(params["gap_minutes"])
+        tf = int(params.get("tf_min", 1))
+        # "Gap must last" is rounded up to whole candles; compare in those units.
+        sel_n = max(-(-int(params["gap_minutes"]) // tf), 1) * tf
+        params = {**params, "gap_minutes": sel_n}
+        sel_lev = float(params["leverage"])
         for lev in sorted({2.0, 3.0, 5.0, 10.0, sel_lev}):
             say(f"Comparing leverage {lev:g}x…")
             r = main if lev == sel_lev else bt.run_price_backtest(universe, {**params, "leverage": lev}, data=data)
             r.pop("data", None)
             compare.append({"Selected": "◀" if lev == sel_lev else "", **r["summary"]})
             equities[f"{lev:g}x, last {sel_n}m"] = r["equity"]
-        tf = int(params.get("tf_min", 1))
         for n in sorted({tf * k for k in (1, 2, 3, 5, 10)} - {sel_n}):
             say(f"Comparing 'gap must last' {n} min…")
             r = bt.run_price_backtest(universe, {**params, "gap_minutes": n}, data=data)
