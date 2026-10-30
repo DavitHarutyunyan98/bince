@@ -453,7 +453,14 @@ def _bt_worker(params, exchanges, min_vol, top_n):
             r = main if lev == params["leverage"] else bt.run_backtest(universe, {**params, "leverage": lev})
             row = {"Selected": "◀" if lev == params["leverage"] else "", **r["summary"]}
             compare.append(row)
-            equities[lev] = r["equity"]
+            equities[f"{params['mode']} {lev:g}x"] = r["equity"]
+        for m in ("funding", "price", "combined"):
+            if m == params["mode"]:
+                continue
+            say(f"Strategy comparison: {m}…")
+            r = bt.run_backtest(universe, {**params, "mode": m})
+            compare.append({"Selected": "", **r["summary"]})
+            equities[f"{m} {params['leverage']:g}x"] = r["equity"]
         BT_JOB["result"] = {"main": main, "compare": compare, "equities": equities}
         days = (params["end_ms"] - params["start_ms"]) / 86_400_000
         BT_JOB["msg"] = (f"✅ Done in {time.time() - t0:.0f}s — {len(universe)} coins, {days:.0f} days. "
@@ -537,6 +544,15 @@ def build_app():
             field("Exchanges", dcc.Checklist(id="bt-exchanges", value=EXCHANGES, inline=True,
                                              options=[{"label": f" {e} ", "value": e} for e in EXCHANGES],
                                              style={"color": "#eee"})),
+            field("Strategy", dcc.Dropdown(id="bt-mode", value="combined", clearable=False,
+                                           options=[{"label": "Combined (gap + funding)", "value": "combined"},
+                                                    {"label": "Funding gap only", "value": "funding"},
+                                                    {"label": "Price gap only", "value": "price"}],
+                                           style={"width": "210px", "color": "#000"})),
+            field("Gap entry %", dcc.Input(id="bt-gap-entry", type="number", value=0.5, step=0.05, style=inp)),
+            field("Gap exit %", dcc.Input(id="bt-gap-exit", type="number", value=0.1, step=0.05, style=inp)),
+            field("Min edge % (combined)", dcc.Input(id="bt-edge", type="number", value=0.3, step=0.05, style=inp)),
+            field("Funding horizon days", dcc.Input(id="bt-horizon", type="number", value=1, step=0.5, style=inp)),
             field("Capital per exchange $", dcc.Input(id="bt-capital", type="number", value=500, style=inp)),
             field("Leverage", dcc.Input(id="bt-lev", type="number", value=10, min=1, style=inp)),
             field("Margin usage %", dcc.Input(id="bt-usage", type="number", value=80, min=1, max=100, style=inp)),
@@ -558,7 +574,12 @@ def build_app():
                                "padding": "8px 16px", "borderRadius": "4px", "cursor": "pointer"}),
         ]),
         html.Div(id="bt-progress", style={"fontSize": "13px", "color": "#ffcc66", "marginBottom": "8px"}),
-        html.H3("Leverage comparison (same data & rules)"),
+        html.Div("Combined: enter when gap + funding × horizon − round-trip costs ≥ Min edge (and either the "
+                 "gap ≥ Gap entry or funding passed Entry/Confirm); exit only when the gap is ≤ Gap exit AND "
+                 "funding < Exit. Price history has no bid/ask: gaps come from 1h closes, slippage stands in "
+                 "for the spread, and gaps shorter than 1h are not seen.",
+                 style={"color": "#999", "fontSize": "12px", "marginBottom": "8px"}),
+        html.H3("Comparison: leverages (selected strategy) and strategies (selected leverage)"),
         dash_table.DataTable(id="bt-compare", **{**table_style, "page_size": 10,
                                                  "style_data_conditional": [
                                                      {"if": {"filter_query": "{Net $} > 0"}, "color": "#4caf50"},
@@ -604,10 +625,11 @@ def build_app():
                    State("bt-confirm", "value"), State("bt-hold", "value"), State("bt-slip", "value"),
                    State("bt-liqfee", "value"), State("bt-cross", "value"), State("bt-minvol", "value"),
                    State("bt-topn", "value"), State("fee-binance", "value"), State("fee-bybit", "value"),
-                   State("fee-bitget", "value")],
+                   State("fee-bitget", "value"), State("bt-mode", "value"), State("bt-gap-entry", "value"),
+                   State("bt-gap-exit", "value"), State("bt-edge", "value"), State("bt-horizon", "value")],
                   prevent_initial_call=True)
     def start_bt(_n, start, end, exs, cap, lev, usage, pairs, entry, exit_, confirm, hold, slip,
-                 liqfee, cross, minvol, topn, fb, fy, fg):
+                 liqfee, cross, minvol, topn, fb, fy, fg, mode, gap_entry, gap_exit, edge, horizon):
         if BT_JOB.get("running"):
             return "A backtest is already running…"
         try:
@@ -618,6 +640,11 @@ def build_app():
                 exit=float(exit_ if exit_ is not None else 0.05), confirm_h=int(confirm or 8),
                 max_hold_days=float(hold or 10), slippage=float(slip if slip is not None else 0.05),
                 liq_fee=float(liqfee if liqfee is not None else 1.0), cross=(cross == "cross"), mmr=0.5,
+                mode=mode or "combined",
+                gap_entry=float(gap_entry if gap_entry is not None else 0.5),
+                gap_exit=float(gap_exit if gap_exit is not None else 0.1),
+                min_edge=float(edge if edge is not None else 0.3),
+                horizon_days=float(horizon if horizon is not None else 1),
                 fees={"binance": fb if fb is not None else DEFAULT_FEES["binance"],
                       "bybit": fy if fy is not None else DEFAULT_FEES["bybit"],
                       "bitget": fg if fg is not None else DEFAULT_FEES["bitget"]})
@@ -649,7 +676,7 @@ def build_app():
         main = res["main"]
         fig = go.Figure()
         for lev, r in res["equities"].items():
-            fig.add_trace(go.Scatter(x=r.index, y=r.values, mode="lines", name=f"{lev:g}x"))
+            fig.add_trace(go.Scatter(x=r.index, y=r.values, mode="lines", name=str(lev)))
         fig.update_layout(template="plotly_dark", height=340, title="Equity (net $, both exchanges)",
                           margin=dict(l=40, r=20, t=40, b=30))
         tr = main["trades"]
