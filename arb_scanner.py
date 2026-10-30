@@ -437,6 +437,9 @@ def config_warnings(p, min_vol):
                  f"(~{fee_rt:.2f}%): price trades lose money even when the gap closes")
     if p["mode"] == "both" and p.get("price_slots", 1) + p.get("funding_slots", 1) == 0:
         w.append("Both slot counts are 0: nothing can trade")
+    if p["mode"] != "funding" and p.get("gap_confirm_h", 2) < 2:
+        w.append("Gap confirm = 1: counts gaps seen on a single hourly close — many last only seconds/minutes "
+                 "and can't be traded by a polling bot; results will be optimistic")
     if p["usage"] > 0.9:
         w.append("Margin usage > 90%: no buffer left against liquidation")
     liq = (1 / max(p["max_pairs"] if p["mode"] != "both" else p.get("price_slots", 1) + p.get("funding_slots", 1), 1)
@@ -593,6 +596,8 @@ def build_app():
             field("Funding slots", dcc.Input(id="bt-funding-slots", type="number", value=1, min=0, style=inp)),
             field("Gap entry %", dcc.Input(id="bt-gap-entry", type="number", value=0.7, step=0.05, style=inp)),
             field("Gap exit %", dcc.Input(id="bt-gap-exit", type="number", value=0.1, step=0.05, style=inp)),
+            field("Gap confirm (1h closes)", dcc.Input(id="bt-gap-confirm", type="number", value=2, min=1, style=inp)),
+            field("Max gap % (glitch)", dcc.Input(id="bt-max-gap", type="number", value=3, min=0, step=0.5, style=inp)),
             field("Price max hold h", dcc.Input(id="bt-price-hold", type="number", value=24, min=1, style=inp)),
             field("Cooldown price h", dcc.Input(id="bt-cd-price", type="number", value=1, min=0, style=inp)),
             field("Cooldown funding h", dcc.Input(id="bt-cd-funding", type="number", value=4, min=0, style=inp)),
@@ -704,12 +709,13 @@ def build_app():
                    State("bt-cd-price", "value"), State("bt-cd-funding", "value"),
                    State("bt-min-settle", "value"), State("bt-exit-confirm", "value"),
                    State("bt-max-move", "value"), State("bt-exclude", "value"),
-                   State("bt-max-spread", "value"), State("bt-max-adverse", "value")],
+                   State("bt-max-spread", "value"), State("bt-max-adverse", "value"),
+                   State("bt-gap-confirm", "value"), State("bt-max-gap", "value")],
                   prevent_initial_call=True)
     def start_bt(_n, start, end, exs, cap, lev, usage, pairs, entry, exit_, confirm, hold, slip,
                  liqfee, cross, minvol, topn, fb, fy, fg, mode, gap_entry, gap_exit, pslots, fslots,
                  phold, cd_price, cd_funding, min_settle, exit_confirm, max_move, exclude,
-                 max_spread, max_adverse):
+                 max_spread, max_adverse, gap_confirm, max_gap):
         if not start or not end:
             return "❌ Pick a start and end date."
         if BT_JOB.get("running"):
@@ -734,6 +740,8 @@ def build_app():
                 min_settlements=int(min_settle if min_settle is not None else 1),
                 exit_confirm_h=int(exit_confirm or 4),
                 max_1h_move=float(max_move if max_move is not None else 8),
+                gap_confirm_h=int(gap_confirm or 2),
+                max_gap=float(max_gap if max_gap is not None else 3),
                 max_entry_spread=float(max_spread if max_spread is not None else 1.5),
                 max_adverse_basis=float(max_adverse if max_adverse is not None else 0.2),
                 fees={"binance": fb if fb is not None else DEFAULT_FEES["binance"],

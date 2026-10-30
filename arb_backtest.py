@@ -323,6 +323,8 @@ def run_backtest(universe, params, progress=None):
     min_settle = int(p.get("min_settlements", 1))      # funding: hold through N payments
     exit_confirm = max(int(p.get("exit_confirm_h", 4)), 1)
     max_move = float(p.get("max_1h_move", 8.0)) / 100
+    gap_confirm = max(int(p.get("gap_confirm_h", 2)), 1)    # gap must show on N hourly closes in a row
+    max_gap = float(p.get("max_gap", 3.0))                 # bigger = data glitch / different token
     max_spread = float(p.get("max_entry_spread", 1.5))     # %/day; above = short-lived spike
     max_adverse = float(p.get("max_adverse_basis", 0.2))   # % price gap against the hedge at entry   # skip coins that jumped this much in 1h
 
@@ -437,8 +439,12 @@ def run_backtest(universe, params, progress=None):
                     w = arr[t - confirm + 1:t + 1]
                     for sgn, lex, sex in ((1, b, a), (-1, a, b)):   # sgn=1: short a, long b
                         if eng == "price":
-                            gap = sgn * bs[t] if bs is not None else np.nan
-                            if not np.isnan(gap) and gap >= gap_entry:
+                            if bs is None:
+                                continue
+                            gw = sgn * bs[max(t - gap_confirm + 1, 0):t + 1]
+                            gap = gw[-1]
+                            if (len(gw) == gap_confirm and not np.isnan(gw).any()
+                                    and gw.min() >= gap_entry and (not max_gap or gw.max() <= max_gap)):
                                 cands.append((gap, coin, lex, sex))
                         elif not np.isnan(w).any() and (sgn * w).min() >= p["entry"]:
                             if max_spread and sgn * arr[t] > max_spread:
