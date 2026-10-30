@@ -3,3 +3,4 @@ __pycache__/
 .venv/
 arb_snapshots.db
 arb_history_cache.db
+arb_cache_1m/
