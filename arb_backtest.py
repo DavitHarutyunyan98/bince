@@ -1,11 +1,12 @@
 """Historical backtest of cross-exchange funding carry, price-gap convergence,
-or both combined (mode = funding | price | combined).
+or both as independent engines (mode = funding | price | both).
 
-Price gap: enter when the 1h-close price on one exchange is >= gap_entry %
+Price engine: enter when the 1h-close price on one exchange is >= gap_entry %
 above the other (short the dear one, long the cheap one), exit when the gap is
-<= gap_exit %. Funding is accrued on every hedge in every mode (it is real).
-Combined: enter when gap + funding x horizon - round-trip costs >= min_edge;
-exit only when BOTH the gap has closed and funding fell below exit.
+<= gap_exit % or after price_max_hold_h. Funding engine: the rules below.
+"both" runs the two engines INDEPENDENTLY with their own slots; one coin can
+only be in one position, each exchange holds at most (total slots) legs, and a
+closed coin has a per-engine cooldown. Funding is accrued on every hedge.
 NOTE: history has no bid/ask, so gaps come from 1h closes; the slippage input
 stands in for the bid/ask spread, and gaps lasting < 1h are not seen.
 
@@ -247,7 +248,8 @@ def run_backtest(universe, params, progress=None):
     """universe: list of dicts {coin, symbols: {ex: symbol}, mult: {ex: m}}.
     params: start_ms, end_ms, capital, leverage, usage, max_pairs, entry, exit,
             confirm_h, max_hold_days, fees{ex:%}, slippage, cross, mmr, liq_fee,
-            mode (funding|price|combined), gap_entry, gap_exit, min_edge, horizon_days.
+            mode (funding|price|both), gap_entry, gap_exit, price_slots, funding_slots,
+            cooldown_price_h, cooldown_funding_h, price_max_hold_h.
     Returns dict with summary, trades (DataFrame), equity (Series)."""
     p = params
     start, end = int(p["start_ms"]), int(p["end_ms"])
@@ -276,6 +278,17 @@ def run_backtest(universe, params, progress=None):
                 pairs.append((u["coin"], exs[a], exs[b], u))
     if not pairs:
         return {"error": "No funding history could be loaded for 2+ exchanges."}
+
+    mode = p.get("mode", "both")             # funding | price | both (independent engines)
+    if mode == "both":
+        slots = {"price": int(p.get("price_slots", 1)), "funding": int(p.get("funding_slots", 1))}
+    else:
+        slots = {"price": 0, "funding": 0}
+        slots[mode] = int(p["max_pairs"])
+    total_slots = max(sum(slots.values()), 1)
+    p = {**p, "max_pairs": total_slots}
+    cooldown = {"price": float(p.get("cooldown_price_h", 0.5)), "funding": float(p.get("cooldown_funding_h", 4))}
+    max_hold_h = {"price": float(p.get("price_max_hold_h", 24)), "funding": float(p["max_hold_days"]) * 24}
 
     notional = p["capital"] * p["usage"] * p["leverage"] / p["max_pairs"]
     if p["cross"]:
@@ -306,12 +319,10 @@ def run_backtest(universe, params, progress=None):
                 kl_cache[key] = None
         return kl_cache[key]
 
-    mode = p.get("mode", "funding")          # funding | price | combined
     gap_entry, gap_exit = p.get("gap_entry", 0.5), p.get("gap_exit", 0.1)
-    min_edge, horizon = p.get("min_edge", 0.3), p.get("horizon_days", 1.0)
     # Price basis per pair from 1h closes: (close_a - close_b) / close_b in %.
     basis = {}
-    if mode != "funding":
+    if slots["price"]:
         for i, (coin, a, b, u) in enumerate(pairs):
             say(f"Price history {i + 1}/{len(pairs)}: {coin} {a}/{b}")
             ka, kb = closes(coin, a, u), closes(coin, b, u)
@@ -327,6 +338,7 @@ def run_backtest(universe, params, progress=None):
         return fs, (sgn * bs[t] if bs is not None else np.nan)
 
     open_pos, trades = [], []
+    last_close = {}                           # (engine, coin) -> step closed
     equity = np.zeros(len(grid))
     realised = 0.0
     say("Simulating…")
@@ -334,51 +346,49 @@ def run_backtest(universe, params, progress=None):
         # --- accrue funding + check liquidation / exit for open positions
         still = []
         for pos in open_pos:
-            coin, lex, sex, u = pos["coin"], pos["long"], pos["short"], pos["u"]
+            coin, lex, sex, u, eng = pos["coin"], pos["long"], pos["short"], pos["u"], pos["engine"]
+            # Funding is real money on every hedge, whichever engine opened it.
             pos["funding"] += notional * (series[(coin, sex)][1][t] - series[(coin, lex)][1][t])
             lk, sk = pos["lk"], pos["sk"]
             liq = None
-            if lk and sk:
-                if lk[1][t] <= pos["l0"] * (1 - liq_move):
-                    liq = "long"
-                elif sk[0][t] >= pos["s0"] * (1 + liq_move):
-                    liq = "short"
-            s, bnow = oriented(coin, lex, sex, t)
-            f_done = np.isnan(s) or s < p["exit"]
-            g_done = np.isnan(bnow) or bnow <= gap_exit
-            done = {"funding": f_done, "price": g_done, "combined": f_done and g_done}[mode]
+            if lk[1][t] <= pos["l0"] * (1 - liq_move):
+                liq = "long"
+            elif sk[0][t] >= pos["s0"] * (1 + liq_move):
+                liq = "short"
+            s_now, b_now = oriented(coin, lex, sex, t)
+            if eng == "price":
+                done = np.isnan(b_now) or b_now <= gap_exit
+            else:
+                done = np.isnan(s_now) or s_now < p["exit"]
             held_h = t - pos["t0"]
             reason = None
             if liq:
                 reason = f"LIQUIDATED {liq}"
             elif done:
-                reason = {"funding": "funding spread below exit", "price": "price gap closed",
-                          "combined": "gap closed & funding below exit"}[mode]
-            elif held_h >= p["max_hold_days"] * 24:
+                reason = "price gap closed" if eng == "price" else "funding spread below exit"
+            elif held_h >= max_hold_h[eng]:
                 reason = "max hold"
             elif t == len(grid) - 1:
                 reason = "end of test"
             if reason:
-                if lk and sk:
-                    l1, s1 = lk[2][t], sk[2][t]
-                    if liq == "long":
-                        l1 = pos["l0"] * (1 - liq_move)
-                    if liq == "short":
-                        s1 = pos["s0"] * (1 + liq_move)
-                    price_pnl = notional * ((l1 - pos["l0"]) / pos["l0"] + (pos["s0"] - s1) / pos["s0"])
-                else:
-                    price_pnl = 0.0
+                l1, s1 = lk[2][t], sk[2][t]
+                if liq == "long":
+                    l1 = pos["l0"] * (1 - liq_move)
+                if liq == "short":
+                    s1 = pos["s0"] * (1 + liq_move)
+                price_pnl = notional * ((l1 - pos["l0"]) / pos["l0"] + (pos["s0"] - s1) / pos["s0"])
                 exit_fee = notional * ((fees[lex] + fees[sex]) / 100 + 2 * slip)
                 liq_cost = notional * p["liq_fee"] / 100 if liq else 0.0
                 net = pos["funding"] + price_pnl - pos["entry_fee"] - exit_fee - liq_cost
                 realised += net
+                last_close[(eng, coin)] = t
                 trades.append({
-                    "Coin": coin, "Long @": lex, "Short @": sex,
+                    "Engine": eng, "Coin": coin, "Long @": lex, "Short @": sex,
                     "Entry": pd.to_datetime(grid[pos["t0"]], unit="ms", utc=True).strftime("%Y-%m-%d %H:%M"),
                     "Exit": pd.to_datetime(grid[t], unit="ms", utc=True).strftime("%Y-%m-%d %H:%M"),
-                    "Hours": held_h, "Entry score": round(pos["s_entry"], 4),
-                    "Entry gap %": round(pos["g_entry"], 4) if not np.isnan(pos["g_entry"]) else None,
-                    "Entry funding %/day": round(pos["f_entry"], 4) if not np.isnan(pos["f_entry"]) else None,
+                    "Hours": held_h,
+                    "Entry gap %": None if np.isnan(pos["g_entry"]) else round(pos["g_entry"], 4),
+                    "Entry funding %/day": None if np.isnan(pos["f_entry"]) else round(pos["f_entry"], 4),
                     "Funding $": round(pos["funding"], 2), "Price PnL $": round(price_pnl, 2),
                     "Fees $": round(pos["entry_fee"] + exit_fee + liq_cost, 2),
                     "Net $": round(net, 2), "Exit reason": reason,
@@ -387,50 +397,50 @@ def run_backtest(universe, params, progress=None):
                 still.append(pos)
         open_pos = still
 
-        # --- entries
-        if len(open_pos) < p["max_pairs"] and t >= confirm and t < len(grid) - 1:
-            busy = {pos["coin"] for pos in open_pos}
-            cands = []
-            fee_rt = lambda x, y: 2 * (fees[x] + fees[y]) + 4 * slip * 100
-            for (coin, a, b), arr in sp.items():
-                if coin in busy:
+        # --- entries: each engine fills ONLY its own slots, independently
+        if t >= confirm and t < len(grid) - 1:
+            for eng in ("price", "funding"):
+                if sum(1 for x in open_pos if x["engine"] == eng) >= slots[eng]:
                     continue
-                w = arr[t - confirm + 1:t + 1]
-                bs = basis.get((coin, a, b))
-                for sgn, lex, sex in ((1, b, a), (-1, a, b)):     # short the first-named "a" when sgn=1
-                    fs = sgn * arr[t]
-                    gap = sgn * bs[t] if bs is not None else np.nan
-                    f_ok = not np.isnan(w).any() and (sgn * w).min() >= p["entry"]
-                    if mode == "funding":
-                        if f_ok:
-                            cands.append((fs, coin, lex, sex))
-                    elif mode == "price":
-                        if not np.isnan(gap) and gap >= gap_entry:
-                            cands.append((gap, coin, lex, sex))
-                    else:
-                        if np.isnan(gap) or np.isnan(fs):
-                            continue
-                        # Expected edge = price gap that should close + funding over the
-                        # horizon - round-trip costs. Either source can carry the trade.
-                        edge = gap + fs * horizon - fee_rt(lex, sex)
-                        if edge >= min_edge and (gap >= gap_entry or f_ok):
-                            cands.append((edge, coin, lex, sex))
-            for s, coin, lex, sex in sorted(cands, reverse=True):
-                if len(open_pos) >= p["max_pairs"] or coin in busy:
-                    continue
-                u = next(x for x in universe if x["coin"] == coin)
-                lk, sk = closes(coin, lex, u), closes(coin, sex, u)
-                if lk is None or sk is None or np.isnan(lk[2][t]) or np.isnan(sk[2][t]):
-                    continue
-                f0, g0 = oriented(coin, lex, sex, t)
-                open_pos.append({
-                    "coin": coin, "long": lex, "short": sex, "u": u, "t0": t, "s_entry": s,
-                    "f_entry": f0, "g_entry": g0,
-                    "lk": lk, "sk": sk, "l0": lk[2][t] * (1 + slip), "s0": sk[2][t] * (1 - slip),
-                    "funding": 0.0,
-                    "entry_fee": notional * (fees[lex] + fees[sex]) / 100,
-                })
-                busy.add(coin)
+                busy = {x["coin"] for x in open_pos}          # one coin = one position
+                cands = []
+                for (coin, a, b), arr in sp.items():
+                    if coin in busy:
+                        continue
+                    lc = last_close.get((eng, coin))
+                    if lc is not None and t - lc < cooldown[eng]:
+                        continue
+                    bs = basis.get((coin, a, b))
+                    w = arr[t - confirm + 1:t + 1]
+                    for sgn, lex, sex in ((1, b, a), (-1, a, b)):   # sgn=1: short a, long b
+                        if eng == "price":
+                            gap = sgn * bs[t] if bs is not None else np.nan
+                            if not np.isnan(gap) and gap >= gap_entry:
+                                cands.append((gap, coin, lex, sex))
+                        elif not np.isnan(w).any() and (sgn * w).min() >= p["entry"]:
+                            cands.append((sgn * arr[t], coin, lex, sex))
+                for score, coin, lex, sex in sorted(cands, reverse=True):
+                    if sum(1 for x in open_pos if x["engine"] == eng) >= slots[eng]:
+                        break
+                    if coin in busy:
+                        continue
+                    # Each exchange can host at most `total_slots` legs (margin limit).
+                    legs = [x["long"] for x in open_pos] + [x["short"] for x in open_pos]
+                    if legs.count(lex) >= total_slots or legs.count(sex) >= total_slots:
+                        continue
+                    u = next(x for x in universe if x["coin"] == coin)
+                    lk, sk = closes(coin, lex, u), closes(coin, sex, u)
+                    if lk is None or sk is None or np.isnan(lk[2][t]) or np.isnan(sk[2][t]):
+                        continue
+                    f0, g0 = oriented(coin, lex, sex, t)
+                    open_pos.append({
+                        "engine": eng, "coin": coin, "long": lex, "short": sex, "u": u, "t0": t,
+                        "f_entry": f0, "g_entry": g0,
+                        "lk": lk, "sk": sk, "l0": lk[2][t] * (1 + slip), "s0": sk[2][t] * (1 - slip),
+                        "funding": 0.0,
+                        "entry_fee": notional * (fees[lex] + fees[sex]) / 100,
+                    })
+                    busy.add(coin)
 
         # --- mark to market (funding accrued so far; price legs roughly offset)
         unreal = 0.0
@@ -448,7 +458,11 @@ def run_backtest(universe, params, progress=None):
     dd = ((eq + total_cap) / peak - 1).min() * 100
     net_total = float(tr["Net $"].sum()) if not tr.empty else 0.0
     summary = {
-        "Mode": mode, "Leverage": p["leverage"], "Notional per leg $": round(notional, 0),
+        "Mode": mode, "Leverage": p["leverage"],
+        "Price trades": int((tr["Engine"] == "price").sum()) if not tr.empty else 0,
+        "Price net $": round(float(tr.loc[tr["Engine"] == "price", "Net $"].sum()), 2) if not tr.empty else 0,
+        "Funding trades": int((tr["Engine"] == "funding").sum()) if not tr.empty else 0,
+        "Funding net $": round(float(tr.loc[tr["Engine"] == "funding", "Net $"].sum()), 2) if not tr.empty else 0, "Notional per leg $": round(notional, 0),
         "Liq. move per leg %": round(liq_move * 100, 1),
         "Trades": len(tr), "Liquidations": int(tr["Exit reason"].str.startswith("LIQ").sum()) if not tr.empty else 0,
         "Funding $": round(float(tr["Funding $"].sum()), 2) if not tr.empty else 0,

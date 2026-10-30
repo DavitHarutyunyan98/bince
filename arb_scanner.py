@@ -454,7 +454,7 @@ def _bt_worker(params, exchanges, min_vol, top_n):
             row = {"Selected": "◀" if lev == params["leverage"] else "", **r["summary"]}
             compare.append(row)
             equities[f"{params['mode']} {lev:g}x"] = r["equity"]
-        for m in ("funding", "price", "combined"):
+        for m in ("funding", "price", "both"):
             if m == params["mode"]:
                 continue
             say(f"Strategy comparison: {m}…")
@@ -537,26 +537,36 @@ def build_app():
                  style={"color": "#999", "fontSize": "12px", "margin": "6px 0 10px 0"}),
         html.Div(style={"display": "flex", "flexWrap": "wrap", "gap": "10px 16px",
                         "alignItems": "flex-end", "marginBottom": "12px"}, children=[
-            field("Start", dcc.Input(id="bt-start", type="text", value=str(today - timedelta(days=60)),
-                                     style={**inp, "width": "105px"})),
-            field("End", dcc.Input(id="bt-end", type="text", value=str(today - timedelta(days=1)),
-                                   style={**inp, "width": "105px"})),
+            field("Period", dcc.Dropdown(id="bt-preset", value=30, clearable=False,
+                                         options=[{"label": "Last 7 days", "value": 7},
+                                                  {"label": "Last 14 days", "value": 14},
+                                                  {"label": "Last 30 days", "value": 30},
+                                                  {"label": "Last 60 days", "value": 60},
+                                                  {"label": "Last 90 days", "value": 90},
+                                                  {"label": "Custom (pick dates)", "value": 0}],
+                                         style={"width": "170px", "color": "#000"})),
+            field("Dates", dcc.DatePickerRange(id="bt-dates", display_format="YYYY-MM-DD",
+                                               start_date=str(today - timedelta(days=30)),
+                                               end_date=str(today), max_date_allowed=str(today))),
             field("Exchanges", dcc.Checklist(id="bt-exchanges", value=EXCHANGES, inline=True,
                                              options=[{"label": f" {e} ", "value": e} for e in EXCHANGES],
                                              style={"color": "#eee"})),
-            field("Strategy", dcc.Dropdown(id="bt-mode", value="combined", clearable=False,
-                                           options=[{"label": "Combined (gap + funding)", "value": "combined"},
-                                                    {"label": "Funding gap only", "value": "funding"},
-                                                    {"label": "Price gap only", "value": "price"}],
-                                           style={"width": "210px", "color": "#000"})),
+            field("Strategy", dcc.Dropdown(id="bt-mode", value="both", clearable=False,
+                                           options=[{"label": "Both engines (independent)", "value": "both"},
+                                                    {"label": "Funding engine only", "value": "funding"},
+                                                    {"label": "Price-gap engine only", "value": "price"}],
+                                           style={"width": "220px", "color": "#000"})),
+            field("Price slots", dcc.Input(id="bt-price-slots", type="number", value=1, min=0, style=inp)),
+            field("Funding slots", dcc.Input(id="bt-funding-slots", type="number", value=1, min=0, style=inp)),
             field("Gap entry %", dcc.Input(id="bt-gap-entry", type="number", value=0.5, step=0.05, style=inp)),
             field("Gap exit %", dcc.Input(id="bt-gap-exit", type="number", value=0.1, step=0.05, style=inp)),
-            field("Min edge % (combined)", dcc.Input(id="bt-edge", type="number", value=0.3, step=0.05, style=inp)),
-            field("Funding horizon days", dcc.Input(id="bt-horizon", type="number", value=1, step=0.5, style=inp)),
+            field("Price max hold h", dcc.Input(id="bt-price-hold", type="number", value=24, min=1, style=inp)),
+            field("Cooldown price h", dcc.Input(id="bt-cd-price", type="number", value=1, min=0, style=inp)),
+            field("Cooldown funding h", dcc.Input(id="bt-cd-funding", type="number", value=4, min=0, style=inp)),
             field("Capital per exchange $", dcc.Input(id="bt-capital", type="number", value=500, style=inp)),
             field("Leverage", dcc.Input(id="bt-lev", type="number", value=10, min=1, style=inp)),
             field("Margin usage %", dcc.Input(id="bt-usage", type="number", value=80, min=1, max=100, style=inp)),
-            field("Max pairs open", dcc.Input(id="bt-pairs", type="number", value=2, min=1, style=inp)),
+            field("Max pairs (single engine)", dcc.Input(id="bt-pairs", type="number", value=2, min=1, style=inp)),
             field("Entry %/day", dcc.Input(id="bt-entry", type="number", value=0.3, step=0.05, style=inp)),
             field("Exit %/day", dcc.Input(id="bt-exit", type="number", value=0.05, step=0.05, style=inp)),
             field("Confirm hours", dcc.Input(id="bt-confirm", type="number", value=8, min=1, style=inp)),
@@ -574,10 +584,12 @@ def build_app():
                                "padding": "8px 16px", "borderRadius": "4px", "cursor": "pointer"}),
         ]),
         html.Div(id="bt-progress", style={"fontSize": "13px", "color": "#ffcc66", "marginBottom": "8px"}),
-        html.Div("Combined: enter when gap + funding × horizon − round-trip costs ≥ Min edge (and either the "
-                 "gap ≥ Gap entry or funding passed Entry/Confirm); exit only when the gap is ≤ Gap exit AND "
-                 "funding < Exit. Price history has no bid/ask: gaps come from 1h closes, slippage stands in "
-                 "for the spread, and gaps shorter than 1h are not seen.",
+        html.Div("Both engines: the price-gap engine and the funding engine trade independently, each only in "
+                 "its own slots. Position size = capital × margin usage × leverage ÷ total slots. One coin can "
+                 "be in only one position; each exchange holds at most (total slots) legs; a closed coin waits "
+                 "its cooldown before the same engine reopens it. Funding is paid/earned on every hedge. Price "
+                 "history has no bid/ask: gaps come from 1h closes, slippage stands in for the spread, and gaps "
+                 "shorter than 1h are not seen.",
                  style={"color": "#999", "fontSize": "12px", "marginBottom": "8px"}),
         html.H3("Comparison: leverages (selected strategy) and strategies (selected leverage)"),
         dash_table.DataTable(id="bt-compare", **{**table_style, "page_size": 10,
@@ -617,34 +629,63 @@ def build_app():
                  ]),
     ])
 
+    @app.callback([Output("bt-dates", "start_date"), Output("bt-dates", "end_date")],
+                  Input("bt-preset", "value"), prevent_initial_call=True)
+    def apply_preset(days):
+        if not days:
+            return no_update, no_update
+        now = datetime.now(timezone.utc).date()
+        return str(now - timedelta(days=int(days))), str(now)
+
+    @app.callback(Output("bt-preset", "value"),
+                  [Input("bt-dates", "start_date"), Input("bt-dates", "end_date")],
+                  State("bt-preset", "value"), prevent_initial_call=True)
+    def dates_to_custom(start, end, preset):
+        # Picking dates by hand switches the period to "Custom".
+        if not preset or not start or not end:
+            return no_update
+        now = datetime.now(timezone.utc).date()
+        if start[:10] == str(now - timedelta(days=int(preset))) and end[:10] == str(now):
+            return no_update
+        return 0
+
     @app.callback(Output("bt-progress", "children"),
                   Input("bt-run", "n_clicks"),
-                  [State("bt-start", "value"), State("bt-end", "value"), State("bt-exchanges", "value"),
+                  [State("bt-dates", "start_date"), State("bt-dates", "end_date"), State("bt-exchanges", "value"),
                    State("bt-capital", "value"), State("bt-lev", "value"), State("bt-usage", "value"),
                    State("bt-pairs", "value"), State("bt-entry", "value"), State("bt-exit", "value"),
                    State("bt-confirm", "value"), State("bt-hold", "value"), State("bt-slip", "value"),
                    State("bt-liqfee", "value"), State("bt-cross", "value"), State("bt-minvol", "value"),
                    State("bt-topn", "value"), State("fee-binance", "value"), State("fee-bybit", "value"),
                    State("fee-bitget", "value"), State("bt-mode", "value"), State("bt-gap-entry", "value"),
-                   State("bt-gap-exit", "value"), State("bt-edge", "value"), State("bt-horizon", "value")],
+                   State("bt-gap-exit", "value"), State("bt-price-slots", "value"),
+                   State("bt-funding-slots", "value"), State("bt-price-hold", "value"),
+                   State("bt-cd-price", "value"), State("bt-cd-funding", "value")],
                   prevent_initial_call=True)
     def start_bt(_n, start, end, exs, cap, lev, usage, pairs, entry, exit_, confirm, hold, slip,
-                 liqfee, cross, minvol, topn, fb, fy, fg, mode, gap_entry, gap_exit, edge, horizon):
+                 liqfee, cross, minvol, topn, fb, fy, fg, mode, gap_entry, gap_exit, pslots, fslots,
+                 phold, cd_price, cd_funding):
+        if not start or not end:
+            return "❌ Pick a start and end date."
         if BT_JOB.get("running"):
             return "A backtest is already running…"
         try:
             params = dict(
-                start_ms=bt.ms(start), end_ms=bt.ms(end, end_of_day=True),
+                start_ms=bt.ms(start),
+                end_ms=min(bt.ms(end, end_of_day=True), int(time.time() * 1000) - 3_600_000),
                 capital=float(cap or 500), leverage=float(lev or 10), usage=float(usage or 80) / 100,
                 max_pairs=int(pairs or 2), entry=float(entry if entry is not None else 0.3),
                 exit=float(exit_ if exit_ is not None else 0.05), confirm_h=int(confirm or 8),
                 max_hold_days=float(hold or 10), slippage=float(slip if slip is not None else 0.05),
                 liq_fee=float(liqfee if liqfee is not None else 1.0), cross=(cross == "cross"), mmr=0.5,
-                mode=mode or "combined",
+                mode=mode or "both",
                 gap_entry=float(gap_entry if gap_entry is not None else 0.5),
                 gap_exit=float(gap_exit if gap_exit is not None else 0.1),
-                min_edge=float(edge if edge is not None else 0.3),
-                horizon_days=float(horizon if horizon is not None else 1),
+                price_slots=int(pslots if pslots is not None else 1),
+                funding_slots=int(fslots if fslots is not None else 1),
+                price_max_hold_h=float(phold or 24),
+                cooldown_price_h=float(cd_price if cd_price is not None else 1),
+                cooldown_funding_h=float(cd_funding if cd_funding is not None else 4),
                 fees={"binance": fb if fb is not None else DEFAULT_FEES["binance"],
                       "bybit": fy if fy is not None else DEFAULT_FEES["bybit"],
                       "bitget": fg if fg is not None else DEFAULT_FEES["bitget"]})
