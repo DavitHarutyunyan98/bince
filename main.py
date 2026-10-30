@@ -3212,6 +3212,9 @@ app.layout = html.Div(style={'backgroundColor': '#111111', 'color': '#FFFFFF', '
                className='nav-link'),
         html.A('Optimizer Results', href='#optimizer-results-section',
                className='nav-link'),
+        # Separate process (arb_scanner.py) on port 8081, opened in a new tab.
+        html.A('Arb Scanner ↗', id='arb-scanner-link', href='#', target='_blank',
+               className='nav-link'),
         ], className='nav-links'),
     ], className='nav-bar'),
 
@@ -4947,6 +4950,13 @@ def _order_mode_label(mode):
 def show_add_cfg_info(order_mode, sizing):
     return (f"Uses the optimizer settings: order type = {_order_mode_label(order_mode)}, "
             f"sizing = {sizing or 'fixed'}, timeframe/strategy/params = from each row.")
+
+
+app.clientside_callback(
+    "function(_id) { return window.location.protocol + '//' + window.location.hostname + ':8081/'; }",
+    Output('arb-scanner-link', 'href'),
+    Input('arb-scanner-link', 'id')
+)
 
 
 @app.callback(
