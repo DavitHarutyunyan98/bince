@@ -32,6 +32,8 @@ from datetime import datetime, timedelta, timezone
 import pandas as pd
 import requests
 
+import arb_backtest as bt
+
 logger = logging.getLogger("arb_scanner")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 
@@ -413,6 +415,56 @@ def collector_loop():
 
 # ---------------------------------------------------------------------- UI --
 
+BT_JOB = {}
+
+
+def _bt_worker(params, exchanges, min_vol, top_n):
+    """Background backtest: download (cached) history once, then simulate the
+    chosen leverage plus a few others for comparison."""
+    BT_JOB.update(running=True, result=None, msg="Preparing universe…",
+                  job_id=BT_JOB.get("job_id", 0) + 1)
+    try:
+        with LOCK:
+            frames = dict(STATE["rows"])
+        if len(frames) < 2:
+            frames = {}
+            for name in exchanges:
+                try:
+                    frames[name] = FETCHERS[name]()
+                except Exception as e:
+                    logger.warning(f"backtest universe: {name} failed: {e}")
+        universe = bt.build_universe(frames, exchanges, min_vol, top_n)
+        if not universe:
+            BT_JOB["result"] = {"error": "No coins on 2+ exchanges pass the volume filter."}
+            return
+        t0 = time.time()
+
+        def say(m):
+            BT_JOB["msg"] = f"{m}  ({time.time() - t0:.0f}s, {len(universe)} coins)"
+
+        main = bt.run_backtest(universe, params, say)
+        if "error" in main:
+            BT_JOB["result"] = main
+            return
+        levs = sorted({2.0, 3.0, 5.0, 10.0, float(params["leverage"])})
+        compare, equities = [], {}
+        for lev in levs:
+            say(f"Leverage comparison {lev:g}x…")
+            r = main if lev == params["leverage"] else bt.run_backtest(universe, {**params, "leverage": lev})
+            row = {"Selected": "◀" if lev == params["leverage"] else "", **r["summary"]}
+            compare.append(row)
+            equities[lev] = r["equity"]
+        BT_JOB["result"] = {"main": main, "compare": compare, "equities": equities}
+        days = (params["end_ms"] - params["start_ms"]) / 86_400_000
+        BT_JOB["msg"] = (f"✅ Done in {time.time() - t0:.0f}s — {len(universe)} coins, {days:.0f} days. "
+                         f"Bias warning: universe/volume filter use TODAY's listings (delisted coins missing).")
+    except Exception as e:
+        logger.exception("backtest failed")
+        BT_JOB["result"] = {"error": str(e)}
+    finally:
+        BT_JOB["running"] = False
+
+
 def build_app():
     from dash import Dash, html, dcc, dash_table, Input, Output, State, no_update
     import plotly.graph_objects as go
@@ -437,11 +489,7 @@ def build_app():
         style_table={"overflowX": "auto"},
     )
 
-    app.layout = html.Div(style={"backgroundColor": "#1a1a1a", "minHeight": "100vh",
-                                 "padding": "12px", "fontFamily": "sans-serif", "color": "#eee"}, children=[
-        html.H2("Cross-Exchange Arbitrage Scanner (read-only)", style={"margin": "0 0 4px 0"}),
-        html.Div("Binance · Bybit · Bitget USDT perpetuals — public data only, no orders are placed.",
-                 style={"color": "#888", "fontSize": "13px", "marginBottom": "10px"}),
+    live_tab = html.Div(children=[
         html.Div(id="status", style={"fontSize": "13px", "marginBottom": "10px"}),
         html.Div(style={"display": "flex", "flexWrap": "wrap", "gap": "10px 16px",
                         "alignItems": "flex-end", "marginBottom": "12px"}, children=[
@@ -471,6 +519,152 @@ def build_app():
         html.Div(id="summary", style={"fontSize": "13px"}),
         dcc.Interval(id="tick", interval=30_000),
     ])
+
+    today = datetime.now(timezone.utc).date()
+    bt_tab = html.Div(children=[
+        html.Div("Replays the funding ACTUALLY PAID on each exchange: enter a hedge (long low-funding, "
+                 "short high-funding) when the spread stays above Entry for Confirm hours, exit when it "
+                 "drops below Exit or after Max hold. Fees + slippage on 4 fills, price PnL of both legs "
+                 "from 1h closes, liquidation checked on 1h highs/lows. First run downloads history "
+                 "(several minutes); re-runs use the local cache.",
+                 style={"color": "#999", "fontSize": "12px", "margin": "6px 0 10px 0"}),
+        html.Div(style={"display": "flex", "flexWrap": "wrap", "gap": "10px 16px",
+                        "alignItems": "flex-end", "marginBottom": "12px"}, children=[
+            field("Start", dcc.Input(id="bt-start", type="text", value=str(today - timedelta(days=60)),
+                                     style={**inp, "width": "105px"})),
+            field("End", dcc.Input(id="bt-end", type="text", value=str(today - timedelta(days=1)),
+                                   style={**inp, "width": "105px"})),
+            field("Exchanges", dcc.Checklist(id="bt-exchanges", value=EXCHANGES, inline=True,
+                                             options=[{"label": f" {e} ", "value": e} for e in EXCHANGES],
+                                             style={"color": "#eee"})),
+            field("Capital per exchange $", dcc.Input(id="bt-capital", type="number", value=500, style=inp)),
+            field("Leverage", dcc.Input(id="bt-lev", type="number", value=10, min=1, style=inp)),
+            field("Margin usage %", dcc.Input(id="bt-usage", type="number", value=80, min=1, max=100, style=inp)),
+            field("Max pairs open", dcc.Input(id="bt-pairs", type="number", value=2, min=1, style=inp)),
+            field("Entry %/day", dcc.Input(id="bt-entry", type="number", value=0.3, step=0.05, style=inp)),
+            field("Exit %/day", dcc.Input(id="bt-exit", type="number", value=0.05, step=0.05, style=inp)),
+            field("Confirm hours", dcc.Input(id="bt-confirm", type="number", value=8, min=1, style=inp)),
+            field("Max hold days", dcc.Input(id="bt-hold", type="number", value=10, step=1, style=inp)),
+            field("Slippage % / fill", dcc.Input(id="bt-slip", type="number", value=0.05, step=0.01, style=inp)),
+            field("Liq. fee %", dcc.Input(id="bt-liqfee", type="number", value=1.0, step=0.25, style=inp)),
+            field("Margin mode", dcc.RadioItems(id="bt-cross", value="cross", inline=True,
+                                                options=[{"label": " Cross ", "value": "cross"},
+                                                         {"label": " Isolated", "value": "isolated"}],
+                                                style={"color": "#eee"})),
+            field("Min 24h vol $ (today)", dcc.Input(id="bt-minvol", type="number", value=5_000_000, style={**inp, "width": "110px"})),
+            field("Coins (top by volume)", dcc.Input(id="bt-topn", type="number", value=40, min=2, style=inp)),
+            html.Button("Run backtest", id="bt-run", n_clicks=0,
+                        style={"backgroundColor": "#28a745", "color": "#fff", "border": "none",
+                               "padding": "8px 16px", "borderRadius": "4px", "cursor": "pointer"}),
+        ]),
+        html.Div(id="bt-progress", style={"fontSize": "13px", "color": "#ffcc66", "marginBottom": "8px"}),
+        html.H3("Leverage comparison (same data & rules)"),
+        dash_table.DataTable(id="bt-compare", **{**table_style, "page_size": 10,
+                                                 "style_data_conditional": [
+                                                     {"if": {"filter_query": "{Net $} > 0"}, "color": "#4caf50"},
+                                                     {"if": {"filter_query": "{Net $} < 0"}, "color": "#f44336"},
+                                                     {"if": {"filter_query": "{Liquidations} > 0",
+                                                             "column_id": "Liquidations"},
+                                                      "backgroundColor": "#5c1e1e"}]}),
+        dcc.Graph(id="bt-equity", figure=go.Figure().update_layout(template="plotly_dark", height=340)),
+        html.H3("Per coin"),
+        dash_table.DataTable(id="bt-coins", **{**table_style, "page_size": 15,
+                                               "style_data_conditional": [
+                                                   {"if": {"filter_query": "{Net $} > 0"}, "color": "#4caf50"},
+                                                   {"if": {"filter_query": "{Net $} < 0"}, "color": "#f44336"}]}),
+        html.H3("Trades (selected leverage)"),
+        dash_table.DataTable(id="bt-trades", **{**table_style,
+                                                "style_data_conditional": [
+                                                    {"if": {"filter_query": "{Net $} > 0"}, "color": "#4caf50"},
+                                                    {"if": {"filter_query": "{Net $} < 0"}, "color": "#f44336"}]}),
+        dcc.Interval(id="bt-tick", interval=2000),
+    ])
+
+    app.layout = html.Div(style={"backgroundColor": "#1a1a1a", "minHeight": "100vh",
+                                 "padding": "12px", "fontFamily": "sans-serif", "color": "#eee"}, children=[
+        html.H2("Cross-Exchange Arbitrage Scanner (read-only)", style={"margin": "0 0 4px 0"}),
+        html.Div("Binance · Bybit · Bitget USDT perpetuals — public data only, no orders are placed.",
+                 style={"color": "#888", "fontSize": "13px", "marginBottom": "10px"}),
+        dcc.Tabs(id="tabs", value="live", colors={"border": "#444", "primary": "#00BFFF", "background": "#2c2c2c"},
+                 children=[
+                     dcc.Tab(label="Live scanner", value="live", children=live_tab,
+                             style={"backgroundColor": "#2c2c2c", "color": "#ccc"},
+                             selected_style={"backgroundColor": "#1a1a1a", "color": "#00BFFF"}),
+                     dcc.Tab(label="Funding backtest", value="bt", children=bt_tab,
+                             style={"backgroundColor": "#2c2c2c", "color": "#ccc"},
+                             selected_style={"backgroundColor": "#1a1a1a", "color": "#00BFFF"}),
+                 ]),
+    ])
+
+    @app.callback(Output("bt-progress", "children"),
+                  Input("bt-run", "n_clicks"),
+                  [State("bt-start", "value"), State("bt-end", "value"), State("bt-exchanges", "value"),
+                   State("bt-capital", "value"), State("bt-lev", "value"), State("bt-usage", "value"),
+                   State("bt-pairs", "value"), State("bt-entry", "value"), State("bt-exit", "value"),
+                   State("bt-confirm", "value"), State("bt-hold", "value"), State("bt-slip", "value"),
+                   State("bt-liqfee", "value"), State("bt-cross", "value"), State("bt-minvol", "value"),
+                   State("bt-topn", "value"), State("fee-binance", "value"), State("fee-bybit", "value"),
+                   State("fee-bitget", "value")],
+                  prevent_initial_call=True)
+    def start_bt(_n, start, end, exs, cap, lev, usage, pairs, entry, exit_, confirm, hold, slip,
+                 liqfee, cross, minvol, topn, fb, fy, fg):
+        if BT_JOB.get("running"):
+            return "A backtest is already running…"
+        try:
+            params = dict(
+                start_ms=bt.ms(start), end_ms=bt.ms(end, end_of_day=True),
+                capital=float(cap or 500), leverage=float(lev or 10), usage=float(usage or 80) / 100,
+                max_pairs=int(pairs or 2), entry=float(entry if entry is not None else 0.3),
+                exit=float(exit_ if exit_ is not None else 0.05), confirm_h=int(confirm or 8),
+                max_hold_days=float(hold or 10), slippage=float(slip if slip is not None else 0.05),
+                liq_fee=float(liqfee if liqfee is not None else 1.0), cross=(cross == "cross"), mmr=0.5,
+                fees={"binance": fb if fb is not None else DEFAULT_FEES["binance"],
+                      "bybit": fy if fy is not None else DEFAULT_FEES["bybit"],
+                      "bitget": fg if fg is not None else DEFAULT_FEES["bitget"]})
+        except Exception as e:
+            return f"❌ Bad input: {e} (dates as YYYY-MM-DD)"
+        if params["end_ms"] <= params["start_ms"]:
+            return "❌ End must be after start."
+        threading.Thread(target=_bt_worker, args=(params, exs or EXCHANGES, float(minvol or 0),
+                                                  int(topn or 40)), daemon=True).start()
+        return "Starting…"
+
+    @app.callback([Output("bt-progress", "children", allow_duplicate=True),
+                   Output("bt-compare", "data"), Output("bt-compare", "columns"),
+                   Output("bt-equity", "figure"), Output("bt-coins", "data"), Output("bt-coins", "columns"),
+                   Output("bt-trades", "data"), Output("bt-trades", "columns")],
+                  Input("bt-tick", "n_intervals"), State("tabs", "value"),
+                  prevent_initial_call=True)
+    def poll_bt(_n, tab):
+        if tab != "bt":
+            return (no_update,) * 8
+        msg = BT_JOB.get("msg", "")
+        res = BT_JOB.get("result")
+        if res is None or BT_JOB.get("shown") == BT_JOB.get("job_id"):
+            return (msg,) + (no_update,) * 7
+        BT_JOB["shown"] = BT_JOB.get("job_id")
+        if "error" in res:
+            return (f"❌ {res['error']}",) + (no_update,) * 7
+        comp = res["compare"]
+        main = res["main"]
+        fig = go.Figure()
+        for lev, r in res["equities"].items():
+            fig.add_trace(go.Scatter(x=r.index, y=r.values, mode="lines", name=f"{lev:g}x"))
+        fig.update_layout(template="plotly_dark", height=340, title="Equity (net $, both exchanges)",
+                          margin=dict(l=40, r=20, t=40, b=30))
+        tr = main["trades"]
+        if tr.empty:
+            coins = []
+        else:
+            g = tr.groupby("Coin").agg(Trades=("Net $", "size"), Funding=("Funding $", "sum"),
+                                       Price=("Price PnL $", "sum"), Fees=("Fees $", "sum"),
+                                       Net=("Net $", "sum"), Hours=("Hours", "sum")).reset_index()
+            g = g.rename(columns={"Funding": "Funding $", "Price": "Price PnL $", "Fees": "Fees $",
+                                  "Net": "Net $", "Hours": "Hours held"}).round(2)
+            coins = g.sort_values("Net $", ascending=False).to_dict("records")
+        cols = lambda rows: [{"name": c, "id": c} for c in (rows[0].keys() if rows else ["—"])]
+        trows = tr.to_dict("records") if not tr.empty else []
+        return (msg, comp, cols(comp), fig, coins, cols(coins), trows, cols(trows))
 
     @app.callback(
         [Output("opps", "data"), Output("opps", "columns"), Output("status", "children"),
