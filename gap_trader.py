@@ -35,7 +35,6 @@ import hmac
 import html
 import json
 import logging
-import math
 import os
 import threading
 import time
@@ -157,6 +156,11 @@ class BitgetAPI:
         d = self._req("GET", "/api/v2/mix/position/all-position", {"productType": PRODUCT, "marginCoin": "USDT"})
         return {p["symbol"]: float(p.get("total") or 0) * (1 if p.get("holdSide") == "long" else -1)
                 for p in (d or []) if float(p.get("total") or 0) != 0}
+
+    def position(self, symbol):
+        d = self._req("GET", "/api/v2/mix/position/single-position",
+                      {"symbol": symbol, "productType": PRODUCT, "marginCoin": "USDT"})
+        return sum(float(p.get("total") or 0) * (1 if p.get("holdSide") == "long" else -1) for p in (d or []))
 
     def one_way_mode(self):
         try:
@@ -541,7 +545,7 @@ class GapTrader:
 
     def check_exit(self, coin):
         pos = self.positions.get(coin)
-        if not pos or coin in self.busy:
+        if not pos or coin in self.busy or time.time() - pos.get("close_failed_at", 0) < 60:
             return
         g = self.close_gap(pos)
         held = time.time() - pos["opened"]
@@ -554,6 +558,13 @@ class GapTrader:
             self.busy.add(coin)
             self.pool.submit(self.close_position, coin, reason)
 
+    def leg_amounts(self, pos):
+        """What is REALLY still open on each exchange: (long coins left, short coins left)."""
+        sym = pos["symbol"]
+        la = self.api[pos["long"]].position(sym)
+        sa = self.api[pos["short"]].position(sym)
+        return max(la, 0.0), max(-sa, 0.0)
+
     def close_position(self, coin, reason):
         self.busy.add(coin)
         pos = self.positions.get(coin)
@@ -561,28 +572,44 @@ class GapTrader:
             if not pos:
                 return
             sym, qty = pos["symbol"], pos["qty"]
-            q = self.qstr(coin, qty)
-            (lf, le), (sf, se) = self._both((self.api[pos["long"]].market, sym, "sell", q, True),
-                                            (self.api[pos["short"]].market, sym, "buy", q, True))
+            # Close only what really exists: a side may already be gone (liquidated / closed by hand).
+            long_left, short_left = self.leg_amounts(pos)
+            long_left, short_left = min(long_left, qty), min(short_left, qty)
+            lost = {"long": qty - long_left, "short": qty - short_left}
+            if lost["long"] > qty * 0.01 or lost["short"] > qty * 0.01:
+                reason = "LIQUIDATED or closed outside the bot"
+            no_fill = {"price": None, "qty": 0.0, "fee": 0.0}
+            jobs = {}
+            if long_left > 0:
+                jobs["long"] = (self.api[pos["long"]].market, sym, "sell", self.qstr(coin, long_left), True)
+            if short_left > 0:
+                jobs["short"] = (self.api[pos["short"]].market, sym, "buy", self.qstr(coin, short_left), True)
+            fills, errs = {"long": no_fill, "short": no_fill}, {}
+            futs = {k: self.pool.submit(*v) for k, v in jobs.items()}
+            for k, f in futs.items():
+                try:
+                    fills[k] = f.result(timeout=15)
+                except Exception as e:
+                    errs[k] = e
             for _ in range(3):   # retry any leg that failed to close
-                if le:
+                for k in list(errs):
                     try:
-                        lf, le = self.api[pos["long"]].market(sym, "sell", q, True), None
+                        fills[k] = jobs[k][0](*jobs[k][1:])
+                        errs.pop(k)
                     except Exception as e:
-                        le = e
-                if se:
-                    try:
-                        sf, se = self.api[pos["short"]].market(sym, "buy", q, True), None
-                    except Exception as e:
-                        se = e
-                if not le and not se:
+                        errs[k] = e
+                if not errs:
                     break
                 time.sleep(1)
-            if le or se:
+            if errs:
+                pos["close_failed_at"] = time.time()     # back off 60 s instead of retrying every second
                 self.telegram(f"🚨 <b>{coin}: could not close</b> "
-                              f"{'long on ' + NAMES[pos['long']] if le else ''} "
-                              f"{'short on ' + NAMES[pos['short']] if se else ''} — check the exchange manually! "
-                              f"{html.escape(str(le or se))[:200]}")
+                              + ", ".join(f"{k} on {NAMES[pos[k]]}" for k in errs)
+                              + f" — check the exchange manually! {html.escape(str(next(iter(errs.values()))))[:200]}")
+                return
+            lf, sf = fills["long"], fills["short"]
+            if lost["long"] > qty * 0.01 or lost["short"] > qty * 0.01:
+                self.report_lost_leg(pos, lost, lf, sf)
                 return
             long_pnl = (lf["price"] - pos["long_px"]) * qty
             short_pnl = (pos["short_px"] - sf["price"]) * qty
@@ -615,6 +642,53 @@ class GapTrader:
             self.telegram(f"🚨 <b>{coin}: close failed</b>: {html.escape(str(e))[:300]} — check manually!")
         finally:
             self.busy.discard(coin)
+
+    def report_lost_leg(self, pos, lost, lf, sf):
+        """A side vanished (liquidation or manual close). The rest was just closed; report it plainly."""
+        coin, qty = pos["coin"], pos["qty"]
+        lines = [f"🚨 <b>{coin}: a side was LIQUIDATED or closed outside the bot</b>"]
+        net, approx = 0.0, False
+        for side, fill, entry, sign in (("long", lf, pos["long_px"], 1), ("short", sf, pos["short_px"], -1)):
+            ex = pos[side]
+            closed = qty - lost[side]
+            if closed > 0 and fill["price"]:
+                pnl = (fill["price"] - entry) * closed * sign
+                fee = self.fee_or_est(fill, ex)[0]
+                net += pnl - fee
+                lines.append(f"{side.title()} {NAMES[ex]}: closed by bot {fmt_px(entry)} → {fmt_px(fill['price'])} "
+                             f"= {money(pnl)} (fee {fee:.2f})")
+            if lost[side] > 0:
+                q = self.quotes.get((ex, coin))
+                now_px = (q[0] if side == "long" else q[2]) if q else entry
+                pnl = (now_px - entry) * lost[side] * sign
+                net += pnl
+                approx = True
+                lines.append(f"{side.title()} {NAMES[ex]}: <b>gone on the exchange</b> ({lost[side]:g} {coin}); "
+                             f"approx {money(pnl)} at today's price — liquidation is usually worse, check "
+                             f"{NAMES[ex]} for the exact loss")
+        net -= pos["open_fees"]
+        self.add_day(net, 1)
+        with self.lock:
+            self.positions.pop(coin, None)
+            self.save()
+        self.cooldown[coin] = time.time() + 6 * 3600
+        lines.append(f"\nNet ≈ <b>{money(net)} USDT</b>{' (approx.)' if approx else ''} · coin paused 6h")
+        self.telegram("\n".join(lines))
+        log.warning(f"[{coin}] LOST LEG {lost} net≈{net:.4f}")
+
+    def sync_legs(self):
+        """Every few seconds: compare what we think is open with what the exchanges really hold."""
+        for coin, pos in list(self.positions.items()):
+            if coin in self.busy or time.time() - pos["opened"] < 15:
+                continue
+            try:
+                long_left, short_left = self.leg_amounts(pos)
+            except Exception as e:
+                log.warning(f"[{coin}] position check failed: {e}")
+                continue
+            if long_left < pos["qty"] * 0.99 or short_left < pos["qty"] * 0.99:
+                self.busy.add(coin)
+                self.close_position(coin, "side missing on exchange")
 
     def open_message(self, pos):
         notional = pos["qty"] * pos["long_px"]
@@ -661,10 +735,14 @@ class GapTrader:
 
     # ---------------------------------------------------------- housekeeping loop
     async def housekeeping(self):
-        last_status = 0
+        last_status = last_sync = 0
+        sync_job = None
         while True:
             await asyncio.sleep(1)
             now = time.time()
+            if self.positions and now - last_sync >= 10 and (sync_job is None or sync_job.done()):
+                last_sync = now
+                sync_job = self.pool.submit(self.sync_legs)
             for coin in list(self.pending):              # re-check gaps waiting for persistence
                 self.on_quote(coin)
             for coin in list(self.positions):
