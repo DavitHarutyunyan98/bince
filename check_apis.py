@@ -39,7 +39,9 @@ def main():
     bn = None
     try:
         bn = gt.BinanceAPI(cfg.get("api_key"), cfg.get("secret_key"))
-        report(OK, "Binance futures balance", f"{bn.balance():,.2f} USDT")
+        b = bn.balance()
+        report(OK if b > 0 else BAD, "Binance futures balance",
+               f"{b:,.2f} USDT" + ("" if b > 0 else " — no USDT in USD-M Futures: transfer some (or wrong account)"))
     except Exception as e:
         report(BAD, "Binance login / futures balance", str(e)[:200])
     if bn:
@@ -70,7 +72,9 @@ def main():
     bg = gt.BitgetAPI(keys.get("bitget_api_key", ""), keys.get("bitget_secret_key", ""),
                       keys.get("bitget_passphrase", ""))
     try:
-        report(OK, "Bitget USDT-M futures balance", f"{bg.balance():,.2f} USDT")
+        b = bg.balance()
+        report(OK if b > 0 else BAD, "Bitget USDT-M futures balance",
+               f"{b:,.2f} USDT" + ("" if b > 0 else " — transfer USDT from Spot to USDT-M Futures"))
     except Exception as e:
         report(BAD, "Bitget login / futures balance", str(e)[:200])
     try:
