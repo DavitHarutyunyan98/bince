@@ -407,6 +407,9 @@ class GapTrader:
         ql, qs = self.quotes.get((pos["long"], pos["coin"])), self.quotes.get((pos["short"], pos["coin"]))
         if not ql or not qs:
             return None
+        age = self.cfg["max_quote_age_seconds"]
+        if time.time() - ql[4] > age or time.time() - qs[4] > age:
+            return None          # never decide on stale prices
         return (qs[2] - ql[0]) / ql[0] * 100
 
     def can_open(self):
