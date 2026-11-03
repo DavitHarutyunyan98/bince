@@ -4,3 +4,8 @@ __pycache__/
 arb_snapshots.db
 arb_history_cache.db
 arb_cache_1m/
+gap_trader_keys.json
+gap_trader_state.json
+gap_trader.log
+STOP_GAP_TRADER
+CLOSE_ALL_GAPS

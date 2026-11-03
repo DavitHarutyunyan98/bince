@@ -1,0 +1,728 @@
+#!/usr/bin/env python3
+"""Live cross-exchange price-gap trader: Binance + Bitget USDT perpetuals.
+
+How it works
+  * Websockets stream the best bid/ask of every selected coin on both
+    exchanges (updates many times per second).
+  * Gap = what you could really sell at on the dear exchange (its BID) vs. what
+    you could really buy at on the cheap one (its ASK). When it is >= entry_gap_pct
+    in the same direction for persist_seconds, and the top of both books holds
+    our size, the bot sends BOTH market orders at the same moment: short on the
+    dear exchange, long on the cheap one.
+  * Right after the fills it checks the gap actually captured from the real fill
+    prices. Below min_captured_gap_pct -> it closes both legs immediately
+    ("opened without a real gap") and goes back to scanning.
+  * It closes both legs when the gap to close them (dear ASK vs cheap BID) is
+    <= exit_gap_pct, or after max_hold_minutes.
+  * If one leg fails to open, the other leg is closed at once (never one-sided).
+  * Telegram messages use REAL fill prices, quantities and fees from the
+    exchanges.
+
+Files
+  gap_trader_config.json  settings (created with defaults on first start)
+  gap_trader_keys.json    Bitget API key/secret/passphrase (never committed)
+  config.json             Binance keys + Telegram (same file the other bot uses)
+  gap_trader_state.json   open positions + today's stats (survives restarts)
+  STOP_GAP_TRADER         create this file -> no new entries (open ones still managed)
+  CLOSE_ALL_GAPS          create this file -> close every open position now
+
+Run:  .venv/bin/python gap_trader.py
+"""
+import asyncio
+import base64
+import hashlib
+import hmac
+import html
+import json
+import logging
+import math
+import os
+import threading
+import time
+import uuid
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from decimal import Decimal, ROUND_DOWN
+
+import requests
+import websockets
+from binance.client import Client
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
+                    handlers=[logging.FileHandler("gap_trader.log"), logging.StreamHandler()])
+log = logging.getLogger("gap_trader")
+
+CONFIG_FILE = "gap_trader_config.json"
+KEYS_FILE = "gap_trader_keys.json"
+STATE_FILE = "gap_trader_state.json"
+STOP_FILE = "STOP_GAP_TRADER"
+CLOSE_ALL_FILE = "CLOSE_ALL_GAPS"
+
+DEFAULT_CONFIG = {
+    "live_trading": True,
+    "size_usdt_per_side": 50,
+    "leverage": 10,
+    "entry_gap_pct": 1.0,
+    "persist_seconds": 1,
+    "min_captured_gap_pct": 0.3,
+    "exit_gap_pct": 0.1,
+    "max_gap_pct": 5.0,
+    "max_hold_minutes": 240,
+    "max_positions": 2,
+    "cooldown_minutes": 10,
+    "min_24h_volume_usdt": 5000000,
+    "max_quote_age_seconds": 5,
+    "daily_loss_limit_usdt": 30,
+    "taker_fee_pct": {"binance": 0.05, "bitget": 0.06},
+    "exclude": ["ANTHROPIC", "OPENAI", "SPACEX", "XAI", "USDC", "FDUSD", "XAU", "XAG", "PAXG"],
+}
+
+BITGET = "https://api.bitget.com"
+PRODUCT = "USDT-FUTURES"
+NAMES = {"binance": "Binance", "bitget": "Bitget"}
+
+
+def load_json(path, default=None):
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except Exception:
+        return default
+
+
+def save_json(path, data):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        json.dump(data, f, indent=2)
+    os.replace(tmp, path)
+
+
+def fmt_px(x):
+    if x is None:
+        return "—"
+    if x >= 100:
+        return f"{x:,.2f}"
+    if x >= 1:
+        return f"{x:.4f}"
+    return f"{x:.6g}"
+
+
+def money(x):
+    return f"{'+' if x >= 0 else '−'}{abs(x):.2f}"
+
+
+def dur(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m"
+
+
+# ======================================================================== exchanges
+
+class BitgetAPI:
+    def __init__(self, key, secret, passphrase):
+        self.key, self.secret, self.passphrase = key, secret, passphrase
+        self.s = requests.Session()
+        self.prepared = set()
+
+    def _req(self, method, path, params=None, body=None):
+        ts = str(int(time.time() * 1000))
+        query = ""
+        if params:
+            query = "?" + "&".join(f"{k}={v}" for k, v in params.items())
+        payload = json.dumps(body) if body else ""
+        msg = ts + method.upper() + path + query + payload
+        sign = base64.b64encode(hmac.new(self.secret.encode(), msg.encode(), hashlib.sha256).digest()).decode()
+        headers = {"ACCESS-KEY": self.key, "ACCESS-SIGN": sign, "ACCESS-TIMESTAMP": ts,
+                   "ACCESS-PASSPHRASE": self.passphrase, "Content-Type": "application/json", "locale": "en-US"}
+        r = self.s.request(method, BITGET + path + query, headers=headers, data=payload or None, timeout=10)
+        j = r.json()
+        if str(j.get("code")) != "00000":
+            raise RuntimeError(f"Bitget {path}: {j.get('code')} {j.get('msg')}")
+        return j.get("data")
+
+    def balance(self):
+        d = self._req("GET", "/api/v2/mix/account/accounts", {"productType": PRODUCT})
+        for a in d or []:
+            if a.get("marginCoin") == "USDT":
+                return float(a.get("usdtEquity") or a.get("accountEquity") or 0)
+        return 0.0
+
+    def positions(self):
+        d = self._req("GET", "/api/v2/mix/position/all-position", {"productType": PRODUCT, "marginCoin": "USDT"})
+        return {p["symbol"]: float(p.get("total") or 0) * (1 if p.get("holdSide") == "long" else -1)
+                for p in (d or []) if float(p.get("total") or 0) != 0}
+
+    def one_way_mode(self):
+        try:
+            self._req("POST", "/api/v2/mix/account/set-position-mode", body={"productType": PRODUCT,
+                                                                             "posMode": "one_way_mode"})
+        except Exception as e:
+            log.warning(f"Bitget position mode not changed ({e}); it must be one-way for this bot.")
+
+    def prepare_symbol(self, symbol, leverage):
+        if symbol in self.prepared:
+            return
+        self.prepared.add(symbol)
+        for path, body in (("/api/v2/mix/account/set-margin-mode", {"marginMode": "crossed"}),
+                           ("/api/v2/mix/account/set-leverage", {"leverage": str(int(leverage))})):
+            try:
+                self._req("POST", path, body={"symbol": symbol, "productType": PRODUCT, "marginCoin": "USDT", **body})
+            except Exception as e:
+                log.warning(f"Bitget {symbol} {path.rsplit('/', 1)[-1]}: {e}")
+
+    def market(self, symbol, side, qty, reduce_only=False):
+        """side: 'buy'/'sell'. Returns dict(price, qty, fee, id)."""
+        d = self._req("POST", "/api/v2/mix/order/place-order", body={
+            "symbol": symbol, "productType": PRODUCT, "marginMode": "crossed", "marginCoin": "USDT",
+            "size": str(qty), "side": side, "orderType": "market", "reduceOnly": "YES" if reduce_only else "NO",
+            "clientOid": "gap" + uuid.uuid4().hex[:20]})
+        oid = d["orderId"]
+        for _ in range(20):
+            time.sleep(0.15)
+            o = self._req("GET", "/api/v2/mix/order/detail", {"symbol": symbol, "productType": PRODUCT,
+                                                              "orderId": oid})
+            if o and o.get("state") == "filled":
+                return {"price": float(o["priceAvg"]), "qty": float(o["baseVolume"]),
+                        "fee": abs(float(o.get("fee") or 0)), "id": oid}
+        raise RuntimeError(f"Bitget order {oid} not filled in time")
+
+
+class BinanceAPI:
+    def __init__(self, key, secret):
+        self.c = Client(api_key=key, api_secret=secret)
+        self.lev_done = set()
+
+    def balance(self):
+        for a in self.c.futures_account_balance():
+            if a["asset"] == "USDT":
+                return float(a["balance"])
+        return 0.0
+
+    def position(self, symbol):
+        for p in self.c.futures_position_information(symbol=symbol):
+            return float(p["positionAmt"])
+        return 0.0
+
+    def positions(self):
+        return {p["symbol"]: float(p["positionAmt"]) for p in self.c.futures_position_information()
+                if float(p["positionAmt"]) != 0}
+
+    def prepare_symbol(self, symbol, leverage):
+        if symbol in self.lev_done:
+            return
+        try:
+            self.c.futures_change_leverage(symbol=symbol, leverage=int(leverage))
+        except Exception as e:
+            log.warning(f"Binance {symbol} leverage: {e}")
+        self.lev_done.add(symbol)
+
+    def market(self, symbol, side, qty, reduce_only=False):
+        """side: 'buy'/'sell'. Returns dict(price, qty, fee, id)."""
+        kw = dict(symbol=symbol, side=side.upper(), type="MARKET", quantity=qty, newOrderRespType="RESULT")
+        if reduce_only:
+            kw["reduceOnly"] = "true"
+        o = self.c.futures_create_order(**kw)
+        oid = o["orderId"]
+        price, filled = float(o.get("avgPrice") or 0), float(o.get("executedQty") or 0)
+        fee = None
+        for _ in range(6):
+            try:
+                tr = self.c.futures_account_trades(symbol=symbol, orderId=oid)
+                if tr:
+                    usdt = [float(t["commission"]) for t in tr if t.get("commissionAsset") == "USDT"]
+                    fee = sum(usdt) if len(usdt) == len(tr) else None   # paid in BNB -> estimate
+                    if not price:
+                        q = sum(float(t["qty"]) for t in tr)
+                        price = sum(float(t["price"]) * float(t["qty"]) for t in tr) / q
+                        filled = q
+                    break
+            except Exception:
+                pass
+            time.sleep(0.3)
+        return {"price": price, "qty": filled, "fee": fee, "id": oid}
+
+
+# ======================================================================== bot
+
+class GapTrader:
+    def __init__(self):
+        cfg = load_json(CONFIG_FILE)
+        if cfg is None:
+            save_json(CONFIG_FILE, DEFAULT_CONFIG)
+            cfg = {}
+        self.cfg = {**DEFAULT_CONFIG, **cfg}
+        main_cfg = load_json("config.json", {}) or {}
+        keys = load_json(KEYS_FILE)
+        if not keys or not keys.get("bitget_api_key"):
+            save_json(KEYS_FILE, {"bitget_api_key": "", "bitget_secret_key": "", "bitget_passphrase": ""})
+            raise SystemExit(f"Fill in your Bitget API key, secret and passphrase in {KEYS_FILE}, then start again.")
+        self.tg_token, self.tg_chat = main_cfg.get("telegram_bot_token"), main_cfg.get("telegram_chat_id")
+        self.bn = BinanceAPI(main_cfg.get("api_key"), main_cfg.get("secret_key"))
+        self.bg = BitgetAPI(keys["bitget_api_key"], keys["bitget_secret_key"], keys["bitget_passphrase"])
+        self.api = {"binance": self.bn, "bitget": self.bg}
+        self.quotes = {}            # (ex, coin) -> [bid, bid_qty, ask, ask_qty, t]
+        self.feed_seen = {"binance": 0.0, "bitget": 0.0}
+        self.pending = {}           # coin -> (direction, first_seen)
+        self.busy = set()
+        self.cooldown = {}
+        self.pool = ThreadPoolExecutor(max_workers=8)
+        st = load_json(STATE_FILE, {}) or {}
+        self.positions = st.get("positions", {})
+        self.day = st.get("day", {})
+        self.lock = threading.Lock()
+
+    # ---------------------------------------------------------- setup
+    def build_universe(self):
+        info = self.bn.c.futures_exchange_info()
+        bn_sym = {}
+        for s in info["symbols"]:
+            if s.get("contractType") != "PERPETUAL" or s.get("quoteAsset") != "USDT" or s.get("status") != "TRADING":
+                continue
+            f = {x["filterType"]: x for x in s["filters"]}
+            lot = f.get("MARKET_LOT_SIZE") or f.get("LOT_SIZE")
+            bn_sym[s["symbol"]] = {"step": Decimal(lot["stepSize"]).normalize(), "min": float(lot["minQty"]),
+                                   "min_notional": float(f.get("MIN_NOTIONAL", {}).get("notional", 5))}
+        bn_vol = {t["symbol"]: float(t["quoteVolume"]) for t in self.bn.c.futures_ticker()}
+        bg = requests.get(BITGET + "/api/v2/mix/market/contracts", params={"productType": PRODUCT}, timeout=15).json()
+        bg_sym = {}
+        for s in bg.get("data") or []:
+            if s.get("symbolStatus") != "normal":
+                continue
+            bg_sym[s["symbol"]] = {"step": Decimal(s["sizeMultiplier"]).normalize(),
+                                   "min": float(s["minTradeNum"]), "min_usdt": float(s.get("minTradeUSDT") or 5)}
+        bgt = requests.get(BITGET + "/api/v2/mix/market/tickers", params={"productType": PRODUCT}, timeout=15).json()
+        bg_vol = {t["symbol"]: float(t.get("usdtVolume") or t.get("quoteVolume") or 0) for t in bgt.get("data") or []}
+        # Never trade symbols the other bot (hybrid_trader) uses: one-way positions would net together.
+        other = {c.get("symbol") for c in (load_json("trade_config.json", []) or []) if isinstance(c, dict)}
+        excl = {x.upper() for x in self.cfg["exclude"]}
+        self.meta = {}
+        for sym in set(bn_sym) & set(bg_sym):
+            coin = sym[:-4]
+            if coin in excl or sym in other:
+                continue
+            if min(bn_vol.get(sym, 0), bg_vol.get(sym, 0)) < self.cfg["min_24h_volume_usdt"]:
+                continue
+            step = max(bn_sym[sym]["step"], bg_sym[sym]["step"])
+            # The coarser step must also be a whole multiple of the finer one.
+            if (step / min(bn_sym[sym]["step"], bg_sym[sym]["step"])) % 1 != 0:
+                continue
+            self.meta[coin] = {"symbol": sym, "step": step,
+                               "min_qty": max(bn_sym[sym]["min"], bg_sym[sym]["min"]),
+                               "min_usdt": max(bn_sym[sym]["min_notional"], bg_sym[sym]["min_usdt"])}
+        log.info(f"Universe: {len(self.meta)} coins on both exchanges with ≥ "
+                 f"{self.cfg['min_24h_volume_usdt']:,.0f} USDT 24h volume")
+
+    # ---------------------------------------------------------- feeds
+    async def binance_feed(self, coins):
+        chunks = [coins[i:i + 150] for i in range(0, len(coins), 150)]
+        await asyncio.gather(*(self._binance_conn(c) for c in chunks))
+
+    async def _binance_conn(self, coins):
+        url = "wss://fstream.binance.com/stream?streams=" + "/".join(
+            f"{self.meta[c]['symbol'].lower()}@bookTicker" for c in coins)
+        while True:
+            try:
+                async with websockets.connect(url, ping_interval=20, max_size=2 ** 22) as ws:
+                    log.info(f"Binance websocket connected ({len(coins)} coins)")
+                    async for raw in ws:
+                        d = json.loads(raw).get("data") or {}
+                        coin = d.get("s", "")[:-4]
+                        if coin in self.meta:
+                            self.quotes[("binance", coin)] = [float(d["b"]), float(d["B"]), float(d["a"]),
+                                                              float(d["A"]), time.time()]
+                            self.feed_seen["binance"] = time.time()
+                            self.on_quote(coin)
+            except Exception as e:
+                log.warning(f"Binance websocket dropped: {e}; reconnecting")
+                await asyncio.sleep(2)
+
+    async def bitget_feed(self, coins):
+        chunks = [coins[i:i + 200] for i in range(0, len(coins), 200)]
+        await asyncio.gather(*(self._bitget_conn(c) for c in chunks))
+
+    async def _bitget_conn(self, coins):
+        while True:
+            try:
+                async with websockets.connect("wss://ws.bitget.com/v2/ws/public", ping_interval=None,
+                                              max_size=2 ** 22) as ws:
+                    for i in range(0, len(coins), 50):
+                        await ws.send(json.dumps({"op": "subscribe", "args": [
+                            {"instType": PRODUCT, "channel": "books1", "instId": self.meta[c]["symbol"]}
+                            for c in coins[i:i + 50]]}))
+                        await asyncio.sleep(0.2)
+                    log.info(f"Bitget websocket connected ({len(coins)} coins)")
+
+                    async def pinger():
+                        while True:
+                            await asyncio.sleep(25)
+                            await ws.send("ping")
+                    ping_task = asyncio.create_task(pinger())
+                    try:
+                        async for raw in ws:
+                            if raw == "pong":
+                                continue
+                            m = json.loads(raw)
+                            if not m.get("data"):
+                                continue
+                            coin = m["arg"]["instId"][:-4]
+                            d = m["data"][0]
+                            if coin in self.meta and d.get("bids") and d.get("asks"):
+                                self.quotes[("bitget", coin)] = [float(d["bids"][0][0]), float(d["bids"][0][1]),
+                                                                 float(d["asks"][0][0]), float(d["asks"][0][1]),
+                                                                 time.time()]
+                                self.feed_seen["bitget"] = time.time()
+                                self.on_quote(coin)
+                    finally:
+                        ping_task.cancel()
+            except Exception as e:
+                log.warning(f"Bitget websocket dropped: {e}; reconnecting")
+                await asyncio.sleep(2)
+
+    # ---------------------------------------------------------- signal logic
+    def gaps(self, coin):
+        """Returns (fresh, {('long_ex','short_ex'): open_gap%}) from live bid/ask."""
+        qb, qg = self.quotes.get(("binance", coin)), self.quotes.get(("bitget", coin))
+        if not qb or not qg:
+            return False, {}
+        age = self.cfg["max_quote_age_seconds"]
+        now = time.time()
+        fresh = now - qb[4] <= age and now - qg[4] <= age
+        return fresh, {
+            ("binance", "bitget"): (qg[0] - qb[2]) / qb[2] * 100,   # buy Binance ask, sell Bitget bid
+            ("bitget", "binance"): (qb[0] - qg[2]) / qg[2] * 100,   # buy Bitget ask, sell Binance bid
+        }
+
+    def close_gap(self, pos):
+        """Gap left to close a position: buy back the short at its ASK, sell the long at its BID."""
+        ql, qs = self.quotes.get((pos["long"], pos["coin"])), self.quotes.get((pos["short"], pos["coin"]))
+        if not ql or not qs:
+            return None
+        return (qs[2] - ql[0]) / ql[0] * 100
+
+    def can_open(self):
+        if not self.cfg["live_trading"] or os.path.exists(STOP_FILE):
+            return False
+        if len(self.positions) + len(self.busy) >= self.cfg["max_positions"]:
+            return False
+        if self.today()["net"] <= -abs(self.cfg["daily_loss_limit_usdt"]):
+            return False
+        return all(time.time() - t < 10 for t in self.feed_seen.values())
+
+    def on_quote(self, coin):
+        if coin in self.positions:
+            self.check_exit(coin)
+            return
+        if coin in self.busy or time.time() < self.cooldown.get(coin, 0):
+            self.pending.pop(coin, None)
+            return
+        fresh, g = self.gaps(coin)
+        if not fresh:
+            self.pending.pop(coin, None)
+            return
+        best = max(g.items(), key=lambda kv: kv[1])
+        direction, gap = best
+        if not (self.cfg["entry_gap_pct"] <= gap <= self.cfg["max_gap_pct"]):
+            self.pending.pop(coin, None)
+            return
+        first = self.pending.get(coin)
+        now = time.time()
+        if not first or first[0] != direction:
+            self.pending[coin] = (direction, now)        # new gap or flipped direction: restart the clock
+            return
+        if now - first[1] < self.cfg["persist_seconds"] or not self.can_open():
+            return
+        long_ex, short_ex = direction
+        ql, qs = self.quotes[(long_ex, coin)], self.quotes[(short_ex, coin)]
+        size = self.cfg["size_usdt_per_side"]
+        if ql[2] * ql[3] < size or qs[0] * qs[1] < size:   # top of book must hold our size
+            return
+        self.pending.pop(coin, None)
+        self.busy.add(coin)
+        self.pool.submit(self.open_position, coin, long_ex, short_ex, gap, ql[2], qs[0])
+
+    # ---------------------------------------------------------- trading
+    def qty_for(self, coin, price):
+        m = self.meta[coin]
+        raw = Decimal(str(self.cfg["size_usdt_per_side"] / price))
+        q = (raw / m["step"]).to_integral_value(rounding=ROUND_DOWN) * m["step"]
+        if float(q) < m["min_qty"] or float(q) * price < m["min_usdt"]:
+            return None
+        return float(q)
+
+    def fee_or_est(self, fill, ex):
+        """Real fee from the exchange, or taker-rate estimate if it isn't in USDT."""
+        if fill.get("fee") is not None:
+            return fill["fee"], False
+        return fill["price"] * fill["qty"] * self.cfg["taker_fee_pct"][ex] / 100, True
+
+    def qstr(self, coin, q):
+        step = self.meta[coin]["step"]
+        return format((Decimal(str(q)) / step).to_integral_value(rounding=ROUND_DOWN) * step, "f")
+
+    def _both(self, a, b):
+        fa, fb = self.pool.submit(*a), self.pool.submit(*b)
+        out = []
+        for f in (fa, fb):
+            try:
+                out.append((f.result(timeout=15), None))
+            except Exception as e:
+                out.append((None, e))
+        return out
+
+    def open_position(self, coin, long_ex, short_ex, signal_gap, ask_long, bid_short):
+        sym = self.meta[coin]["symbol"]
+        try:
+            qty = self.qty_for(coin, ask_long)
+            if not qty:
+                log.info(f"[{coin}] size too small for exchange minimums, skipped")
+                return
+            if abs(self.bn.position(sym)) > 0:
+                log.info(f"[{coin}] Binance already has a position in {sym} (not ours), skipped")
+                self.cooldown[coin] = time.time() + 3600
+                return
+            for ex in (long_ex, short_ex):
+                self.api[ex].prepare_symbol(sym, self.cfg["leverage"])
+            t0 = time.time()
+            q = self.qstr(coin, qty)
+            (lf, le), (sf, se) = self._both((self.api[long_ex].market, sym, "buy", q),
+                                            (self.api[short_ex].market, sym, "sell", q))
+            if le or se:
+                # One leg failed: close the leg that did fill, never stay one-sided.
+                msg = [f"⚠️ <b>{coin}: one side failed to open</b>"]
+                if le:
+                    msg.append(f"Long on {NAMES[long_ex]} failed: {html.escape(str(le))[:200]}")
+                if se:
+                    msg.append(f"Short on {NAMES[short_ex]} failed: {html.escape(str(se))[:200]}")
+                for fill, ex, side in ((lf, long_ex, "sell"), (sf, short_ex, "buy")):
+                    if fill and fill["qty"] > 0:
+                        try:
+                            c = self.api[ex].market(sym, side, self.qstr(coin, fill["qty"]), reduce_only=True)
+                            pnl = (c["price"] - fill["price"]) * fill["qty"] * (1 if side == "sell" else -1)
+                            fees = self.fee_or_est(fill, ex)[0] + self.fee_or_est(c, ex)[0]
+                            self.add_day(pnl - fees, 1)
+                            msg.append(f"Closed the filled side on {NAMES[ex]}: {money(pnl - fees)} USDT "
+                                       f"(incl. {fees:.2f} fees)")
+                        except Exception as e:
+                            msg.append(f"🚨 Could NOT close {NAMES[ex]} side: {html.escape(str(e))[:200]} — "
+                                       f"check the exchange manually!")
+                self.cooldown[coin] = time.time() + self.cfg["cooldown_minutes"] * 60
+                self.telegram("\n".join(msg))
+                return
+            captured = (sf["price"] - lf["price"]) / lf["price"] * 100
+            (fl, el), (fs, es) = self.fee_or_est(lf, long_ex), self.fee_or_est(sf, short_ex)
+            pos = {"coin": coin, "symbol": sym, "long": long_ex, "short": short_ex, "qty": min(lf["qty"], sf["qty"]),
+                   "long_px": lf["price"], "short_px": sf["price"], "open_fees": fl + fs,
+                   "fees_estimated": el or es,
+                   "signal_gap": signal_gap, "captured_gap": captured, "opened": time.time(),
+                   "exec_ms": int((time.time() - t0) * 1000)}
+            with self.lock:
+                self.positions[coin] = pos
+                self.save()
+            log.info(f"[{coin}] OPEN long {long_ex} @ {lf['price']} / short {short_ex} @ {sf['price']} "
+                     f"qty {pos['qty']} captured {captured:.3f}% (signal {signal_gap:.3f}%)")
+            if captured < self.cfg["min_captured_gap_pct"]:
+                self.telegram(self.open_message(pos) + f"\n\n⚠️ Real gap at fill is only {captured:.2f}% "
+                              f"(minimum {self.cfg['min_captured_gap_pct']:.2f}%) — closing right away.")
+                self.close_position(coin, "opened without a real gap")
+            else:
+                self.telegram(self.open_message(pos))
+        except Exception as e:
+            log.exception(f"[{coin}] open failed")
+            self.telegram(f"⚠️ <b>{coin}</b>: open failed: {html.escape(str(e))[:300]}")
+            self.cooldown[coin] = time.time() + self.cfg["cooldown_minutes"] * 60
+        finally:
+            self.busy.discard(coin)
+
+    def check_exit(self, coin):
+        pos = self.positions.get(coin)
+        if not pos or coin in self.busy:
+            return
+        g = self.close_gap(pos)
+        held = time.time() - pos["opened"]
+        reason = None
+        if g is not None and g <= self.cfg["exit_gap_pct"]:
+            reason = "gap closed"
+        elif held >= self.cfg["max_hold_minutes"] * 60:
+            reason = "max hold time"
+        if reason:
+            self.busy.add(coin)
+            self.pool.submit(self.close_position, coin, reason)
+
+    def close_position(self, coin, reason):
+        self.busy.add(coin)
+        pos = self.positions.get(coin)
+        try:
+            if not pos:
+                return
+            sym, qty = pos["symbol"], pos["qty"]
+            q = self.qstr(coin, qty)
+            (lf, le), (sf, se) = self._both((self.api[pos["long"]].market, sym, "sell", q, True),
+                                            (self.api[pos["short"]].market, sym, "buy", q, True))
+            for _ in range(3):   # retry any leg that failed to close
+                if le:
+                    try:
+                        lf, le = self.api[pos["long"]].market(sym, "sell", q, True), None
+                    except Exception as e:
+                        le = e
+                if se:
+                    try:
+                        sf, se = self.api[pos["short"]].market(sym, "buy", q, True), None
+                    except Exception as e:
+                        se = e
+                if not le and not se:
+                    break
+                time.sleep(1)
+            if le or se:
+                self.telegram(f"🚨 <b>{coin}: could not close</b> "
+                              f"{'long on ' + NAMES[pos['long']] if le else ''} "
+                              f"{'short on ' + NAMES[pos['short']] if se else ''} — check the exchange manually! "
+                              f"{html.escape(str(le or se))[:200]}")
+                return
+            long_pnl = (lf["price"] - pos["long_px"]) * qty
+            short_pnl = (pos["short_px"] - sf["price"]) * qty
+            (cl, e1), (cs, e2) = self.fee_or_est(lf, pos["long"]), self.fee_or_est(sf, pos["short"])
+            close_fees = cl + cs
+            est = pos["fees_estimated"] or e1 or e2
+            fees = pos["open_fees"] + close_fees
+            net = long_pnl + short_pnl - fees
+            self.add_day(net, 1)
+            with self.lock:
+                self.positions.pop(coin, None)
+                self.save()
+            self.cooldown[coin] = time.time() + self.cfg["cooldown_minutes"] * 60
+            held = time.time() - pos["opened"]
+            d = self.today()
+            icon = "✅" if net >= 0 else "🔻"
+            self.telegram(
+                f"{icon} <b>CLOSED {coin}: {money(net)} USDT</b>\n"
+                f"Reason: {reason} · held {dur(held)}\n\n"
+                f"Long  {NAMES[pos['long']]}: {fmt_px(pos['long_px'])} → {fmt_px(lf['price'])} = {money(long_pnl)}\n"
+                f"Short {NAMES[pos['short']]}: {fmt_px(pos['short_px'])} → {fmt_px(sf['price'])} = {money(short_pnl)}\n"
+                f"Fees: open {pos['open_fees']:.2f} + close {close_fees:.2f} = {fees:.2f}"
+                f"{' (some estimated)' if est else ''}\n"
+                f"Quantity: {qty:g} {coin} per side\n\n"
+                f"<b>Net: {money(net)} USDT</b>\n"
+                f"Today: {d['trades']} trades · {money(d['net'])} USDT")
+            log.info(f"[{coin}] CLOSED ({reason}) net {net:.4f} long {long_pnl:.4f} short {short_pnl:.4f} fees {fees:.4f}")
+        except Exception as e:
+            log.exception(f"[{coin}] close failed")
+            self.telegram(f"🚨 <b>{coin}: close failed</b>: {html.escape(str(e))[:300]} — check manually!")
+        finally:
+            self.busy.discard(coin)
+
+    def open_message(self, pos):
+        notional = pos["qty"] * pos["long_px"]
+        return (f"🟢 <b>OPENED {pos['coin']}</b>\n"
+                f"Long  {NAMES[pos['long']]}: {pos['qty']:g} @ {fmt_px(pos['long_px'])}\n"
+                f"Short {NAMES[pos['short']]}: {pos['qty']:g} @ {fmt_px(pos['short_px'])}\n\n"
+                f"Gap seen: {pos['signal_gap']:.2f}% → real gap at fill: <b>{pos['captured_gap']:.2f}%</b>\n"
+                f"Size: {notional:,.0f} USDT per side · {self.cfg['leverage']}x\n"
+                f"Fees paid: {pos['open_fees']:.2f} USDT{' (estimated)' if pos['fees_estimated'] else ''}\n"
+                f"Both orders filled in {pos['exec_ms']} ms\n"
+                f"Will close when the gap is ≤ {self.cfg['exit_gap_pct']}% "
+                f"(or after {self.cfg['max_hold_minutes']} min)")
+
+    # ---------------------------------------------------------- bookkeeping
+    def today(self):
+        key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+        if self.day.get("date") != key:
+            if self.day.get("date"):
+                self.telegram(f"📊 <b>Daily summary {self.day['date']} (UTC)</b>\n"
+                              f"Trades: {self.day.get('trades', 0)}\n"
+                              f"Net: <b>{money(self.day.get('net', 0))} USDT</b>")
+            self.day = {"date": key, "trades": 0, "net": 0.0}
+        return self.day
+
+    def add_day(self, net, trades):
+        with self.lock:
+            d = self.today()
+            d["net"] += net
+            d["trades"] += trades
+            self.save()
+
+    def save(self):
+        save_json(STATE_FILE, {"positions": self.positions, "day": self.day})
+
+    def telegram(self, text):
+        if not self.tg_token or not self.tg_chat:
+            log.info("TELEGRAM: " + text.replace("\n", " | "))
+            return
+        try:
+            requests.post(f"https://api.telegram.org/bot{self.tg_token}/sendMessage",
+                          data={"chat_id": self.tg_chat, "text": text[:4000], "parse_mode": "HTML"}, timeout=10)
+        except Exception as e:
+            log.warning(f"Telegram failed: {e}")
+
+    # ---------------------------------------------------------- housekeeping loop
+    async def housekeeping(self):
+        last_status = 0
+        while True:
+            await asyncio.sleep(1)
+            now = time.time()
+            for coin in list(self.pending):              # re-check gaps waiting for persistence
+                self.on_quote(coin)
+            for coin in list(self.positions):
+                self.check_exit(coin)
+            if os.path.exists(CLOSE_ALL_FILE):
+                os.remove(CLOSE_ALL_FILE)
+                self.telegram(f"🛑 CLOSE_ALL requested: closing {len(self.positions)} position(s)")
+                for coin in list(self.positions):
+                    if coin not in self.busy:
+                        self.pool.submit(self.close_position, coin, "manual close-all")
+            if now - last_status > 600:
+                last_status = now
+                stale = [ex for ex, t in self.feed_seen.items() if now - t > 10]
+                log.info(f"status: {len(self.positions)} open, today {self.today()['trades']} trades "
+                         f"{self.today()['net']:+.2f} USDT, feeds {'OK' if not stale else 'STALE: ' + ','.join(stale)}")
+
+    def startup_message(self):
+        try:
+            b_bal, g_bal = self.bn.balance(), self.bg.balance()
+        except Exception as e:
+            b_bal = g_bal = None
+            log.warning(f"balance check failed: {e}")
+        c = self.cfg
+        lines = [
+            "🚀 <b>Gap trader started</b>",
+            f"Mode: {'LIVE TRADING' if c['live_trading'] else 'watching only (live_trading = false)'}",
+            f"Balances: Binance {b_bal:,.2f} · Bitget {g_bal:,.2f} USDT" if b_bal is not None else "Balances: n/a",
+            f"Coins watched: {len(self.meta)}",
+            f"Size: {c['size_usdt_per_side']} USDT per side · {c['leverage']}x · max {c['max_positions']} positions",
+            f"Open at gap ≥ {c['entry_gap_pct']}% held {c['persist_seconds']}s · keep only if real gap ≥ "
+            f"{c['min_captured_gap_pct']}% · close at ≤ {c['exit_gap_pct']}%",
+            f"Daily loss limit: {c['daily_loss_limit_usdt']} USDT",
+        ]
+        if self.positions:
+            lines.append(f"Resumed open positions: {', '.join(self.positions)}")
+        self.telegram("\n".join(lines))
+
+    async def run(self):
+        self.build_universe()
+        self.bg.one_way_mode()
+        # Warn about positions on the exchanges that this bot doesn't know about.
+        try:
+            ours = {p["symbol"] for p in self.positions.values()}
+            foreign = [s for s in set(self.bg.positions()) - ours if s[:-4] in self.meta]
+            if foreign:
+                self.telegram("⚠️ Bitget has open positions not opened by this bot: " + ", ".join(foreign)
+                              + " — they are skipped.")
+                for s in foreign:
+                    self.cooldown[s[:-4]] = float("inf")
+        except Exception as e:
+            log.warning(f"position check failed: {e}")
+        self.startup_message()
+        coins = sorted(self.meta)
+        await asyncio.gather(self.binance_feed(coins), self.bitget_feed(coins), self.housekeeping())
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(GapTrader().run())
+    except KeyboardInterrupt:
+        pass
