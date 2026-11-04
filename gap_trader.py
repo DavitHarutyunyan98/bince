@@ -384,6 +384,7 @@ class GapTrader:
         self.day = st.get("day", {})
         self.lock = threading.Lock()
         self.started = time.time()
+        self.funded = {}            # exchange -> True if its balance can carry one more position
         self.last_small = {}        # coin -> last time its gap was "normal" (<= fresh_gap_below_pct)
         self.hour = self._new_hour()
 
@@ -586,6 +587,24 @@ class GapTrader:
             return None          # never decide on stale prices
         return (qs[2] - ql[0]) / ql[0] * 100
 
+    def refresh_balances(self, announce=False):
+        """An exchange is usable only if it holds 1.5x the margin one position needs."""
+        need = self.cfg["size_usdt_per_side"] / max(self.cfg["leverage"], 1) * 1.5
+        lines = []
+        for ex in self.exchanges:
+            try:
+                bal = self.api[ex].balance()
+            except Exception as e:
+                log.warning(f"{ex} balance check failed: {e}")
+                continue
+            ok = bal >= need
+            if self.funded.get(ex) is not None and self.funded[ex] != ok or (announce and not ok):
+                lines.append(f"{NAMES[ex]}: {bal:,.2f} USDT — " + ("usable again ✅" if ok else
+                             f"too low (needs ≥ {need:,.2f}), skipped ⛔"))
+            self.funded[ex] = ok
+        if lines:
+            self.telegram("💰 <b>Balance check</b>\n" + "\n".join(lines))
+
     def can_open(self):
         if not self.cfg["live_trading"] or os.path.exists(STOP_FILE):
             return False
@@ -602,7 +621,12 @@ class GapTrader:
             self.pending.pop(coin, None)
             return
         now = time.time()
+        # Ignore pairs that use an exchange without enough balance.
+        g = {k: v for k, v in g.items() if self.funded.get(k[0], True) and self.funded.get(k[1], True)} or g
         direction, gap = max(g.items(), key=lambda kv: kv[1])
+        if not (self.funded.get(direction[0], True) and self.funded.get(direction[1], True)):
+            self.pending.pop(coin, None)
+            return
         if gap <= self.cfg["fresh_gap_below_pct"]:
             self.last_small[coin] = now                  # gap is "normal" right now
         h = self.hour
@@ -979,6 +1003,9 @@ class GapTrader:
                 for coin in list(self.positions):
                     if coin not in self.busy:
                         self.pool.submit(self.close_position, coin, "manual close-all")
+            if now - getattr(self, "_bal_t", 0) >= 300:
+                self._bal_t = now
+                self.pool.submit(self.refresh_balances)
             if now - self.hour["start"] >= 3600:
                 self.roll_hour()
             if now - last_status > 600:
@@ -1032,6 +1059,8 @@ class GapTrader:
                               + " — those coins are skipped.")
                 for x in foreign:
                     self.cooldown[x[:-4]] = float("inf")
+        self.refresh_balances(announce=True)
+        self._bal_t = time.time()
         self.startup_message()
         feeds = {"binance": self.binance_feed, "bitget": self.bitget_feed, "bybit": self.bybit_feed}
         await asyncio.gather(*(feeds[ex](self.coins_on(ex)) for ex in self.exchanges), self.housekeeping())
