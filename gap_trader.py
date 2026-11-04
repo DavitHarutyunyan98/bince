@@ -605,6 +605,18 @@ class GapTrader:
         if lines:
             self.telegram("💰 <b>Balance check</b>\n" + "\n".join(lines))
 
+    def open_blocker(self):
+        """Why no new position may open right now ('' = allowed)."""
+        if not self.cfg["live_trading"]:
+            return "live_trading is false"
+        if os.path.exists(STOP_FILE):
+            return "STOP_GAP_TRADER file present"
+        if len(self.positions) + len(self.busy) >= self.cfg["max_positions"]:
+            return f"max_positions ({self.cfg['max_positions']}) already open"
+        if self.today()["net"] <= -abs(self.cfg["daily_loss_limit_usdt"]):
+            return "daily loss limit reached"
+        return ""
+
     def can_open(self):
         if not self.cfg["live_trading"] or os.path.exists(STOP_FILE):
             return False
@@ -625,6 +637,8 @@ class GapTrader:
         g = {k: v for k, v in g.items() if self.funded.get(k[0], True) and self.funded.get(k[1], True)} or g
         direction, gap = max(g.items(), key=lambda kv: kv[1])
         if not (self.funded.get(direction[0], True) and self.funded.get(direction[1], True)):
+            if gap >= self.cfg["entry_gap_pct"]:
+                self.hour["why"][coin] = "exchange balance too low"
             self.pending.pop(coin, None)
             return
         if gap <= self.cfg["fresh_gap_below_pct"]:
@@ -636,9 +650,14 @@ class GapTrader:
             self.pending.pop(coin, None)
             return
         if not (self.cfg["entry_gap_pct"] <= gap <= self.cfg["max_gap_pct"]):
+            if coin in self.pending and gap < self.cfg["entry_gap_pct"]:
+                h["why"].setdefault(coin, f"gone before {self.cfg['persist_seconds']}s")
+            elif gap > self.cfg["max_gap_pct"]:
+                h["why"][coin] = f"above max_gap {self.cfg['max_gap_pct']}%"
             self.pending.pop(coin, None)
             return
         h["seen"].add(coin)
+        h["best"][coin] = max(h["best"].get(coin, 0), gap)
         mins = self.cfg["fresh_gap_minutes"]
         if mins and now - self.last_small.get(coin, -1e18) > mins * 60:
             # Wide for longer than fresh_gap_minutes (or since the bot started): a stuck gap, skip.
@@ -649,12 +668,18 @@ class GapTrader:
         if not first or first[0] != direction:
             self.pending[coin] = (direction, now)        # new gap or flipped direction: restart the clock
             return
-        if now - first[1] < self.cfg["persist_seconds"] or not self.can_open():
+        if now - first[1] < self.cfg["persist_seconds"]:
+            return
+        blocked = self.open_blocker()
+        if blocked:
+            h["why"][coin] = blocked
             return
         long_ex, short_ex = direction
         ql, qs = self.quotes[(long_ex, coin)], self.quotes[(short_ex, coin)]
         size = self.cfg["size_usdt_per_side"]
         if ql[2] * ql[3] < size or qs[0] * qs[1] < size:   # top of book must hold our size
+            h["why"][coin] = (f"book too thin for {size:g} USDT "
+                              f"({NAMES[long_ex]} ask {ql[2] * ql[3]:,.0f}, {NAMES[short_ex]} bid {qs[0] * qs[1]:,.0f})")
             return
         self.pending.pop(coin, None)
         self.busy.add(coin)
@@ -663,7 +688,8 @@ class GapTrader:
 
     @staticmethod
     def _new_hour():
-        return {"start": time.time(), "max": (0.0, "—"), "seen": set(), "stale": set(), "traded": set()}
+        return {"start": time.time(), "max": (0.0, "—"), "seen": set(), "stale": set(), "traded": set(),
+                "why": {}, "best": {}}
 
     def roll_hour(self):
         """Hourly log line (and daily totals) of what the bot saw, traded and skipped."""
@@ -682,6 +708,12 @@ class GapTrader:
             if h["max"][0] > d.get("max_gap", 0):
                 d["max_gap"], d["max_gap_coin"] = h["max"][0], h["max"][1]
             self.save()
+        # One line per coin that crossed the entry gap but was not traded, with the reason.
+        for coin, best in sorted(h["best"].items(), key=lambda kv: -kv[1])[:15]:
+            if coin in h["traded"]:
+                continue
+            why = "stuck gap (old)" if coin in h["stale"] else h["why"].get(coin, "gone before it could be checked")
+            log.info(f"HOUR   not traded: {coin} max {best:.2f}% — {why}")
 
     # ---------------------------------------------------------- trading
     def leg_rules(self, coin, legs):
