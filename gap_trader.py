@@ -406,7 +406,8 @@ class GapTrader:
         self.lock = threading.Lock()
         self.started = time.time()
         self.funded = {}
-        self.depth_checked = {}     # coin -> last time deeper order-book levels were fetched            # exchange -> True if its balance can carry one more position
+        self.depth_checked = {}
+        self.blocked_legs = {}      # (coin, exchange) -> until time: that exchange rejected this coin     # coin -> last time deeper order-book levels were fetched            # exchange -> True if its balance can carry one more position
         self.last_small = {}        # coin -> last time its gap was "normal" (<= fresh_gap_below_pct)
         self.hour = self._new_hour()
 
@@ -604,6 +605,8 @@ class GapTrader:
         gap = (bid on the short exchange - ask on the long exchange) / that ask."""
         age, now, q = self.cfg["max_quote_age_seconds"], time.time(), {}
         for ex in self.meta[coin]["ex"]:
+            if self.blocked_legs.get((coin, ex), 0) > now:
+                continue
             x = self.quotes.get((ex, coin))
             if x and now - x[4] <= age:
                 q[ex] = x
@@ -887,6 +890,12 @@ class GapTrader:
                             msg.append(f"🚨 Could NOT close {NAMES[ex]} side: {html.escape(str(e))[:200]} — "
                                        f"check the exchange manually!")
                 self.cooldown[coin] = time.time() + self.R(coin)["cooldown_minutes"] * 60
+                for err, ex in ((le, long_ex), (se, short_ex)):
+                    if err:
+                        # Don't retry the same rejection every cooldown (each try costs fees).
+                        self.blocked_legs[(coin, ex)] = time.time() + 24 * 3600
+                        msg.append(f"⛔ {coin} will not be traded on {NAMES[ex]} for 24h "
+                                   f"(fix the cause, then restart the bot to retry sooner).")
                 self.telegram("\n".join(msg))
                 return
             captured = (sf["price"] - lf["price"]) / lf["price"] * 100
