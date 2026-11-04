@@ -29,7 +29,7 @@ def main():
         report(OK if cfg.get(k) else BAD, f"config.json {k}", "present" if cfg.get(k) else "missing")
     for k in ("telegram_bot_token", "telegram_chat_id"):
         report(OK if cfg.get(k) else WARN, f"config.json {k}", "present" if cfg.get(k) else "missing (no Telegram)")
-    for k in ("bitget_api_key", "bitget_secret_key", "bitget_passphrase"):
+    for k in ("bitget_api_key", "bitget_secret_key", "bitget_passphrase", "bybit_api_key", "bybit_secret_key"):
         report(OK if keys.get(k) else BAD, f"{gt.KEYS_FILE} {k}", "present" if keys.get(k) else "missing")
     tcfg = gt.load_json(gt.CONFIG_FILE)
     report(OK if tcfg is not None else WARN, gt.CONFIG_FILE,
@@ -98,6 +98,31 @@ def main():
     except Exception as e:
         report(WARN, "Bitget position mode", str(e)[:150])
 
+    print("\n=== Bybit ===")
+    by = gt.BybitAPI(keys.get("bybit_api_key", ""), keys.get("bybit_secret_key", ""))
+    try:
+        b = by.balance()
+        report(OK if b >= 1 else BAD, "Bybit USDT balance (Unified/Contract)",
+               f"{b:,.2f} USDT" + ("" if b >= 1 else " — transfer USDT to the Unified Trading account"))
+    except Exception as e:
+        report(BAD, "Bybit login / balance", str(e)[:200])
+    try:
+        pos = by.positions()
+        report(OK, "Bybit open positions", ", ".join(f"{s} {a:g}" for s, a in pos.items()) or "none")
+    except Exception as e:
+        report(BAD, "Bybit positions (needs Contract - Orders/Positions permission)", str(e)[:200])
+    try:
+        info = by._req("GET", "/v5/user/query-api")
+        perms = info.get("permissions") or {}
+        report(OK if perms.get("ContractTrade") or perms.get("Derivatives") else WARN, "Bybit key permissions",
+               ", ".join(f"{k}: {'/'.join(v)}" for k, v in perms.items() if v) or "(none listed)")
+        report(OK if not perms.get("Withdraw") else WARN, "Bybit key: withdrawals",
+               "disabled (good)" if not perms.get("Withdraw") else "ENABLED — safer to turn off")
+        report(OK if info.get("ips") and info["ips"] != ["*"] else WARN, "Bybit key: IP restriction",
+               "on" if info.get("ips") and info["ips"] != ["*"] else "off — recommended to bind your server IP")
+    except Exception as e:
+        report(WARN, "Bybit key permissions", f"could not read: {str(e)[:150]}")
+
     print("\n=== Live price feeds (5 seconds) ===")
 
     async def feeds():
@@ -121,8 +146,18 @@ def main():
                     if '"data"' in m:
                         got["bitget"] += 1
 
-        res = await asyncio.gather(b(), g(), return_exceptions=True)
-        for ex, r in zip(("binance", "bitget"), res):
+        async def y():
+            async with websockets.connect("wss://stream.bybit.com/v5/public/linear") as ws:
+                await ws.send(json.dumps({"op": "subscribe", "args": ["orderbook.1.BTCUSDT", "orderbook.1.ETHUSDT"]}))
+                end = time.time() + 5
+                while time.time() < end:
+                    m = await asyncio.wait_for(ws.recv(), 5)
+                    if '"topic"' in m:
+                        got["bybit"] += 1
+
+        got["bybit"] = 0
+        res = await asyncio.gather(b(), g(), y(), return_exceptions=True)
+        for ex, r in zip(("binance", "bitget", "bybit"), res):
             if isinstance(r, Exception) and not got[ex]:
                 report(BAD, f"{ex.title()} websocket", str(r)[:150])
             else:
@@ -135,6 +170,7 @@ def main():
         bot = object.__new__(gt.GapTrader)
         bot.cfg = {**gt.DEFAULT_CONFIG, **(tcfg or {})}
         bot.bn = bn
+        bot.exchanges = [e for e in bot.cfg["exchanges"] if e in gt.NAMES]
         bot.build_universe()
         report(OK if bot.meta else BAD, "Tradable coins", f"{len(bot.meta)} pass the volume filter")
     except Exception as e:
