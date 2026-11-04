@@ -526,7 +526,8 @@ class GapTrader:
                 await asyncio.sleep(2)
 
     async def binance_feed(self, coins):
-        chunks = [coins[i:i + 150] for i in range(0, len(coins), 150)]
+        # Small connections: one busy socket with hundreds of streams can't keep up and gets dropped.
+        chunks = [coins[i:i + 50] for i in range(0, len(coins), 50)]
         await asyncio.gather(*(self._binance_conn(c) for c in chunks))
 
     async def _binance_conn(self, coins):
@@ -534,7 +535,10 @@ class GapTrader:
             f"{self.meta[c]['symbol'].lower()}@bookTicker" for c in coins)
         while True:
             try:
-                async with websockets.connect(url, ping_interval=20, max_size=2 ** 22) as ws:
+                # Binance pings us and the library answers automatically; our own keep-alive pings
+                # time out under heavy load ("no close frame"), so they are switched off.
+                async with websockets.connect(url, ping_interval=None, ping_timeout=None, close_timeout=5,
+                                              max_size=2 ** 22, max_queue=4096) as ws:
                     log.info(f"Binance websocket connected ({len(coins)} coins)")
                     async for raw in ws:
                         d = json.loads(raw).get("data") or {}
@@ -545,7 +549,7 @@ class GapTrader:
                             self.feed_seen["binance"] = time.time()
                             self.on_quote(coin)
             except Exception as e:
-                log.warning(f"Binance websocket dropped: {e}; reconnecting")
+                log.warning(f"Binance websocket dropped ({len(coins)} coins): {e}; reconnecting")
                 await asyncio.sleep(2)
 
     async def bitget_feed(self, coins):
