@@ -65,6 +65,7 @@ DEFAULT_CONFIG = {
     "entry_gap_pct": 1.0,
     "persist_seconds": 1,
     "min_captured_gap_pct": 0.3,
+    "min_gap_at_size_pct": 0.6,     # when the best price is too small: gap at the AVERAGE fill for our size
     "exit_gap_pct": 0.1,
     "max_gap_pct": 5.0,
     "max_hold_minutes": 240,
@@ -88,6 +89,7 @@ DEFAULT_CONFIG = {
         "max_hold_minutes": 7200,
         "max_positions": 1,
         "persist_seconds": 5,
+        "min_gap_at_size_pct": 0.9,
         "cooldown_minutes": 30,
     },
     "taker_fee_pct": {"binance": 0.05, "bitget": 0.06, "bybit": 0.055},
@@ -401,7 +403,8 @@ class GapTrader:
         self.day = st.get("day", {})
         self.lock = threading.Lock()
         self.started = time.time()
-        self.funded = {}            # exchange -> True if its balance can carry one more position
+        self.funded = {}
+        self.depth_checked = {}     # coin -> last time deeper order-book levels were fetched            # exchange -> True if its balance can carry one more position
         self.last_small = {}        # coin -> last time its gap was "normal" (<= fresh_gap_below_pct)
         self.hour = self._new_hour()
 
@@ -632,14 +635,14 @@ class GapTrader:
         if lines:
             self.telegram("💰 <b>Balance check</b>\n" + "\n".join(lines))
 
-    def open_blocker(self, mode="fast"):
+    def open_blocker(self, mode="fast", ignore=None):
         """Why no new position may open right now ('' = allowed). Each mode has its own slots."""
         if not self.cfg["live_trading"]:
             return "live_trading is false"
         if os.path.exists(STOP_FILE):
             return "STOP_GAP_TRADER file present"
         limit = self.cfg["slow_mode"]["max_positions"] if mode == "slow" else self.cfg["max_positions"]
-        used = sum(1 for c in set(self.positions) | self.busy if self.mode_of(c) == mode)
+        used = sum(1 for c in (set(self.positions) | self.busy) - {ignore} if self.mode_of(c) == mode)
         if used >= limit:
             return f"{mode} max_positions ({limit}) already open"
         if self.today()["net"] <= -abs(self.cfg["daily_loss_limit_usdt"]):
@@ -700,14 +703,78 @@ class GapTrader:
         long_ex, short_ex = direction
         ql, qs = self.quotes[(long_ex, coin)], self.quotes[(short_ex, coin)]
         size = r["size_usdt_per_side"]
-        if ql[2] * ql[3] < size or qs[0] * qs[1] < size:   # top of book must hold our size
-            h["why"][coin] = (f"book too thin for {size:g} USDT "
-                              f"({NAMES[long_ex]} ask {ql[2] * ql[3]:,.0f}, {NAMES[short_ex]} bid {qs[0] * qs[1]:,.0f})")
+        if ql[2] * ql[3] < size or qs[0] * qs[1] < size:
+            # Best price can't hold our size: check deeper levels (REST, at most every 10 s per coin).
+            if now - self.depth_checked.get(coin, 0) < 10:
+                return
+            self.depth_checked[coin] = now
+            self.pending.pop(coin, None)
+            self.busy.add(coin)
+            self.pool.submit(self.depth_then_open, coin, long_ex, short_ex, gap, size, r)
             return
         self.pending.pop(coin, None)
         self.busy.add(coin)
         h["traded"].add(coin)
         self.pool.submit(self.open_position, coin, long_ex, short_ex, gap, ql[2], qs[0])
+
+    # ---------------------------------------------------------- order-book depth
+    def book(self, ex, symbol):
+        """Public order book: (bids, asks) as [(price, qty)], best first."""
+        if ex == "binance":
+            d = requests.get("https://fapi.binance.com/fapi/v1/depth", params={"symbol": symbol, "limit": 20},
+                             timeout=5).json()
+            b, a = d["bids"], d["asks"]
+        elif ex == "bitget":
+            d = requests.get(BITGET + "/api/v2/mix/market/merge-depth", timeout=5, params={
+                "symbol": symbol, "productType": PRODUCT, "limit": "50"}).json()["data"]
+            b, a = d["bids"], d["asks"]
+        else:
+            d = requests.get(BYBIT + "/v5/market/orderbook", timeout=5, params={
+                "category": "linear", "symbol": symbol, "limit": 50}).json()["result"]
+            b, a = d["b"], d["a"]
+        return [(float(p), float(q)) for p, q in b], [(float(p), float(q)) for p, q in a]
+
+    @staticmethod
+    def avg_fill(levels, usdt):
+        """Average price to fill `usdt` walking the book; None if the book is too thin."""
+        left, cost, qty = usdt, 0.0, 0.0
+        for p, q in levels:
+            take = min(left, p * q)
+            cost += take
+            qty += take / p
+            left -= take
+            if left <= 1e-9:
+                return cost / qty
+        return None
+
+    def depth_then_open(self, coin, long_ex, short_ex, top_gap, size, r):
+        """Open only if the gap still pays at the AVERAGE prices our full size would get."""
+        h = self.hour
+        try:
+            sym = self.meta[coin]["symbol"]
+            (_, asks), (bids, _) = self.book(long_ex, sym), self.book(short_ex, sym)
+            buy, sell = self.avg_fill(asks, size), self.avg_fill(bids, size)
+            if not buy or not sell:
+                h["why"][coin] = f"book too thin for {size:g} USDT even across 20+ levels"
+                return
+            gap_at_size = (sell - buy) / buy * 100
+            if gap_at_size < r["min_gap_at_size_pct"]:
+                h["why"][coin] = (f"gap at full {size:g} USDT only {gap_at_size:.2f}% "
+                                  f"(needs {r['min_gap_at_size_pct']}%; best-price gap {top_gap:.2f}%)")
+                return
+            blocked = self.open_blocker(r["mode"], ignore=coin)
+            if blocked:
+                h["why"][coin] = blocked
+                return
+            h["traded"].add(coin)
+            log.info(f"[{coin}] depth ok: gap {gap_at_size:.3f}% at {size:g} USDT (best-price gap {top_gap:.3f}%)")
+            self.open_position(coin, long_ex, short_ex, gap_at_size, buy, sell)   # clears busy itself
+            return
+        except Exception as e:
+            h["why"][coin] = f"order-book check failed: {str(e)[:80]}"
+        finally:
+            if coin not in self.positions:
+                self.busy.discard(coin)
 
     @staticmethod
     def _new_hour():
