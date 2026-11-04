@@ -26,6 +26,7 @@ Files
   gap_trader_state.json   open positions + today's stats (survives restarts)
   STOP_GAP_TRADER         create this file -> no new entries (open ones still managed)
   CLOSE_ALL_GAPS          create this file -> close every open position now
+  REPORT_GAPS             create this file -> write the gap report to the log now (normally hourly)
 
 Run:  .venv/bin/python gap_trader.py
 """
@@ -57,6 +58,7 @@ KEYS_FILE = "gap_trader_keys.json"
 STATE_FILE = "gap_trader_state.json"
 STOP_FILE = "STOP_GAP_TRADER"
 CLOSE_ALL_FILE = "CLOSE_ALL_GAPS"
+REPORT_FILE = "REPORT_GAPS"      # create it -> the hourly report is written right away
 
 DEFAULT_CONFIG = {
     "live_trading": True,
@@ -1132,7 +1134,10 @@ class GapTrader:
             if now - getattr(self, "_bal_t", 0) >= 300:
                 self._bal_t = now
                 self.pool.submit(self.refresh_balances)
-            if now - self.hour["start"] >= 3600:
+            if os.path.exists(REPORT_FILE):
+                os.remove(REPORT_FILE)
+                self.roll_hour()
+            elif now - self.hour["start"] >= 3600:
                 self.roll_hour()
             if now - last_status > 600:
                 last_status = now
