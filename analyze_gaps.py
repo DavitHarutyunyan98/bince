@@ -12,6 +12,9 @@ For each coin and exchange pair it measures, with the gap_trader rules:
 and compares the excluded coins (OPENAI, ANTHROPIC, ...) with all the others.
 Resolution is the scan interval (~2 min): gaps that lived only seconds are not here.
 
+Episodes still open when the data ends are COUNTED at their last recorded gap
+("still open" column) — leaving them out would hide exactly the stuck gaps.
+
 Result per episode = entry gap - exit gap - COST + funding earned while holding
 (funding from the scanner's recorded hedge funding %/day). "widest gap %" is the
 largest gap seen while the position was open (how far it went against you).
@@ -65,7 +68,7 @@ def main():
           f"cost {a.cost}%" + (f", fresh = previous scan ≤ {a.fresh}%" if a.fresh is not None else "") + "\n")
 
     stats = defaultdict(lambda: {"episodes": 0, "closed": 0, "net": [], "minutes": [], "above_min": 0.0,
-                                 "vol": 0.0, "pairs": set(), "worst": [], "funding": []})
+                                 "vol": 0.0, "pairs": set(), "worst": [], "funding": [], "open": 0})
     for (coin, buy, sell), g in df.groupby(["coin", "buy", "sell"]):
         gap = [0.0] * len(scans)                    # missing row = gap < 0.1% (treated as 0)
         fund = [None] * len(scans)                  # hedge funding %/day (long buy_ex, short sell_ex)
@@ -84,9 +87,10 @@ def main():
                 j = i + 1
                 while j < len(scans) and gap[j] > a.exit and mins[j] - mins[i] < a.hold:
                     j += 1
-                if j >= len(scans):
-                    break                            # still open at the end of the data: not counted
-                closed = gap[j] <= a.exit
+                still_open = j >= len(scans)
+                if still_open:
+                    j = len(scans) - 1               # still open when the data ends: count it at the last gap
+                closed = (not still_open) and gap[j] <= a.exit
                 # Funding earned (+) / paid (-) while holding, from the recorded %/day.
                 last_f, f_sum = 0.0, 0.0
                 for k in range(i, j):
@@ -95,6 +99,7 @@ def main():
                     f_sum += last_f * (mins[k + 1] - mins[k]) / 1440
                 st["episodes"] += 1
                 st["closed"] += closed
+                st["open"] += still_open
                 st["worst"].append(max(gap[i:j + 1]))
                 st["funding"].append(f_sum)
                 st["net"].append(gap[i] - gap[j] - a.cost + f_sum)
@@ -110,7 +115,7 @@ def main():
         n = st["episodes"]
         rows.append({
             "coin": coin, "excluded": "YES" if coin in EXCLUDED else "",
-            "episodes": n, "closed %": round(100 * st["closed"] / n) if n else None,
+            "episodes": n, "still open": st["open"], "closed %": round(100 * st["closed"] / n) if n else None,
             "avg minutes": round(sum(st["minutes"]) / n) if n else None,
             "avg net %": round(sum(st["net"]) / n, 3) if n else None,
             "avg funding %": round(sum(st["funding"]) / n, 3) if n else None,
@@ -136,7 +141,9 @@ def main():
             continue
         closed = sum(stats[c]["closed"] for c in part.coin)
         nets = [x for c in part.coin for x in stats[c]["net"]]
-        print(f"{label}: {ep} episodes · closed within {a.hold:g} min: {100 * closed / ep:.0f}% · "
+        still = sum(stats[c]["open"] for c in part.coin)
+        print(f"{label}: {ep} episodes ({still} still open at the end, counted at their last gap) · "
+              f"closed within {a.hold:g} min: {100 * closed / ep:.0f}% · "
               f"avg net {sum(nets) / ep:+.3f}% per trade · wins {100 * sum(x > 0 for x in nets) / ep:.0f}%")
 
 
