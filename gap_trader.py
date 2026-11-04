@@ -407,6 +407,7 @@ class GapTrader:
         self.started = time.time()
         self.funded = {}
         self.depth_checked = {}
+        self.last_eval = {}         # coin -> last time its gap was evaluated (throttle)
         self.blocked_legs = {}      # (coin, exchange) -> until time: that exchange rejected this coin     # coin -> last time deeper order-book levels were fetched            # exchange -> True if its balance can carry one more position
         self.last_small = {}        # coin -> last time its gap was "normal" (<= fresh_gap_below_pct)
         self.hour = self._new_hour()
@@ -663,6 +664,15 @@ class GapTrader:
         return ""
 
     def on_quote(self, coin):
+        # Prices are always stored by the feeds; the (heavier) gap check runs at most every 0.1 s
+        # per coin. Busy coins send hundreds of updates per second and would overload the bot.
+        now = time.time()
+        if now - self.last_eval.get(coin, 0) < 0.1:
+            return
+        self.last_eval[coin] = now
+        self._on_quote(coin)
+
+    def _on_quote(self, coin):
         if coin in self.positions:
             self.check_exit(coin)
             return
