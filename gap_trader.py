@@ -76,6 +76,20 @@ DEFAULT_CONFIG = {
     "max_quote_age_seconds": 5,
     "daily_loss_limit_usdt": 30,
     "exchanges": ["binance", "bitget", "bybit"],
+    # Slow mode: coins whose gaps close over hours/days (e.g. pre-IPO contracts). Own rules, own slot.
+    "slow_mode": {
+        "enabled": True,
+        "coins": ["OPENAI", "ANTHROPIC"],
+        "size_usdt_per_side": 500,
+        "leverage": 10,
+        "entry_gap_pct": 1.0,
+        "min_captured_gap_pct": 0.7,
+        "exit_gap_pct": 0.3,
+        "max_hold_minutes": 7200,
+        "max_positions": 1,
+        "persist_seconds": 5,
+        "cooldown_minutes": 30,
+    },
     "taker_fee_pct": {"binance": 0.05, "bitget": 0.06, "bybit": 0.055},
     "exclude": ["ANTHROPIC", "OPENAI", "SPACEX", "XAI", "USDC", "FDUSD", "XAU", "XAG", "PAXG"],
 }
@@ -353,6 +367,9 @@ class GapTrader:
         self.cfg = {**DEFAULT_CONFIG, **cfg}
         # Nested dict: fill in exchanges missing from the user's file (e.g. a newly added Bybit).
         self.cfg["taker_fee_pct"] = {**DEFAULT_CONFIG["taker_fee_pct"], **(cfg.get("taker_fee_pct") or {})}
+        self.cfg["slow_mode"] = {**DEFAULT_CONFIG["slow_mode"], **(cfg.get("slow_mode") or {})}
+        sm = self.cfg["slow_mode"]
+        self.slow_coins = {c.upper() for c in sm["coins"]} if sm.get("enabled") else set()
         main_cfg = load_json("config.json", {}) or {}
         keys = load_json(KEYS_FILE, {}) or {}
         self.exchanges = [e for e in self.cfg["exchanges"] if e in NAMES]
@@ -436,7 +453,7 @@ class GapTrader:
         lists = {ex: self._listings(ex) for ex in self.exchanges}
         # Never trade symbols the other bot (hybrid_trader) uses: one-way positions would net together.
         other = {c.get("symbol") for c in (load_json("trade_config.json", []) or []) if isinstance(c, dict)}
-        excl = {x.upper() for x in self.cfg["exclude"]}
+        excl = {x.upper() for x in self.cfg["exclude"]} - getattr(self, "slow_coins", set())
         self.meta = {}
         for sym in set().union(*lists.values()):
             coin = sym[:-4]
@@ -566,6 +583,15 @@ class GapTrader:
                 await asyncio.sleep(2)
 
     # ---------------------------------------------------------- signal logic
+    def R(self, coin):
+        """Rules for this coin: slow-mode overrides for slow coins, the normal settings otherwise."""
+        if coin in self.slow_coins:
+            return {**self.cfg, **self.cfg["slow_mode"], "mode": "slow", "fresh_gap_minutes": 0}
+        return {**self.cfg, "mode": "fast"}
+
+    def mode_of(self, coin):
+        return "slow" if coin in self.slow_coins else "fast"
+
     def gaps(self, coin):
         """{(long_ex, short_ex): gap%} for every pair of exchanges with FRESH quotes.
         gap = (bid on the short exchange - ask on the long exchange) / that ask."""
@@ -589,7 +615,8 @@ class GapTrader:
 
     def refresh_balances(self, announce=False):
         """An exchange is usable only if it holds 1.5x the margin one position needs."""
-        need = self.cfg["size_usdt_per_side"] / max(self.cfg["leverage"], 1) * 1.5
+        modes = [self.cfg] + ([self.cfg["slow_mode"]] if self.slow_coins else [])
+        need = min(m["size_usdt_per_side"] / max(m["leverage"], 1) for m in modes) * 1.5
         lines = []
         for ex in self.exchanges:
             try:
@@ -605,29 +632,25 @@ class GapTrader:
         if lines:
             self.telegram("💰 <b>Balance check</b>\n" + "\n".join(lines))
 
-    def open_blocker(self):
-        """Why no new position may open right now ('' = allowed)."""
+    def open_blocker(self, mode="fast"):
+        """Why no new position may open right now ('' = allowed). Each mode has its own slots."""
         if not self.cfg["live_trading"]:
             return "live_trading is false"
         if os.path.exists(STOP_FILE):
             return "STOP_GAP_TRADER file present"
-        if len(self.positions) + len(self.busy) >= self.cfg["max_positions"]:
-            return f"max_positions ({self.cfg['max_positions']}) already open"
+        limit = self.cfg["slow_mode"]["max_positions"] if mode == "slow" else self.cfg["max_positions"]
+        used = sum(1 for c in set(self.positions) | self.busy if self.mode_of(c) == mode)
+        if used >= limit:
+            return f"{mode} max_positions ({limit}) already open"
         if self.today()["net"] <= -abs(self.cfg["daily_loss_limit_usdt"]):
             return "daily loss limit reached"
         return ""
-
-    def can_open(self):
-        if not self.cfg["live_trading"] or os.path.exists(STOP_FILE):
-            return False
-        if len(self.positions) + len(self.busy) >= self.cfg["max_positions"]:
-            return False
-        return self.today()["net"] > -abs(self.cfg["daily_loss_limit_usdt"])
 
     def on_quote(self, coin):
         if coin in self.positions:
             self.check_exit(coin)
             return
+        r = self.R(coin)
         g = self.gaps(coin)
         if not g:
             self.pending.pop(coin, None)
@@ -637,11 +660,11 @@ class GapTrader:
         g = {k: v for k, v in g.items() if self.funded.get(k[0], True) and self.funded.get(k[1], True)} or g
         direction, gap = max(g.items(), key=lambda kv: kv[1])
         if not (self.funded.get(direction[0], True) and self.funded.get(direction[1], True)):
-            if gap >= self.cfg["entry_gap_pct"]:
+            if gap >= r["entry_gap_pct"]:
                 self.hour["why"][coin] = "exchange balance too low"
             self.pending.pop(coin, None)
             return
-        if gap <= self.cfg["fresh_gap_below_pct"]:
+        if gap <= r["fresh_gap_below_pct"]:
             self.last_small[coin] = now                  # gap is "normal" right now
         h = self.hour
         if gap > h["max"][0]:
@@ -649,16 +672,16 @@ class GapTrader:
         if coin in self.busy or now < self.cooldown.get(coin, 0):
             self.pending.pop(coin, None)
             return
-        if not (self.cfg["entry_gap_pct"] <= gap <= self.cfg["max_gap_pct"]):
-            if coin in self.pending and gap < self.cfg["entry_gap_pct"]:
-                h["why"].setdefault(coin, f"gone before {self.cfg['persist_seconds']}s")
-            elif gap > self.cfg["max_gap_pct"]:
-                h["why"][coin] = f"above max_gap {self.cfg['max_gap_pct']}%"
+        if not (r["entry_gap_pct"] <= gap <= r["max_gap_pct"]):
+            if coin in self.pending and gap < r["entry_gap_pct"]:
+                h["why"].setdefault(coin, f"gone before {r['persist_seconds']}s")
+            elif gap > r["max_gap_pct"]:
+                h["why"][coin] = f"above max_gap {r['max_gap_pct']}%"
             self.pending.pop(coin, None)
             return
         h["seen"].add(coin)
         h["best"][coin] = max(h["best"].get(coin, 0), gap)
-        mins = self.cfg["fresh_gap_minutes"]
+        mins = r["fresh_gap_minutes"]
         if mins and now - self.last_small.get(coin, -1e18) > mins * 60:
             # Wide for longer than fresh_gap_minutes (or since the bot started): a stuck gap, skip.
             h["stale"].add(coin)
@@ -668,15 +691,15 @@ class GapTrader:
         if not first or first[0] != direction:
             self.pending[coin] = (direction, now)        # new gap or flipped direction: restart the clock
             return
-        if now - first[1] < self.cfg["persist_seconds"]:
+        if now - first[1] < r["persist_seconds"]:
             return
-        blocked = self.open_blocker()
+        blocked = self.open_blocker(r["mode"])
         if blocked:
             h["why"][coin] = blocked
             return
         long_ex, short_ex = direction
         ql, qs = self.quotes[(long_ex, coin)], self.quotes[(short_ex, coin)]
-        size = self.cfg["size_usdt_per_side"]
+        size = r["size_usdt_per_side"]
         if ql[2] * ql[3] < size or qs[0] * qs[1] < size:   # top of book must hold our size
             h["why"][coin] = (f"book too thin for {size:g} USDT "
                               f"({NAMES[long_ex]} ask {ql[2] * ql[3]:,.0f}, {NAMES[short_ex]} bid {qs[0] * qs[1]:,.0f})")
@@ -724,12 +747,13 @@ class GapTrader:
             return None
         return step, max(x["min"] for x in ex), max(x["min_usdt"] for x in ex)
 
-    def qty_for(self, coin, price, legs):
+    def qty_for(self, coin, price, legs, size=None):
         rules = self.leg_rules(coin, legs)
         if not rules:
             return None
         step, min_q, min_usdt = rules
-        q = (Decimal(str(self.cfg["size_usdt_per_side"] / price)) / step).to_integral_value(rounding=ROUND_DOWN) * step
+        size = size or self.R(coin)["size_usdt_per_side"]
+        q = (Decimal(str(size / price)) / step).to_integral_value(rounding=ROUND_DOWN) * step
         if float(q) < min_q or float(q) * price < min_usdt:
             return None
         return float(q)
@@ -767,7 +791,7 @@ class GapTrader:
                 self.cooldown[coin] = time.time() + 3600
                 return
             for ex in (long_ex, short_ex):
-                self.api[ex].prepare_symbol(sym, self.cfg["leverage"])
+                self.api[ex].prepare_symbol(sym, self.R(coin)["leverage"])
             t0 = time.time()
             q = self.qstr(coin, qty, legs)
             (lf, le), (sf, se) = self._both((self.api[long_ex].market, sym, "buy", q),
@@ -791,7 +815,7 @@ class GapTrader:
                         except Exception as e:
                             msg.append(f"🚨 Could NOT close {NAMES[ex]} side: {html.escape(str(e))[:200]} — "
                                        f"check the exchange manually!")
-                self.cooldown[coin] = time.time() + self.cfg["cooldown_minutes"] * 60
+                self.cooldown[coin] = time.time() + self.R(coin)["cooldown_minutes"] * 60
                 self.telegram("\n".join(msg))
                 return
             captured = (sf["price"] - lf["price"]) / lf["price"] * 100
@@ -806,16 +830,16 @@ class GapTrader:
                 self.save()
             log.info(f"[{coin}] OPEN long {long_ex} @ {lf['price']} / short {short_ex} @ {sf['price']} "
                      f"qty {pos['qty']} captured {captured:.3f}% (signal {signal_gap:.3f}%)")
-            if captured < self.cfg["min_captured_gap_pct"]:
+            if captured < self.R(coin)["min_captured_gap_pct"]:
                 self.telegram(self.open_message(pos) + f"\n\n⚠️ Real gap at fill is only {captured:.2f}% "
-                              f"(minimum {self.cfg['min_captured_gap_pct']:.2f}%) — closing right away.")
+                              f"(minimum {self.R(coin)['min_captured_gap_pct']:.2f}%) — closing right away.")
                 self.close_position(coin, "opened without a real gap")
             else:
                 self.telegram(self.open_message(pos))
         except Exception as e:
             log.exception(f"[{coin}] open failed")
             self.telegram(f"⚠️ <b>{coin}</b>: open failed: {html.escape(str(e))[:300]}")
-            self.cooldown[coin] = time.time() + self.cfg["cooldown_minutes"] * 60
+            self.cooldown[coin] = time.time() + self.R(coin)["cooldown_minutes"] * 60
         finally:
             self.busy.discard(coin)
 
@@ -826,9 +850,9 @@ class GapTrader:
         g = self.close_gap(pos)
         held = time.time() - pos["opened"]
         reason = None
-        if g is not None and g <= self.cfg["exit_gap_pct"]:
+        if g is not None and g <= self.R(coin)["exit_gap_pct"]:
             reason = "gap closed"
-        elif held >= self.cfg["max_hold_minutes"] * 60:
+        elif held >= self.R(coin)["max_hold_minutes"] * 60:
             reason = "max hold time"
         if reason:
             self.busy.add(coin)
@@ -898,12 +922,13 @@ class GapTrader:
             with self.lock:
                 self.positions.pop(coin, None)
                 self.save()
-            self.cooldown[coin] = time.time() + self.cfg["cooldown_minutes"] * 60
+            self.cooldown[coin] = time.time() + self.R(coin)["cooldown_minutes"] * 60
             held = time.time() - pos["opened"]
             d = self.today()
             icon = "✅" if net >= 0 else "🔻"
             self.telegram(
-                f"{icon} <b>CLOSED {coin}: {money(net)} USDT</b>\n"
+                f"{icon} <b>{'🐢 SLOW · ' if self.mode_of(coin) == 'slow' else ''}CLOSED {coin}: "
+                f"{money(net)} USDT</b>\n"
                 f"Reason: {reason} · held {dur(held)}\n\n"
                 f"Long  {NAMES[pos['long']]}: {fmt_px(pos['long_px'])} → {fmt_px(lf['price'])} = {money(long_pnl)}\n"
                 f"Short {NAMES[pos['short']]}: {fmt_px(pos['short_px'])} → {fmt_px(sf['price'])} = {money(short_pnl)}\n"
@@ -968,15 +993,17 @@ class GapTrader:
 
     def open_message(self, pos):
         notional = pos["qty"] * pos["long_px"]
-        return (f"🟢 <b>OPENED {pos['coin']}</b>\n"
+        r = self.R(pos["coin"])
+        tag = "🐢 SLOW · " if r["mode"] == "slow" else ""
+        return (f"🟢 <b>{tag}OPENED {pos['coin']}</b>\n"
                 f"Long  {NAMES[pos['long']]}: {pos['qty']:g} @ {fmt_px(pos['long_px'])}\n"
                 f"Short {NAMES[pos['short']]}: {pos['qty']:g} @ {fmt_px(pos['short_px'])}\n\n"
                 f"Gap seen: {pos['signal_gap']:.2f}% → real gap at fill: <b>{pos['captured_gap']:.2f}%</b>\n"
-                f"Size: {notional:,.0f} USDT per side · {self.cfg['leverage']}x\n"
+                f"Size: {notional:,.0f} USDT per side · {r['leverage']}x\n"
                 f"Fees paid: {pos['open_fees']:.2f} USDT{' (estimated)' if pos['fees_estimated'] else ''}\n"
                 f"Both orders filled in {pos['exec_ms']} ms\n"
-                f"Will close when the gap is ≤ {self.cfg['exit_gap_pct']}% "
-                f"(or after {self.cfg['max_hold_minutes']} min)")
+                f"Will close when the gap is ≤ {r['exit_gap_pct']}% "
+                f"(or after {dur(r['max_hold_minutes'] * 60)})")
 
     # ---------------------------------------------------------- bookkeeping
     def today(self):
@@ -1065,6 +1092,10 @@ class GapTrader:
             f"{c['min_captured_gap_pct']}% · close at ≤ {c['exit_gap_pct']}%",
             (f"Only fresh gaps: must have been ≤ {c['fresh_gap_below_pct']}% within {c['fresh_gap_minutes']} min"
              if c['fresh_gap_minutes'] else "Fresh-gap rule: off"),
+            (f"🐢 Slow mode: {', '.join(sorted(self.slow_coins))} · {c['slow_mode']['size_usdt_per_side']} USDT/side "
+             f"· {c['slow_mode']['leverage']}x · open ≥ {c['slow_mode']['entry_gap_pct']}% · close ≤ "
+             f"{c['slow_mode']['exit_gap_pct']}% · max {dur(c['slow_mode']['max_hold_minutes'] * 60)} · "
+             f"{c['slow_mode']['max_positions']} slot(s)" if self.slow_coins else "🐢 Slow mode: off"),
             f"Daily loss limit: {c['daily_loss_limit_usdt']} USDT",
         ]
         if self.positions:
