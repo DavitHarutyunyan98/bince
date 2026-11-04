@@ -69,6 +69,8 @@ DEFAULT_CONFIG = {
     "max_hold_minutes": 240,
     "max_positions": 2,
     "cooldown_minutes": 10,
+    "fresh_gap_minutes": 30,
+    "fresh_gap_below_pct": 0.3,
     "min_24h_volume_usdt": 5000000,
     "max_quote_age_seconds": 5,
     "daily_loss_limit_usdt": 30,
@@ -280,6 +282,9 @@ class GapTrader:
         self.positions = st.get("positions", {})
         self.day = st.get("day", {})
         self.lock = threading.Lock()
+        self.started = time.time()
+        self.last_small = {}        # coin -> last time its gap was "normal" (<= fresh_gap_below_pct)
+        self.hour = self._new_hour()
 
     # ---------------------------------------------------------- setup
     def build_universe(self):
@@ -425,20 +430,31 @@ class GapTrader:
         if coin in self.positions:
             self.check_exit(coin)
             return
-        if coin in self.busy or time.time() < self.cooldown.get(coin, 0):
-            self.pending.pop(coin, None)
-            return
         fresh, g = self.gaps(coin)
         if not fresh:
             self.pending.pop(coin, None)
             return
-        best = max(g.items(), key=lambda kv: kv[1])
-        direction, gap = best
+        now = time.time()
+        direction, gap = max(g.items(), key=lambda kv: kv[1])
+        if gap <= self.cfg["fresh_gap_below_pct"]:
+            self.last_small[coin] = now                  # gap is "normal" right now
+        h = self.hour
+        if gap > h["max"][0]:
+            h["max"] = (gap, coin)
+        if coin in self.busy or now < self.cooldown.get(coin, 0):
+            self.pending.pop(coin, None)
+            return
         if not (self.cfg["entry_gap_pct"] <= gap <= self.cfg["max_gap_pct"]):
             self.pending.pop(coin, None)
             return
+        h["seen"].add(coin)
+        mins = self.cfg["fresh_gap_minutes"]
+        if mins and now - self.last_small.get(coin, -1e18) > mins * 60:
+            # Wide for longer than fresh_gap_minutes (or since the bot started): a stuck gap, skip.
+            h["stale"].add(coin)
+            self.pending.pop(coin, None)
+            return
         first = self.pending.get(coin)
-        now = time.time()
         if not first or first[0] != direction:
             self.pending[coin] = (direction, now)        # new gap or flipped direction: restart the clock
             return
@@ -451,7 +467,30 @@ class GapTrader:
             return
         self.pending.pop(coin, None)
         self.busy.add(coin)
+        h["traded"].add(coin)
         self.pool.submit(self.open_position, coin, long_ex, short_ex, gap, ql[2], qs[0])
+
+    @staticmethod
+    def _new_hour():
+        return {"start": time.time(), "max": (0.0, "—"), "seen": set(), "stale": set(), "traded": set()}
+
+    def roll_hour(self):
+        """Hourly log line (and daily totals) of what the bot saw, traded and skipped."""
+        h, self.hour = self.hour, self._new_hour()
+        stale = sorted(h["stale"] - h["traded"])
+        log.info(f"HOUR: biggest gap {h['max'][0]:.2f}% ({h['max'][1]}) · coins with gap ≥ "
+                 f"{self.cfg['entry_gap_pct']}%: {len(h['seen'])} · traded: {len(h['traded'])} · "
+                 f"skipped as old (wide > {self.cfg['fresh_gap_minutes']} min): {len(stale)}"
+                 + (f" [{', '.join(stale)}]" if stale else ""))
+        with self.lock:
+            d = self.today()
+            d["gaps_seen"] = d.get("gaps_seen", 0) + len(h["seen"])
+            d["gaps_traded"] = d.get("gaps_traded", 0) + len(h["traded"])
+            d["gaps_stale"] = d.get("gaps_stale", 0) + len(stale)
+            d["stale_coins"] = sorted(set(d.get("stale_coins", [])) | set(stale))
+            if h["max"][0] > d.get("max_gap", 0):
+                d["max_gap"], d["max_gap_coin"] = h["max"][0], h["max"][1]
+            self.save()
 
     # ---------------------------------------------------------- trading
     def qty_for(self, coin, price):
@@ -710,9 +749,15 @@ class GapTrader:
         key = datetime.now(timezone.utc).strftime("%Y-%m-%d")
         if self.day.get("date") != key:
             if self.day.get("date"):
-                self.telegram(f"📊 <b>Daily summary {self.day['date']} (UTC)</b>\n"
-                              f"Trades: {self.day.get('trades', 0)}\n"
-                              f"Net: <b>{money(self.day.get('net', 0))} USDT</b>")
+                d = self.day
+                stale = d.get("stale_coins", [])
+                self.telegram(f"📊 <b>Daily summary {d['date']} (UTC)</b>\n"
+                              f"Trades: {d.get('trades', 0)}\n"
+                              f"Net: <b>{money(d.get('net', 0))} USDT</b>\n\n"
+                              f"Biggest gap seen: {d.get('max_gap', 0):.2f}% ({d.get('max_gap_coin', '—')})\n"
+                              f"Gaps ≥ entry (coin-hours): {d.get('gaps_seen', 0)} · traded {d.get('gaps_traded', 0)}"
+                              f" · skipped as old {d.get('gaps_stale', 0)}"
+                              + (f"\nSkipped coins: {', '.join(stale[:15])}" if stale else ""))
             self.day = {"date": key, "trades": 0, "net": 0.0}
         return self.day
 
@@ -756,6 +801,8 @@ class GapTrader:
                 for coin in list(self.positions):
                     if coin not in self.busy:
                         self.pool.submit(self.close_position, coin, "manual close-all")
+            if now - self.hour["start"] >= 3600:
+                self.roll_hour()
             if now - last_status > 600:
                 last_status = now
                 stale = [ex for ex, t in self.feed_seen.items() if now - t > 10]
@@ -777,6 +824,8 @@ class GapTrader:
             f"Size: {c['size_usdt_per_side']} USDT per side · {c['leverage']}x · max {c['max_positions']} positions",
             f"Open at gap ≥ {c['entry_gap_pct']}% held {c['persist_seconds']}s · keep only if real gap ≥ "
             f"{c['min_captured_gap_pct']}% · close at ≤ {c['exit_gap_pct']}%",
+            (f"Only fresh gaps: must have been ≤ {c['fresh_gap_below_pct']}% within {c['fresh_gap_minutes']} min"
+             if c['fresh_gap_minutes'] else "Fresh-gap rule: off"),
             f"Daily loss limit: {c['daily_loss_limit_usdt']} USDT",
         ]
         if self.positions:
