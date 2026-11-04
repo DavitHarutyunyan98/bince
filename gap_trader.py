@@ -540,7 +540,9 @@ class GapTrader:
                 async with websockets.connect(url, ping_interval=None, ping_timeout=None, close_timeout=5,
                                               max_size=2 ** 22, max_queue=4096) as ws:
                     log.info(f"Binance websocket connected ({len(coins)} coins)")
-                    async for raw in ws:
+                    while True:
+                        # Watchdog: a silent socket for 60 s is treated as dead and reopened.
+                        raw = await asyncio.wait_for(ws.recv(), timeout=60)
                         d = json.loads(raw).get("data") or {}
                         coin = d.get("s", "")[:-4]
                         if coin in self.meta:
