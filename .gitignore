@@ -9,3 +9,6 @@ gap_trader_state.json
 gap_trader.log
 STOP_GAP_TRADER
 CLOSE_ALL_GAPS
+social.db
+social_config.json
+social_collector.log
