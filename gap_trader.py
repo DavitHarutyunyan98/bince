@@ -417,7 +417,9 @@ class GapTrader:
         if ex == "binance":
             vol = {t["symbol"]: float(t["quoteVolume"]) for t in self.bn.c.futures_ticker()}
             for s in self.bn.c.futures_exchange_info()["symbols"]:
-                if s.get("contractType") != "PERPETUAL" or s.get("quoteAsset") != "USDT" or s.get("status") != "TRADING":
+                # Any perpetual type (normal coins, TradFi / pre-IPO perpetuals use other type names).
+                if "PERPETUAL" not in str(s.get("contractType", "")).upper() or s.get("quoteAsset") != "USDT" \
+                        or s.get("status") != "TRADING":
                     continue
                 f = {x["filterType"]: x for x in s["filters"]}
                 lot = f.get("MARKET_LOT_SIZE") or f.get("LOT_SIZE")
@@ -441,7 +443,7 @@ class GapTrader:
                     "category": "linear", "limit": 1000, "cursor": cursor}).json().get("result", {})
                 for s in j.get("list") or []:
                     if s.get("status") != "Trading" or s.get("quoteCoin") != "USDT" \
-                            or s.get("contractType") != "LinearPerpetual":
+                            or "Perpetual" not in str(s.get("contractType", "")):
                         continue
                     lot = s.get("lotSizeFilter") or {}
                     out[s["symbol"]] = {"step": Decimal(lot.get("qtyStep", "1")).normalize(),
