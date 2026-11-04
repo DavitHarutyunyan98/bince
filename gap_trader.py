@@ -351,6 +351,8 @@ class GapTrader:
             save_json(CONFIG_FILE, DEFAULT_CONFIG)
             cfg = {}
         self.cfg = {**DEFAULT_CONFIG, **cfg}
+        # Nested dict: fill in exchanges missing from the user's file (e.g. a newly added Bybit).
+        self.cfg["taker_fee_pct"] = {**DEFAULT_CONFIG["taker_fee_pct"], **(cfg.get("taker_fee_pct") or {})}
         main_cfg = load_json("config.json", {}) or {}
         keys = load_json(KEYS_FILE, {}) or {}
         self.exchanges = [e for e in self.cfg["exchanges"] if e in NAMES]
