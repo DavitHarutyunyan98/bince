@@ -60,7 +60,10 @@ AMBIGUOUS = set("""ALL AND THE FOR NOT ONE CEO USA SEC ETF ATH DCA API NFT DAO I
 FOMC NEW TOP BIG HOT CAT DOG SUN GAS ACE ALT ANT ARK BAT FUN KEY JOE COW PEOPLE REAL SAFE MOVE NEAR SAND
 EDGE GAME HIGH HOOK BOND SIGN MASK LOOK POWER STEP TRUE PUMP MEME WIN BANK CITY GOOD LIFE LOVE MAGIC
 NEXT OPEN PRIME RARE RED SAGA SOLO STORY SUPER TIME TOKEN TREE WAVE ZERO DEEP DOGS HOME HYPE JUST KING
-LAND LIVE LUCK MOON NOW ORDER PEPE PLAY PRO PUSH QUICK RAY ROSE SCR SPEC TAO TRUMP VANRY WAL""".split())
+LAND LIVE LUCK MOON NOW ORDER PEPE PLAY PRO PUSH QUICK RAY ROSE SCR SPEC TAO TRUMP VANRY WAL
+TAKE SOON USELESS HORIZON CORE FORM ARC CYBER APEX BREAKING JUST NEWS ALERT UPDATE WEEK MAJOR SPOT
+FUTURES MARKET PRICE CASH GOLD SILVER OIL DATA FUND BANKS TRADE CHAIN SWAP LAYER BRIDGE AGENT VOTE
+SHELL SKY SAFE SAHARA SONIC STORY TOWNS UNITED VIRTUAL WALLET WORLD YIELD ZONE HOLO HOME LIGHT""".split())
 # Words that must not be matched as coin NAMES (lower case).
 COMMON_NAMES = set("""bitcoin ethereum the one sun people near gas move real safe magic prime story super
 time token tree wave zero home live luck moon play quick rose game edge high hook bond sign mask look
@@ -173,13 +176,16 @@ class Analyzer:
         for m in re.finditer(r"\$([A-Za-z][A-Za-z0-9]{1,14})\b", text):        # $XYZ — any ticker
             if m.group(1).upper() in tick:
                 found.add(m.group(1).upper())
-        for m in re.finditer(r"\b([A-Z][A-Z0-9]{2,14})\b", text):               # XYZ in capitals
-            w = m.group(1)
-            if w in tick and w not in AMBIGUOUS:
-                found.add(w)
-        for m in re.finditer(r"\b([A-Za-z]{6,15})\b", text):                    # OpenAI, Anthropic, SpaceX…
+        letters = [ch for ch in text if ch.isalpha()]
+        shouting = letters and sum(ch.isupper() for ch in letters) / len(letters) > 0.5
+        if not shouting:   # in ALL-CAPS headlines every word is capitalised: only $XYZ and names count
+            for m in re.finditer(r"\b([A-Z][A-Z0-9]{2,14})\b", text):           # XYZ in capitals
+                w = m.group(1)
+                if w in tick and w not in AMBIGUOUS:
+                    found.add(w)
+        for m in re.finditer(r"\b([A-Z][a-z]+[A-Z]?[A-Za-z]*|[a-z]{6,15})\b", text):   # OpenAI, Anthropic…
             w = m.group(1).upper()
-            if w in tick and w not in AMBIGUOUS and w.lower() not in COMMON_NAMES:
+            if len(w) >= 6 and w in tick and w not in AMBIGUOUS and w.lower() not in COMMON_NAMES:
                 found.add(w)
         if name_re:
             for m in name_re.finditer(text):                                      # "solana", "chainlink"…
@@ -426,11 +432,30 @@ def stats(hours):
     con.close()
 
 
+def rescan():
+    """Recompute coin mentions of all stored posts with the current matching rules."""
+    an = Analyzer()
+    an.refresh_coins()
+    con = db()
+    rows = con.execute("SELECT uid, title, body, created, source FROM posts").fetchall()
+    with con:
+        con.execute("DELETE FROM mentions")
+        for uid, title, body, created, source in rows:
+            for coin in an.coins_in(f"{title or ''}\n{body or ''}"):
+                con.execute("INSERT OR IGNORE INTO mentions VALUES (?,?,?,?)", (uid, coin, created, source))
+    n = con.execute("SELECT COUNT(*) FROM mentions").fetchone()[0]
+    con.close()
+    print(f"rescanned {len(rows)} posts -> {n} mentions")
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--stats", type=int, metavar="HOURS", help="print top mentioned coins and exit")
+    ap.add_argument("--rescan", action="store_true", help="recompute mentions of stored posts and exit")
     a = ap.parse_args()
-    if a.stats:
+    if a.rescan:
+        rescan()
+    elif a.stats:
         stats(a.stats)
     else:
         Collector().run()
