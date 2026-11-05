@@ -394,7 +394,7 @@ def make_signals(cfg):
         con.close()
         return []
     now = finished[finished.t == latest_t]
-    sent = []
+    sent, records = [], {}
     for hz in cfg["horizons_hours"]:
         mdl = latest_model(con, hz)
         if not mdl:
@@ -419,22 +419,33 @@ def make_signals(cfg):
                         json.dumps(inputs), json.dumps(dict(zip(FNAMES, contrib.round(4).tolist())))))
             except sqlite3.IntegrityError:
                 continue          # already sent for this coin/hour/horizon
-            top = sorted(zip(FNAMES, x, contrib), key=lambda z: -abs(z[2]))[:4]
-            why = " · ".join(f"{LABEL[f]} {v:.2f} ({c:+.2f}%)" for f, v, c in top)
-            icon = "🟢" if fc > 0 else "🔴"
-            t_in = pd.to_datetime(row.t, unit="ms")
-            t_out = pd.to_datetime(row.t + hz * H, unit="ms")
-            sent.append(
-                f"{icon} <b>{side} {row.coin}</b> · {hz}h\n"
-                f"entry {fmt_price(entry)} (price at {t_in:%m-%d %H:%M} UTC) → expected {fc:+.2f}% → "
-                f"<b>{fmt_price(target)}</b> by {t_out:%m-%d %H:%M} UTC\n"
-                f"model v{mdl['version']} (trained {pd.to_datetime(mdl['from'], unit='ms'):%m-%d} → "
-                f"{pd.to_datetime(mdl['to'], unit='ms'):%m-%d}, {mdl['n_train']} coin-hours)\n"
-                f"why: {why}\n📋 {record_text(mdl['oos'], live_record(con, hz, cfg['cost_pct']))}")
+            top = sorted(zip(FNAMES, x, contrib), key=lambda z: -abs(z[2]))[:3]
+            sent.append({"side": side, "coin": row.coin, "hz": hz, "fc": fc, "entry": entry, "target": target,
+                         "t_in": int(row.t), "t_out": int(row.t + hz * H), "version": mdl["version"],
+                         "why": " · ".join(f"{LABEL[f]} {v:.2f} ({c:+.2f}%)" for f, v, c in top)})
+        if any(x["hz"] == hz for x in sent):
+            records[hz] = (f"<b>{hz}h model v{mdl['version']}</b> (trained {pd.to_datetime(mdl['from'], unit='ms'):%m-%d}"
+                           f" → {pd.to_datetime(mdl['to'], unit='ms'):%m-%d}, {mdl['n_train']} coin-hours)\n"
+                           f"📋 {record_text(mdl['oos'], live_record(con, hz, cfg['cost_pct']))}")
     con.close()
     if sent:
-        telegram(cfg, "🔔 <b>Social signals</b> (alerts only, no trading)\n\n" + "\n\n".join(sent))
+        telegram(cfg, signals_message(sent, records))
     return sent
+
+
+def signals_message(sent, records):
+    """Sorted table first (strongest forecast on top), then the reasons, then each model's record."""
+    sent = sorted(sent, key=lambda x: -abs(x["fc"]))
+    t_in = pd.to_datetime(sent[0]["t_in"], unit="ms")
+    lines = [f"{'SIDE':5} {'COIN':8} {'H':>3} {'ENTRY':>9} {'TARGET':>9} {'EXP':>6}"]
+    for x in sent:
+        lines.append(f"{x['side']:5} {x['coin'][:8]:8} {x['hz']:>2}h "
+                     f"{fmt_price(x['entry'])[:9]:>9} {fmt_price(x['target'])[:9]:>9} {x['fc']:+5.1f}%")
+    table = "\n".join(lines)
+    why = "\n".join(f"{'🟢' if x['fc'] > 0 else '🔴'} <b>{x['side']} {x['coin']}</b> {x['hz']}h until "
+                     f"{pd.to_datetime(x['t_out'], unit='ms'):%m-%d %H:%M} · {x['why']}" for x in sent)
+    return (f"🔔 <b>Social signals</b> · entry prices at {t_in:%m-%d %H:%M} UTC (alerts only, no trading)\n"
+            f"<pre>{table}</pre>\n<b>Why</b>\n{why}\n\n" + "\n\n".join(records.values()))
 
 
 def fmt_price(p):
