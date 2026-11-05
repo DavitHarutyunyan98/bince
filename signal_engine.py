@@ -588,6 +588,8 @@ def run(cfg):
 
 
 if __name__ == "__main__":
+    import signal as _signal
+    _signal.signal(_signal.SIGPIPE, _signal.SIG_DFL)     # quiet exit when piped into `head`
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", action="store_true")
     ap.add_argument("--changes", action="store_true")
