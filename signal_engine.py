@@ -273,10 +273,10 @@ def oos_summary(res, cfg):
         return {"events": 0, "avg_net": None, "win_rate": None, "good_weeks": 0, "weeks": 0}
     r = pd.DataFrame(res)
     r["week"] = pd.to_datetime(r.t, unit="ms").dt.strftime("%G-W%V")
-    wk = r.groupby("week").net.mean()
+    wk = r.groupby("week").net.agg(["mean", "size"])
     return {"events": len(r), "avg_net": round(float(r.net.mean()), 3), "win_rate": round(float((r.net > 0).mean()), 3),
-            "good_weeks": int((wk > 0).sum()), "weeks": int(len(wk)),
-            "by_week": {k: round(float(v), 3) for k, v in wk.items()}}
+            "good_weeks": int((wk["mean"] > 0).sum()), "weeks": int(len(wk)),
+            "by_week": {k: f"{v['mean']:+.2f}% ({int(v['size'])} signals)" for k, v in wk.iterrows()}}
 
 
 def latest_model(con, hz):
@@ -458,8 +458,9 @@ def report_model(cfg):
             print(f"  {w:+.3f}  {LABEL[f]}")
         o = m["oos"]
         print(f"unseen-days test: {o.get('events', 0)} signals · avg after costs {o.get('avg_net')}% · "
-              f"win rate {o.get('win_rate')} · good weeks {o.get('good_weeks', 0)}/{o.get('weeks', 0)} "
-              f"{o.get('by_week', '')}")
+              f"right {o.get('win_rate')} · positive weeks {o.get('good_weeks', 0)}/{o.get('weeks', 0)}")
+        for wk, txt in (o.get("by_week") or {}).items():
+            print(f"    {wk}: {txt}")
         lv = live_record(con, hz, cfg["cost_pct"])
         print(f"live signals: {lv['n']} finished" + (f" · right {lv['right'] * 100:.0f}% · avg after costs "
                                                       f"{lv['avg']:+.2f}%" if lv["n"] else ""))
@@ -506,7 +507,11 @@ def run(cfg):
         try:
             if last_day != now.date() and now.hour >= cfg["retrain_hour_utc"]:
                 last_day = now.date()
-                retrain(cfg)
+                con = db()
+                newest = con.execute("SELECT MAX(trained_at) FROM models").fetchone()[0] or 0
+                con.close()
+                if datetime.fromtimestamp(newest, timezone.utc).date() != now.date():   # once per day only
+                    retrain(cfg)
             if last_hour != (now.date(), now.hour) and now.minute >= 5:
                 last_hour = (now.date(), now.hour)
                 fill_outcomes(cfg)
