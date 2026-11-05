@@ -460,7 +460,9 @@ def report_model(cfg):
         print(f"unseen-days test: {o.get('events', 0)} signals · avg after costs {o.get('avg_net')}% · "
               f"win rate {o.get('win_rate')} · good weeks {o.get('good_weeks', 0)}/{o.get('weeks', 0)} "
               f"{o.get('by_week', '')}")
-        print("live:", record_text(None, live_record(con, hz, cfg["cost_pct"])).split("| ", 1)[-1])
+        lv = live_record(con, hz, cfg["cost_pct"])
+        print(f"live signals: {lv['n']} finished" + (f" · right {lv['right'] * 100:.0f}% · avg after costs "
+                                                      f"{lv['avg']:+.2f}%" if lv["n"] else ""))
     con.close()
 
 
