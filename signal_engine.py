@@ -13,10 +13,8 @@ Model: for each coin and hour, inputs (attention, tone, engagement, recent price
 the coin's move vs BTC over the next 4h and 24h. A ridge regression (a linear model) is used so
 every forecast is a plain sum of "weight x input" that can be shown in full.
 
-Status of the engine:
-  TEST    signals are sent but marked "not proven"
-  PROVEN  on unseen days it had >= min_events signals, average result after costs > 0,
-          and >= min_good_weeks separate weeks with a positive average (settings below).
+Every alert and daily update shows the plain record: how the model's forecasts did on days it
+had not seen (walk-forward test) and how its live signals turned out. No pass/fail labels.
 
 Run:      .venv/bin/python signal_engine.py            (runs forever: hourly signals, daily retrain)
 Reports:  .venv/bin/python signal_engine.py --model    (current version, weights, unseen-days test)
@@ -48,8 +46,6 @@ DEFAULTS = {
     "signal_threshold_pct": 0.5,  # only signal when |forecast| is at least this (after costs)
     "min_train_days": 5,          # no model before this many days of data
     "ridge_alpha": 5.0,           # higher = more conservative weights
-    "min_events": 100,            # PROVEN rule 1: unseen-day signals
-    "min_good_weeks": 2,          # PROVEN rule 3: weeks with positive average
     "max_coins": 80,              # coins priced/considered (most mentioned)
     "exclude": ["USDC", "USDT", "FDUSD", "DAI", "USDE", "RLUSD", "PYUSD", "TUSD", "USD1", "PAXG", "XAUT"],
     "retrain_hour_utc": 0,
@@ -283,10 +279,6 @@ def oos_summary(res, cfg):
             "by_week": {k: round(float(v), 3) for k, v in wk.items()}}
 
 
-def is_proven(o, cfg):
-    return (o["events"] >= cfg["min_events"] and (o["avg_net"] or 0) > 0 and o["good_weeks"] >= cfg["min_good_weeks"])
-
-
 def latest_model(con, hz):
     r = con.execute("SELECT version, weights, mean, std, intercept, oos, status, n_train, data_from, data_to "
                     "FROM models WHERE horizon=? ORDER BY version DESC LIMIT 1", (hz,)).fetchone()
@@ -306,8 +298,6 @@ def describe_change(old, new_w, new_oos, new_status, hz):
         for f, a, b in moves[:5]:
             if abs(b - a) >= 0.005:
                 lines.append(f"{LABEL[f]}: {a:+.3f} → {b:+.3f}")
-        if old["status"] != new_status:
-            lines.append(f"status {old['status']} → {new_status}")
         oa, ob = old["oos"].get("avg_net"), new_oos.get("avg_net")
         lines.append(f"unseen-days test: {old['oos'].get('events', 0)} → {new_oos.get('events', 0)} signals, "
                      f"avg after costs {oa if oa is not None else '—'}% → {ob if ob is not None else '—'}%")
@@ -327,7 +317,7 @@ def retrain(cfg, notify=True):
             continue
         w, mu, sd, b0 = fit(d[FNAMES].values, d[f"y{hz}"].values, cfg["ridge_alpha"])
         oos = oos_summary(walk_forward(df, hz, cfg), cfg)
-        status = "PROVEN" if is_proven(oos, cfg) else "TEST"
+        status = ""
         old = latest_model(con, hz)
         version = (con.execute("SELECT MAX(version) FROM models").fetchone()[0] or 0) + 1
         with con:
@@ -337,7 +327,8 @@ def retrain(cfg, notify=True):
             change = describe_change(old, w, oos, status, hz)
             con.execute("INSERT INTO changes VALUES (?,?,?)", (version, hz, "\n".join(change)))
         msgs.append(f"🔄 <b>{hz}h model v{old['version'] if old else 0} → v{version}</b> · trained on {len(d)} "
-                    f"coin-hours · {status_icon(status)}\n" + "\n".join("• " + c for c in change))
+                    f"coin-hours\n" + "\n".join("• " + c for c in change)
+                    + f"\n📋 {record_text(oos, live_record(con, hz, cfg['cost_pct']))}")
     con.close()
     text = "\n\n".join(msgs)
     log.info("retrain: " + text.replace("\n", " | "))
@@ -346,8 +337,25 @@ def retrain(cfg, notify=True):
     return text
 
 
-def status_icon(s):
-    return "✅ PROVEN" if s == "PROVEN" else "🧪 TEST (not proven)"
+def record_text(oos, live=None):
+    """Plain facts: how this model's forecasts did on days it had not seen, and live so far."""
+    if not oos or not oos.get("events"):
+        txt = "unseen-days test: no signals yet"
+    else:
+        txt = (f"unseen-days test: {oos['events']} signals · right {oos['win_rate'] * 100:.0f}% · "
+               f"avg after costs {oos['avg_net']:+.2f}% · positive weeks {oos['good_weeks']}/{oos['weeks']}")
+    if live and live["n"]:
+        txt += f" | live: {live['n']} finished · right {live['right'] * 100:.0f}% · avg after costs {live['avg']:+.2f}%"
+    return txt
+
+
+def live_record(con, hz, cost):
+    rows = con.execute("SELECT forecast, outcome FROM signals WHERE horizon=? AND outcome IS NOT NULL", (hz,)).fetchall()
+    if not rows:
+        return {"n": 0}
+    net = [np.sign(f) * o - cost for f, o in rows]
+    return {"n": len(rows), "right": float(np.mean([np.sign(f) == np.sign(o) for f, o in rows])),
+            "avg": float(np.mean(net))}
 
 
 # ============================================================ signals
@@ -391,7 +399,7 @@ def make_signals(cfg):
             why = " · ".join(f"{LABEL[f]} {v:.2f} ({c:+.2f}%)" for f, v, c in top)
             icon = "📈" if fc > 0 else "📉"
             sent.append(f"{icon} <b>{row.coin}</b> · next {hz}h · expect <b>{fc:+.2f}%</b> vs BTC · model "
-                        f"v{mdl['version']} · {status_icon(mdl['status'])}\nwhy: {why}")
+                        f"v{mdl['version']}\nwhy: {why}\n📋 {record_text(mdl['oos'], live_record(con, hz, cfg['cost_pct']))}")
     con.close()
     if sent:
         telegram(cfg, "🔔 <b>Social signals</b> (alerts only, no trading)\n\n" + "\n\n".join(sent))
@@ -443,7 +451,7 @@ def report_model(cfg):
         if not m:
             print("no model yet (needs more data; run --retrain to check)")
             continue
-        print(f"version v{m['version']} · {status_icon(m['status'])} · trained on {m['n_train']} coin-hours "
+        print(f"version v{m['version']} · trained on {m['n_train']} coin-hours "
               f"({pd.to_datetime(m['from'], unit='ms'):%Y-%m-%d} → {pd.to_datetime(m['to'], unit='ms'):%Y-%m-%d})")
         print("weights (how much 1 typical step of each input moves the forecast, in % vs BTC):")
         for f, w in sorted(zip(FNAMES, m["w"]), key=lambda z: -abs(z[1])):
@@ -452,7 +460,7 @@ def report_model(cfg):
         print(f"unseen-days test: {o.get('events', 0)} signals · avg after costs {o.get('avg_net')}% · "
               f"win rate {o.get('win_rate')} · good weeks {o.get('good_weeks', 0)}/{o.get('weeks', 0)} "
               f"{o.get('by_week', '')}")
-        print(f"PROVEN needs: ≥ {cfg['min_events']} signals, avg > 0, ≥ {cfg['min_good_weeks']} good weeks")
+        print("live:", record_text(None, live_record(con, hz, cfg["cost_pct"])).split("| ", 1)[-1])
     con.close()
 
 
@@ -474,7 +482,7 @@ def report_signals(hours):
         c = json.loads(contrib)
         top = sorted(c.items(), key=lambda kv: -abs(kv[1]))[:3]
         res = "pending" if out is None else f"real {out:+.2f}% → {'✅ right' if np.sign(out) == np.sign(fc) else '❌ wrong'}"
-        print(f"{pd.to_datetime(ts, unit='ms'):%m-%d %H:%M} {coin:10} {hz:2d}h forecast {fc:+.2f}% v{v} {st:6} · "
+        print(f"{pd.to_datetime(ts, unit='ms'):%m-%d %H:%M} {coin:10} {hz:2d}h forecast {fc:+.2f}% v{v} · "
               f"{res} · why: " + ", ".join(f"{LABEL[f]} {x:+.2f}" for f, x in top))
     done = [r for r in rows if r[7] is not None]
     if done:
