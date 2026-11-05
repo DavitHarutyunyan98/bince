@@ -349,10 +349,12 @@ def retrain(cfg, notify=True):
             con.execute("INSERT INTO changes VALUES (?,?,?)", (version, hz, "\n".join(change)))
         if notify == "changes" and not meaningful(old, w, oos, cfg):
             continue           # saved and visible in --changes, just not sent to Telegram
-        msgs.append(f"🔄 <b>{hz}h model v{old['version'] if old else 0} → v{version}</b> · trained on {len(d)} "
-                    f"coin-hours from {pd.to_datetime(d.t.min(), unit='ms'):%Y-%m-%d %H:%M} to "
-                    f"{pd.to_datetime(d.t.max(), unit='ms'):%Y-%m-%d %H:%M} UTC\n" + "\n".join("• " + c for c in change)
-                    + f"\n📋 {record_text(oos, live_record(con, hz, cfg['cost_pct']))}")
+        top_changes = [c for c in change if "→" in c and "test" not in c][:3]
+        msgs.append(f"🔄 <b>{hz}h model updated → v{version}</b>\n"
+                    f"Data: {len(d)} coin-hours, {pd.to_datetime(d.t.min(), unit='ms'):%m-%d} → "
+                    f"{pd.to_datetime(d.t.max(), unit='ms'):%m-%d %H:%M} UTC\n"
+                    + (("Biggest changes: " + "; ".join(top_changes) + "\n") if top_changes else "")
+                    + f"Past tests: {short_record(oos)}")
     con.close()
     text = "\n\n".join(msgs)
     log.info("retrain: " + (text.replace("\n", " | ") or "no meaningful change"))
@@ -435,34 +437,62 @@ def make_signals(cfg):
             top = sorted(zip(FNAMES, x, contrib), key=lambda z: -abs(z[2]))[:3]
             sent.append({"side": side, "coin": row.coin, "hz": hz, "fc": fc, "entry": entry, "target": target,
                          "t_in": int(row.t), "t_out": int(row.t + hz * H), "version": mdl["version"],
-                         "why": " · ".join(f"{LABEL[f]} {v:.2f} ({c:+.2f}%)" for f, v, c in top)})
+                         "why": " · ".join(reason(f, v, c) for f, v, c in top)})
         if any(x["hz"] == hz for x in sent):
-            records[hz] = (f"<b>{hz}h model v{mdl['version']}</b> (trained {pd.to_datetime(mdl['from'], unit='ms'):%m-%d}"
-                           f" → {pd.to_datetime(mdl['to'], unit='ms'):%m-%d}, {mdl['n_train']} coin-hours)\n"
-                           f"📋 {record_text(mdl['oos'], live_record(con, hz, cfg['cost_pct']))}")
+            records[hz] = f"{hz}h model v{mdl['version']}: {short_record(mdl['oos'])}"
     con.close()
     if sent:
         telegram(cfg, signals_message(sent, records))
     return sent
 
 
+def reason(f, v, c):
+    """One input in plain words with the direction it pushed the forecast (↑ = towards up, ↓ = down)."""
+    arrow = "↑" if c > 0 else "↓"
+    txt = {
+        "mentions": lambda: f"{math.expm1(v):.0f} mentions",
+        "spike": lambda: f"mentions ×{math.exp(v):.1f} normal",
+        "accel": lambda: f"mentions ×{math.exp(v):.1f} vs last hour",
+        "authors": lambda: f"{math.expm1(v):.0f} authors",
+        "sources": lambda: f"{v:.0f} sources",
+        "tone": lambda: f"tone {v:+.2f}",
+        "pos_share": lambda: f"{v * 100:.0f}% very positive posts",
+        "neg_share": lambda: f"{v * 100:.0f}% very negative posts",
+        "engagement": lambda: f"{math.expm1(v):.0f} votes+comments",
+        "ret_1h": lambda: f"coin {v:+.1f}% vs BTC (1h)",
+        "ret_6h": lambda: f"coin {v:+.1f}% vs BTC (6h)",
+        "ret_24h": lambda: f"coin {v:+.1f}% vs BTC (24h)",
+        "btc_6h": lambda: f"BTC {v:+.1f}% (6h)",
+    }[f]()
+    return f"{txt} {arrow}"
+
+
+def short_record(oos):
+    if not oos or not oos.get("events"):
+        return "no past tests yet"
+    right = oos.get("dir_right", oos.get("win_rate"))
+    return f"{oos['events']} tests · {right * 100:.0f}% right · avg {oos['avg_net']:+.2f}% after costs"
+
+
 def signals_message(sent, records):
-    """Sorted table first (strongest forecast on top), then the reasons, then each model's record."""
+    """One clear card per signal (strongest first), then one line of track record per model."""
     sent = sorted(sent, key=lambda x: -abs(x["fc"]))
     t_in = pd.to_datetime(sent[0]["t_in"], unit="ms")
-    lines = [f"{'SIDE':5} {'COIN':8} {'H':>3} {'ENTRY':>9} {'TARGET':>9} {'EXP':>6}"]
+    cards = []
     for x in sent:
-        lines.append(f"{x['side']:5} {x['coin'][:8]:8} {x['hz']:>2}h "
-                     f"{fmt_price(x['entry'])[:9]:>9} {fmt_price(x['target'])[:9]:>9} {x['fc']:+5.1f}%")
-    table = "\n".join(lines)
-    why = "\n".join(f"{'🟢' if x['fc'] > 0 else '🔴'} <b>{x['side']} {x['coin']}</b> {x['hz']}h until "
-                     f"{pd.to_datetime(x['t_out'], unit='ms'):%m-%d %H:%M} · {x['why']}" for x in sent)
-    return (f"🔔 <b>Social signals</b> · entry prices at {t_in:%m-%d %H:%M} UTC (alerts only, no trading)\n"
-            f"<pre>{table}</pre>\n<b>Why</b>\n{why}\n\n" + "\n\n".join(records.values()))
+        icon = "🟢" if x["fc"] > 0 else "🔴"
+        cards.append(
+            f"{icon} <b>{x['side']} {x['coin']}USDT</b> · {x['hz']}h\n"
+            f"Entry <b>{fmt_price(x['entry'])}</b> → Target <b>{fmt_price(x['target'])}</b> ({x['fc']:+.1f}%)\n"
+            f"Until {pd.to_datetime(x['t_out'], unit='ms'):%m-%d %H:%M} UTC\n"
+            f"Why: {x['why']}")
+    return (f"🔔 <b>Social signals</b> · {t_in:%m-%d %H:%M} UTC\n<i>alerts only, no trading · "
+            f"futures pairs, entry = price at that time</i>\n\n" + "\n\n".join(cards)
+            + "\n\n📋 <b>Past tests</b>\n" + "\n".join(records.values()))
 
 
 def fmt_price(p):
-    return f"{p:,.2f}" if p >= 100 else f"{p:.4f}" if p >= 1 else f"{p:.6g}"
+    return f"{p:,.2f}" if p >= 100 else f"{p:.4f}" if p >= 1 else f"{p:.4g}"
 
 
 def fill_outcomes(cfg):
