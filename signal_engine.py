@@ -49,7 +49,9 @@ DEFAULTS = {
     "ridge_alpha": 5.0,           # higher = more conservative weights
     "max_coins": 80,              # coins priced/considered (most mentioned)
     "exclude": ["USDC", "USDT", "FDUSD", "DAI", "USDE", "RLUSD", "PYUSD", "TUSD", "USD1", "PAXG", "XAUT"],
-    "retrain_hour_utc": 0,
+    "retrain_every_hours": 1,        # new model version this often (before that hour's signals)
+    "notify_weight_change": 0.05,    # Telegram model update only if a weight moves at least this much
+    "notify_record_change": 0.1,     # … or the unseen-days avg result moves at least this much (%)
     "telegram": True,
 }
 FEATURES = [
@@ -314,6 +316,15 @@ def describe_change(old, new_w, new_oos, new_status, hz):
     return lines
 
 
+def meaningful(old, new_w, new_oos, cfg):
+    if old is None:
+        return True
+    if np.max(np.abs(np.array(new_w) - old["w"])) >= cfg["notify_weight_change"]:
+        return True
+    oa, ob = old["oos"].get("avg_net"), new_oos.get("avg_net")
+    return (oa is None) != (ob is None) or (oa is not None and abs(ob - oa) >= cfg["notify_record_change"])
+
+
 def retrain(cfg, notify=True):
     df, _ = build_dataset(cfg)
     con = db()
@@ -336,14 +347,16 @@ def retrain(cfg, notify=True):
                 json.dumps(mu.tolist()), json.dumps(sd.tolist()), float(b0), json.dumps(oos), status))
             change = describe_change(old, w, oos, status, hz)
             con.execute("INSERT INTO changes VALUES (?,?,?)", (version, hz, "\n".join(change)))
+        if notify == "changes" and not meaningful(old, w, oos, cfg):
+            continue           # saved and visible in --changes, just not sent to Telegram
         msgs.append(f"🔄 <b>{hz}h model v{old['version'] if old else 0} → v{version}</b> · trained on {len(d)} "
                     f"coin-hours from {pd.to_datetime(d.t.min(), unit='ms'):%Y-%m-%d %H:%M} to "
                     f"{pd.to_datetime(d.t.max(), unit='ms'):%Y-%m-%d %H:%M} UTC\n" + "\n".join("• " + c for c in change)
                     + f"\n📋 {record_text(oos, live_record(con, hz, cfg['cost_pct']))}")
     con.close()
     text = "\n\n".join(msgs)
-    log.info("retrain: " + text.replace("\n", " | "))
-    if notify:
+    log.info("retrain: " + (text.replace("\n", " | ") or "no meaningful change"))
+    if notify and text:
         telegram(cfg, text)
     return text
 
@@ -576,20 +589,15 @@ def report_signals(hours):
 
 def run(cfg):
     db().close()
-    last_hour = last_day = None
+    last_hour = None
     log.info("signal engine started")
     while True:
         now = datetime.now(timezone.utc)
         try:
-            if last_day != now.date() and now.hour >= cfg["retrain_hour_utc"]:
-                last_day = now.date()
-                con = db()
-                newest = con.execute("SELECT MAX(trained_at) FROM models").fetchone()[0] or 0
-                con.close()
-                if datetime.fromtimestamp(newest, timezone.utc).date() != now.date():   # once per day only
-                    retrain(cfg)
             if last_hour != (now.date(), now.hour) and now.minute >= 5:
                 last_hour = (now.date(), now.hour)
+                if now.hour % max(int(cfg["retrain_every_hours"]), 1) == 0:
+                    retrain(cfg, notify="changes")       # new version from all finished hours
                 fill_outcomes(cfg)
                 n = make_signals(cfg)
                 log.info(f"hourly run: {len(n)} new signal(s)")
