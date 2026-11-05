@@ -12,3 +12,6 @@ CLOSE_ALL_GAPS
 social.db
 social_config.json
 social_collector.log
+signals.db
+signal_config.json
+signal_engine.log

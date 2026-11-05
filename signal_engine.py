@@ -1,0 +1,527 @@
+#!/usr/bin/env python3
+"""Social signal engine: learns from collected posts (social.db) + prices, retrains every day,
+and sends transparent signals (alerts only — it never trades).
+
+Everything is visible and stored in signals.db:
+  * models    every daily version: its weights (how much each input pushes the forecast),
+              what it was trained on, and its score on days it had NOT seen (walk-forward test)
+  * changes   what changed between consecutive versions
+  * signals   every signal with the inputs, each input's contribution, the model version,
+              and later the real outcome
+
+Model: for each coin and hour, inputs (attention, tone, engagement, recent price moves) predict
+the coin's move vs BTC over the next 4h and 24h. A ridge regression (a linear model) is used so
+every forecast is a plain sum of "weight x input" that can be shown in full.
+
+Status of the engine:
+  TEST    signals are sent but marked "not proven"
+  PROVEN  on unseen days it had >= min_events signals, average result after costs > 0,
+          and >= min_good_weeks separate weeks with a positive average (settings below).
+
+Run:      .venv/bin/python signal_engine.py            (runs forever: hourly signals, daily retrain)
+Reports:  .venv/bin/python signal_engine.py --model    (current version, weights, unseen-days test)
+          .venv/bin/python signal_engine.py --changes  (what changed between versions)
+          .venv/bin/python signal_engine.py --signals 48   (signals of the last 48 h + outcomes)
+          .venv/bin/python signal_engine.py --retrain  (retrain now and print the result)
+"""
+import argparse
+import json
+import logging
+import math
+import sqlite3
+import time
+from datetime import datetime, timezone
+
+import numpy as np
+import pandas as pd
+import requests
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s",
+                    handlers=[logging.FileHandler("signal_engine.log"), logging.StreamHandler()])
+log = logging.getLogger("signals")
+
+SOCIAL_DB, DB, CONFIG = "social.db", "signals.db", "signal_config.json"
+H = 3_600_000
+DEFAULTS = {
+    "horizons_hours": [4, 24],
+    "cost_pct": 0.2,              # fees + slippage for one round trip, in %
+    "signal_threshold_pct": 0.5,  # only signal when |forecast| is at least this (after costs)
+    "min_train_days": 5,          # no model before this many days of data
+    "ridge_alpha": 5.0,           # higher = more conservative weights
+    "min_events": 100,            # PROVEN rule 1: unseen-day signals
+    "min_good_weeks": 2,          # PROVEN rule 3: weeks with positive average
+    "max_coins": 80,              # coins priced/considered (most mentioned)
+    "exclude": ["USDC", "USDT", "FDUSD", "DAI", "USDE", "RLUSD", "PYUSD", "TUSD", "USD1", "PAXG", "XAUT"],
+    "retrain_hour_utc": 0,
+    "telegram": True,
+}
+FEATURES = [
+    ("mentions", "mentions this hour (log)"),
+    ("spike", "× above normal mentions (log)"),
+    ("accel", "mentions vs previous hour (log ratio)"),
+    ("authors", "different authors (log)"),
+    ("sources", "different sources"),
+    ("tone", "average tone (-1..+1)"),
+    ("pos_share", "share of very positive posts"),
+    ("neg_share", "share of very negative posts"),
+    ("engagement", "votes + comments (log)"),
+    ("ret_1h", "coin move last 1h vs BTC %"),
+    ("ret_6h", "coin move last 6h vs BTC %"),
+    ("ret_24h", "coin move last 24h vs BTC %"),
+    ("btc_6h", "BTC move last 6h %"),
+]
+FNAMES = [f for f, _ in FEATURES]
+LABEL = dict(FEATURES)
+
+
+def load_cfg():
+    try:
+        cfg = json.load(open(CONFIG))
+    except FileNotFoundError:
+        cfg = {}
+        json.dump(DEFAULTS, open(CONFIG, "w"), indent=2)
+    return {**DEFAULTS, **cfg}
+
+
+def db():
+    con = sqlite3.connect(DB, timeout=30)
+    con.execute("CREATE TABLE IF NOT EXISTS prices (coin TEXT, ts INTEGER, close REAL, PRIMARY KEY (coin, ts))")
+    con.execute("""CREATE TABLE IF NOT EXISTS models (version INTEGER PRIMARY KEY, trained_at INTEGER,
+        horizon INTEGER, data_from INTEGER, data_to INTEGER, n_train INTEGER, weights TEXT, mean TEXT, std TEXT,
+        intercept REAL, oos TEXT, status TEXT)""")
+    con.execute("CREATE TABLE IF NOT EXISTS changes (version INTEGER, horizon INTEGER, text TEXT)")
+    con.execute("""CREATE TABLE IF NOT EXISTS signals (ts INTEGER, coin TEXT, horizon INTEGER, version INTEGER,
+        forecast REAL, direction TEXT, status TEXT, inputs TEXT, contributions TEXT, outcome REAL,
+        PRIMARY KEY (ts, coin, horizon))""")
+    return con
+
+
+# ============================================================ prices (hourly closes, cached)
+
+def fetch_hourly(coin, start_ms, end_ms):
+    sym = coin + "USDT"
+    for src in ("binance", "bybit", "bitget"):
+        rows = []
+        try:
+            if src == "binance":
+                cur = start_ms
+                while cur < end_ms:
+                    j = requests.get("https://fapi.binance.com/fapi/v1/klines", timeout=15, params={
+                        "symbol": sym, "interval": "1h", "startTime": cur, "limit": 1500}).json()
+                    if not isinstance(j, list) or not j:
+                        break
+                    rows += [(int(k[0]), float(k[4])) for k in j]
+                    cur = int(j[-1][0]) + H
+                    if len(j) < 1500:
+                        break
+            elif src == "bybit":
+                cur_end = end_ms
+                while cur_end > start_ms:
+                    j = requests.get("https://api.bybit.com/v5/market/kline", timeout=15, params={
+                        "category": "linear", "symbol": sym, "interval": "60", "start": start_ms,
+                        "end": cur_end, "limit": 1000}).json().get("result", {}).get("list") or []
+                    if not j:
+                        break
+                    rows += [(int(k[0]), float(k[4])) for k in j]
+                    oldest = min(int(k[0]) for k in j)
+                    if len(j) < 1000 or oldest <= start_ms:
+                        break
+                    cur_end = oldest - 1
+            else:
+                cur = start_ms
+                while cur < end_ms:
+                    j = requests.get("https://api.bitget.com/api/v2/mix/market/candles", timeout=15, params={
+                        "symbol": sym, "productType": "USDT-FUTURES", "granularity": "1H", "startTime": cur,
+                        "endTime": min(cur + 199 * H, end_ms), "limit": 200}).json().get("data") or []
+                    rows += [(int(k[0]), float(k[4])) for k in j]
+                    cur += 199 * H
+        except Exception:
+            rows = []
+        if len(rows) > 3:
+            return rows
+    return []
+
+
+def hourly_prices(coins, start_ms, end_ms):
+    """{coin: Series(close at the END of each hour, indexed by hour start ms)} using the cache."""
+    con = db()
+    out = {}
+    for coin in coins:
+        have = pd.read_sql_query("SELECT ts, close FROM prices WHERE coin=? AND ts>=? ORDER BY ts", con,
+                                 params=(coin, start_ms))
+        last = int(have.ts.max()) if not have.empty else start_ms - H
+        if last < end_ms - 2 * H:
+            rows = fetch_hourly(coin, last + H, end_ms)
+            # Store only FINISHED hours: an unfinished candle's close is not final (no look-ahead).
+            done = [(coin, t, c) for t, c in rows if t + H <= end_ms]
+            if done:
+                with con:
+                    con.executemany("INSERT OR REPLACE INTO prices VALUES (?,?,?)", done)
+                have = pd.read_sql_query("SELECT ts, close FROM prices WHERE coin=? AND ts>=? ORDER BY ts", con,
+                                         params=(coin, start_ms))
+        if len(have) > 3:
+            out[coin] = pd.Series(have.close.values, index=have.ts.values)
+        time.sleep(0.05)
+    con.close()
+    return out
+
+
+# ============================================================ features & labels
+
+def build_dataset(cfg, now_ms=None):
+    """One row per coin-hour that had mentions: inputs known at the END of that hour, and the
+    coin's move vs BTC over the next N hours (label; NaN while not known yet)."""
+    now_ms = now_ms or int(time.time() * 1000)
+    s = sqlite3.connect(SOCIAL_DB)
+    m = pd.read_sql_query("""SELECT m.coin, m.created, m.source, p.author, p.sentiment, p.score, p.comments
+                             FROM mentions m JOIN posts p ON p.uid = m.uid WHERE m.created >= ?""", s,
+                          params=((now_ms - 60 * 86_400_000) // 1000,))
+    s.close()
+    m = m[~m.coin.isin(set(cfg["exclude"]))]
+    if m.empty:
+        return pd.DataFrame(), {}
+    m["hour"] = (m.created * 1000 // H) * H
+    coins = m.coin.value_counts().head(cfg["max_coins"]).index.tolist()
+    m = m[m.coin.isin(coins)]
+    start = int(m.hour.min()) - 30 * H
+    prices = hourly_prices(sorted(set(coins) | {"BTC"}), start, now_ms)
+    btc = prices.get("BTC")
+    if btc is None:
+        return pd.DataFrame(), prices
+
+    def move(series, t_end, hours):
+        """% move of a series from (t_end - hours) to t_end, using hour-start-indexed closes."""
+        a, b = series.get(t_end - hours * H - H), series.get(t_end - H)
+        return (b / a - 1) * 100 if a and b else np.nan
+
+    rows = []
+    for coin, g in m.groupby("coin"):
+        px = prices.get(coin)
+        if px is None or coin == "BTC":     # BTC is the benchmark itself (its move vs BTC is always 0)
+            continue
+        per_h = g.groupby("hour").size()
+        first_h = int(g.hour.min())
+        for hour, gh in g.groupby("hour"):
+            t_end = int(hour) + H                       # inputs are known at the end of the hour
+            n = len(gh)
+            prev = per_h[(per_h.index < hour) & (per_h.index >= hour - 72 * H)]
+            span = max(min((hour - first_h) / H, 72), 1)
+            normal = prev.sum() / span
+            prev1 = per_h.get(hour - H, 0)
+            tone = gh.sentiment.dropna()
+            row = {
+                "coin": coin, "t": t_end,
+                "mentions": math.log1p(n),
+                "spike": math.log((n + 0.5) / (normal + 0.5)),
+                "accel": math.log((n + 0.5) / (prev1 + 0.5)),
+                "authors": math.log1p(gh.author.nunique()),
+                "sources": gh.source.nunique(),
+                "tone": tone.mean() if len(tone) else 0.0,
+                "pos_share": (tone > 0.5).mean() if len(tone) else 0.0,
+                "neg_share": (tone < -0.5).mean() if len(tone) else 0.0,
+                "engagement": math.log1p(max(gh.score.clip(lower=0).sum() + gh.comments.sum(), 0)),
+                "btc_6h": move(btc, t_end, 6),
+            }
+            for hh in (1, 6, 24):
+                row[f"ret_{hh}h"] = move(px, t_end, hh) - move(btc, t_end, hh)
+            for hz in cfg["horizons_hours"]:
+                c0, c1 = px.get(t_end - H), px.get(t_end + hz * H - H)
+                b0, b1 = btc.get(t_end - H), btc.get(t_end + hz * H - H)
+                row[f"y{hz}"] = ((c1 / c0 - 1) - (b1 / b0 - 1)) * 100 if c0 and c1 and b0 and b1 else np.nan
+            rows.append(row)
+    df = pd.DataFrame(rows).sort_values("t").reset_index(drop=True)
+    df[FNAMES] = df[FNAMES].fillna(0.0)
+    return df, prices
+
+
+# ============================================================ model (transparent ridge regression)
+
+def fit(X, y, alpha):
+    mu, sd = X.mean(axis=0), X.std(axis=0)
+    sd[sd == 0] = 1.0
+    Z = (X - mu) / sd
+    b0 = y.mean()
+    w = np.linalg.solve(Z.T @ Z + alpha * np.eye(Z.shape[1]), Z.T @ (y - b0))
+    return w, mu, sd, b0
+
+
+def contributions(x, w, mu, sd):
+    return (x - mu) / sd * w
+
+
+def walk_forward(df, hz, cfg):
+    """Each day: train only on rows whose outcome was known BEFORE that day, then forecast that day."""
+    y = f"y{hz}"
+    d = df.dropna(subset=[y]).copy()
+    if d.empty:
+        return []
+    d["day"] = d.t // 86_400_000
+    days = sorted(d.day.unique())
+    res = []
+    for day in days[cfg["min_train_days"]:]:
+        known_by = day * 86_400_000
+        train = d[d.t + hz * H <= known_by]
+        test = d[d.day == day]
+        if len(train) < 50 or test.empty:
+            continue
+        w, mu, sd, b0 = fit(train[FNAMES].values, train[y].values, cfg["ridge_alpha"])
+        pred = b0 + ((test[FNAMES].values - mu) / sd) @ w
+        for p, actual, t in zip(pred, test[y].values, test.t.values):
+            if abs(p) >= cfg["signal_threshold_pct"] + cfg["cost_pct"]:
+                res.append({"t": int(t), "forecast": float(p), "net": float(np.sign(p) * actual - cfg["cost_pct"])})
+    return res
+
+
+def oos_summary(res, cfg):
+    if not res:
+        return {"events": 0, "avg_net": None, "win_rate": None, "good_weeks": 0, "weeks": 0}
+    r = pd.DataFrame(res)
+    r["week"] = pd.to_datetime(r.t, unit="ms").dt.strftime("%G-W%V")
+    wk = r.groupby("week").net.mean()
+    return {"events": len(r), "avg_net": round(float(r.net.mean()), 3), "win_rate": round(float((r.net > 0).mean()), 3),
+            "good_weeks": int((wk > 0).sum()), "weeks": int(len(wk)),
+            "by_week": {k: round(float(v), 3) for k, v in wk.items()}}
+
+
+def is_proven(o, cfg):
+    return (o["events"] >= cfg["min_events"] and (o["avg_net"] or 0) > 0 and o["good_weeks"] >= cfg["min_good_weeks"])
+
+
+def latest_model(con, hz):
+    r = con.execute("SELECT version, weights, mean, std, intercept, oos, status, n_train, data_from, data_to "
+                    "FROM models WHERE horizon=? ORDER BY version DESC LIMIT 1", (hz,)).fetchone()
+    if not r:
+        return None
+    return {"version": r[0], "w": np.array(json.loads(r[1])), "mu": np.array(json.loads(r[2])),
+            "sd": np.array(json.loads(r[3])), "b0": r[4], "oos": json.loads(r[5]), "status": r[6],
+            "n_train": r[7], "from": r[8], "to": r[9]}
+
+
+def describe_change(old, new_w, new_oos, new_status, hz):
+    lines = []
+    if old is None:
+        lines.append("first version")
+    else:
+        moves = sorted(zip(FNAMES, old["w"], new_w), key=lambda x: -abs(x[2] - x[1]))
+        for f, a, b in moves[:5]:
+            if abs(b - a) >= 0.005:
+                lines.append(f"{LABEL[f]}: {a:+.3f} → {b:+.3f}")
+        if old["status"] != new_status:
+            lines.append(f"status {old['status']} → {new_status}")
+        oa, ob = old["oos"].get("avg_net"), new_oos.get("avg_net")
+        lines.append(f"unseen-days test: {old['oos'].get('events', 0)} → {new_oos.get('events', 0)} signals, "
+                     f"avg after costs {oa if oa is not None else '—'}% → {ob if ob is not None else '—'}%")
+    return lines
+
+
+def retrain(cfg, notify=True):
+    df, _ = build_dataset(cfg)
+    con = db()
+    msgs = []
+    for hz in cfg["horizons_hours"]:
+        d = df.dropna(subset=[f"y{hz}"]) if not df.empty else df
+        days = d.t.nunique() and (d.t.max() - d.t.min()) / 86_400_000 if not d.empty else 0
+        if d.empty or days < cfg["min_train_days"] or len(d) < 50:
+            msgs.append(f"{hz}h: not enough data yet ({len(d)} coin-hours with known outcome, "
+                        f"{days:.1f} days; need {cfg['min_train_days']} days and 50 rows)")
+            continue
+        w, mu, sd, b0 = fit(d[FNAMES].values, d[f"y{hz}"].values, cfg["ridge_alpha"])
+        oos = oos_summary(walk_forward(df, hz, cfg), cfg)
+        status = "PROVEN" if is_proven(oos, cfg) else "TEST"
+        old = latest_model(con, hz)
+        version = (con.execute("SELECT MAX(version) FROM models").fetchone()[0] or 0) + 1
+        with con:
+            con.execute("INSERT INTO models VALUES (?,?,?,?,?,?,?,?,?,?,?,?)", (
+                version, int(time.time()), hz, int(d.t.min()), int(d.t.max()), len(d), json.dumps(w.tolist()),
+                json.dumps(mu.tolist()), json.dumps(sd.tolist()), float(b0), json.dumps(oos), status))
+            change = describe_change(old, w, oos, status, hz)
+            con.execute("INSERT INTO changes VALUES (?,?,?)", (version, hz, "\n".join(change)))
+        msgs.append(f"🔄 <b>{hz}h model v{old['version'] if old else 0} → v{version}</b> · trained on {len(d)} "
+                    f"coin-hours · {status_icon(status)}\n" + "\n".join("• " + c for c in change))
+    con.close()
+    text = "\n\n".join(msgs)
+    log.info("retrain: " + text.replace("\n", " | "))
+    if notify:
+        telegram(cfg, text)
+    return text
+
+
+def status_icon(s):
+    return "✅ PROVEN" if s == "PROVEN" else "🧪 TEST (not proven)"
+
+
+# ============================================================ signals
+
+def make_signals(cfg):
+    df, _ = build_dataset(cfg)
+    if df.empty:
+        return []
+    con = db()
+    now_ms = int(time.time() * 1000)
+    finished = df[df.t <= now_ms]                  # only hours that are over
+    if finished.empty:
+        con.close()
+        return []
+    latest_t = int(finished.t.max())
+    if now_ms - latest_t > 2 * H:                  # nothing in the last finished hour
+        con.close()
+        return []
+    now = finished[finished.t == latest_t]
+    sent = []
+    for hz in cfg["horizons_hours"]:
+        mdl = latest_model(con, hz)
+        if not mdl:
+            continue
+        for row in now.itertuples():
+            x = np.array([getattr(row, f) for f in FNAMES], dtype=float)
+            contrib = contributions(x, mdl["w"], mdl["mu"], mdl["sd"])
+            fc = mdl["b0"] + contrib.sum()
+            if abs(fc) < cfg["signal_threshold_pct"] + cfg["cost_pct"]:
+                continue
+            direction = "UP" if fc > 0 else "DOWN"
+            try:
+                with con:
+                    con.execute("INSERT INTO signals VALUES (?,?,?,?,?,?,?,?,?,NULL)", (
+                        int(row.t), row.coin, hz, mdl["version"], float(fc), direction, mdl["status"],
+                        json.dumps(dict(zip(FNAMES, x.round(4).tolist()))),
+                        json.dumps(dict(zip(FNAMES, contrib.round(4).tolist())))))
+            except sqlite3.IntegrityError:
+                continue          # already sent for this coin/hour/horizon
+            top = sorted(zip(FNAMES, x, contrib), key=lambda z: -abs(z[2]))[:4]
+            why = " · ".join(f"{LABEL[f]} {v:.2f} ({c:+.2f}%)" for f, v, c in top)
+            icon = "📈" if fc > 0 else "📉"
+            sent.append(f"{icon} <b>{row.coin}</b> · next {hz}h · expect <b>{fc:+.2f}%</b> vs BTC · model "
+                        f"v{mdl['version']} · {status_icon(mdl['status'])}\nwhy: {why}")
+    con.close()
+    if sent:
+        telegram(cfg, "🔔 <b>Social signals</b> (alerts only, no trading)\n\n" + "\n\n".join(sent))
+    return sent
+
+
+def fill_outcomes(cfg):
+    """Write the real result into past signals once their horizon has passed."""
+    con = db()
+    rows = con.execute("SELECT ts, coin, horizon FROM signals WHERE outcome IS NULL").fetchall()
+    if rows:
+        now_ms = int(time.time() * 1000)
+        coins = sorted({r[1] for r in rows} | {"BTC"})
+        start = min(r[0] for r in rows) - 2 * H
+        px = hourly_prices(coins, start, now_ms)
+        with con:
+            for ts, coin, hz in rows:
+                p, b = px.get(coin), px.get("BTC")
+                if p is None or b is None:
+                    continue
+                c0, c1, b0, b1 = p.get(ts - H), p.get(ts + hz * H - H), b.get(ts - H), b.get(ts + hz * H - H)
+                if c0 and c1 and b0 and b1:
+                    con.execute("UPDATE signals SET outcome=? WHERE ts=? AND coin=? AND horizon=?",
+                                (((c1 / c0 - 1) - (b1 / b0 - 1)) * 100, ts, coin, hz))
+    con.close()
+
+
+def telegram(cfg, text):
+    if not cfg.get("telegram") or not text:
+        return
+    try:
+        c = json.load(open("config.json"))
+        tok, chat = c.get("telegram_bot_token"), c.get("telegram_chat_id")
+        if tok and chat:
+            for i in range(0, len(text), 3900):
+                requests.post(f"https://api.telegram.org/bot{tok}/sendMessage", timeout=10,
+                              data={"chat_id": chat, "text": text[i:i + 3900], "parse_mode": "HTML"})
+    except Exception as e:
+        log.warning(f"telegram: {e}")
+
+
+# ============================================================ reports
+
+def report_model(cfg):
+    con = db()
+    for hz in cfg["horizons_hours"]:
+        m = latest_model(con, hz)
+        print(f"\n===== {hz}h model =====")
+        if not m:
+            print("no model yet (needs more data; run --retrain to check)")
+            continue
+        print(f"version v{m['version']} · {status_icon(m['status'])} · trained on {m['n_train']} coin-hours "
+              f"({pd.to_datetime(m['from'], unit='ms'):%Y-%m-%d} → {pd.to_datetime(m['to'], unit='ms'):%Y-%m-%d})")
+        print("weights (how much 1 typical step of each input moves the forecast, in % vs BTC):")
+        for f, w in sorted(zip(FNAMES, m["w"]), key=lambda z: -abs(z[1])):
+            print(f"  {w:+.3f}  {LABEL[f]}")
+        o = m["oos"]
+        print(f"unseen-days test: {o.get('events', 0)} signals · avg after costs {o.get('avg_net')}% · "
+              f"win rate {o.get('win_rate')} · good weeks {o.get('good_weeks', 0)}/{o.get('weeks', 0)} "
+              f"{o.get('by_week', '')}")
+        print(f"PROVEN needs: ≥ {cfg['min_events']} signals, avg > 0, ≥ {cfg['min_good_weeks']} good weeks")
+    con.close()
+
+
+def report_changes():
+    con = db()
+    for v, hz, text in con.execute("SELECT version, horizon, text FROM changes ORDER BY version DESC LIMIT 30"):
+        print(f"\nv{v} ({hz}h):\n  " + text.replace("\n", "\n  "))
+    con.close()
+
+
+def report_signals(hours):
+    con = db()
+    since = int(time.time() * 1000) - hours * H
+    rows = con.execute("SELECT ts, coin, horizon, version, forecast, status, contributions, outcome FROM signals "
+                       "WHERE ts >= ? ORDER BY ts DESC", (since,)).fetchall()
+    if not rows:
+        print("no signals in this period")
+    for ts, coin, hz, v, fc, st, contrib, out in rows:
+        c = json.loads(contrib)
+        top = sorted(c.items(), key=lambda kv: -abs(kv[1]))[:3]
+        res = "pending" if out is None else f"real {out:+.2f}% → {'✅ right' if np.sign(out) == np.sign(fc) else '❌ wrong'}"
+        print(f"{pd.to_datetime(ts, unit='ms'):%m-%d %H:%M} {coin:10} {hz:2d}h forecast {fc:+.2f}% v{v} {st:6} · "
+              f"{res} · why: " + ", ".join(f"{LABEL[f]} {x:+.2f}" for f, x in top))
+    done = [r for r in rows if r[7] is not None]
+    if done:
+        cfg = load_cfg()
+        net = [np.sign(r[4]) * r[7] - cfg["cost_pct"] for r in done]
+        print(f"\nlive track record: {len(done)} finished · right direction {np.mean([n + cfg['cost_pct'] > 0 for n in net]):.0%}"
+              f" · avg after costs {np.mean(net):+.2f}%")
+    con.close()
+
+
+# ============================================================ loop
+
+def run(cfg):
+    db().close()
+    last_hour = last_day = None
+    log.info("signal engine started")
+    while True:
+        now = datetime.now(timezone.utc)
+        try:
+            if last_day != now.date() and now.hour >= cfg["retrain_hour_utc"]:
+                last_day = now.date()
+                retrain(cfg)
+            if last_hour != (now.date(), now.hour) and now.minute >= 5:
+                last_hour = (now.date(), now.hour)
+                fill_outcomes(cfg)
+                n = make_signals(cfg)
+                log.info(f"hourly run: {len(n)} new signal(s)")
+        except Exception as e:
+            log.exception(f"cycle failed: {e}")
+        time.sleep(30)
+
+
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--model", action="store_true")
+    ap.add_argument("--changes", action="store_true")
+    ap.add_argument("--signals", type=int, metavar="HOURS")
+    ap.add_argument("--retrain", action="store_true")
+    a = ap.parse_args()
+    c = load_cfg()
+    if a.model:
+        report_model(c)
+    elif a.changes:
+        report_changes()
+    elif a.signals:
+        report_signals(a.signals)
+    elif a.retrain:
+        print(retrain(c, notify=False))
+    else:
+        run(c)
