@@ -61,14 +61,14 @@ FOMC NEW TOP BIG HOT CAT DOG SUN GAS ACE ALT ANT ARK BAT FUN KEY JOE COW PEOPLE 
 EDGE GAME HIGH HOOK BOND SIGN MASK LOOK POWER STEP TRUE PUMP MEME WIN BANK CITY GOOD LIFE LOVE MAGIC
 NEXT OPEN PRIME RARE RED SAGA SOLO STORY SUPER TIME TOKEN TREE WAVE ZERO DEEP DOGS HOME HYPE JUST KING
 LAND LIVE LUCK MOON NOW ORDER PEPE PLAY PRO PUSH QUICK RAY ROSE SCR SPEC TAO TRUMP VANRY WAL
-TAKE SOON USELESS HORIZON CORE FORM ARC CYBER APEX BREAKING JUST NEWS ALERT UPDATE WEEK MAJOR SPOT
+TAKE SOON USELESS HORIZON CORE FORM ARC CYBER APEX APP AUCTION PORTAL FOUR BREAKING JUST NEWS ALERT UPDATE WEEK MAJOR SPOT
 FUTURES MARKET PRICE CASH GOLD SILVER OIL DATA FUND BANKS TRADE CHAIN SWAP LAYER BRIDGE AGENT VOTE
 SHELL SKY SAFE SAHARA SONIC STORY TOWNS UNITED VIRTUAL WALLET WORLD YIELD ZONE HOLO HOME LIGHT""".split())
 # Words that must not be matched as coin NAMES (lower case).
 COMMON_NAMES = set("""bitcoin ethereum the one sun people near gas move real safe magic prime story super
 time token tree wave zero home live luck moon play quick rose game edge high hook bond sign mask look
 power step true pump meme open order dogs bank city good life love next rare land king just hype deep
-status common stable form core cyber soon app render graph flow ocean origin frontier harmony waves aurora
+status common stable form core cyber soon app four portal auction render graph flow ocean origin frontier harmony waves aurora
 sonic stacks theta oasis mantle linea scroll starknet zeta blast mode celo kava band dash nano ankr
 storj audio api3 radiant gains spell cream alpha beta gamma delta omega pixel voxel quant trust swap bridge
 avalanche polygon cosmos arbitrum optimism immutable worldcoin bittensor chainlink internet computer
@@ -192,7 +192,7 @@ class Analyzer:
                 w = m.group(1)
                 if w in tick and w not in AMBIGUOUS:
                     found.add(w)
-        for m in re.finditer(r"\b([A-Z][a-z]+[A-Z]?[A-Za-z]*|[a-z]{6,15})\b", text):   # OpenAI, Anthropic…
+        for m in re.finditer(r"\b([A-Z][a-z]+[A-Z]?[A-Za-z]*)\b", text):   # OpenAI, Anthropic, SpaceX…
             w = m.group(1).upper()
             if len(w) >= 6 and w in tick and w not in AMBIGUOUS and w.lower() not in COMMON_NAMES:
                 found.add(w)
