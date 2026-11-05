@@ -67,7 +67,13 @@ SHELL SKY SAFE SAHARA SONIC STORY TOWNS UNITED VIRTUAL WALLET WORLD YIELD ZONE H
 # Words that must not be matched as coin NAMES (lower case).
 COMMON_NAMES = set("""bitcoin ethereum the one sun people near gas move real safe magic prime story super
 time token tree wave zero home live luck moon play quick rose game edge high hook bond sign mask look
-power step true pump meme open order dogs bank city good life love next rare land king just hype deep""".split())
+power step true pump meme open order dogs bank city good life love next rare land king just hype deep
+status common stable form core cyber soon app render graph flow ocean origin frontier harmony waves aurora
+sonic stacks theta oasis mantle linea scroll starknet zeta blast mode celo kava band dash nano ankr
+storj audio api3 radiant gains spell cream alpha beta gamma delta omega pixel voxel quant trust swap bridge
+avalanche polygon cosmos arbitrum optimism immutable worldcoin bittensor chainlink internet computer
+""".split()) - {"avalanche", "polygon", "cosmos", "arbitrum", "optimism", "chainlink", "worldcoin", "bittensor",
+                 "immutable", "starknet"}       # real project names that are safe to match
 
 # Extra tone words for crypto slang (VADER scale -4..+4).
 CRYPTO_LEXICON = {"moon": 2.5, "mooning": 3.0, "pump": 1.5, "pumping": 2.0, "bullish": 2.5, "bull": 1.5,
@@ -155,7 +161,10 @@ class Analyzer:
                     "vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": page}).json()
                 for c in rows:
                     sym, name = c["symbol"].upper(), c["name"].lower()
-                    if sym in tick and len(name) >= 4 and name not in COMMON_NAMES and " " not in name[:3]:
+                    # A name equal to its ticker ("Soon"/SOON, "Common"/COMMON) is matched by the ticker
+                    # rules only; as a plain word it would count every normal sentence.
+                    if sym in tick and len(name) >= 4 and name not in COMMON_NAMES and " " not in name[:3] \
+                            and name.replace(" ", "").upper() != sym:
                         names[name] = sym
                 time.sleep(8)      # free CoinGecko limit
             except Exception as e:
