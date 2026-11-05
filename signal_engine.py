@@ -10,7 +10,8 @@ Everything is visible and stored in signals.db:
               and later the real outcome
 
 Model: for each coin and hour, inputs (attention, tone, engagement, recent price moves) predict
-the coin's move vs BTC over the next 4h and 24h. A ridge regression (a linear model) is used so
+the coin's own price move over the next 4h and 24h -> LONG (expected up) or SHORT (expected down),
+with entry price, target price and deadline. A ridge regression (a linear model) is used so
 every forecast is a plain sum of "weight x input" that can be shown in full.
 
 Every alert and daily update shows the plain record: how the model's forecasts did on days it
@@ -166,7 +167,7 @@ def hourly_prices(coins, start_ms, end_ms):
 
 def build_dataset(cfg, now_ms=None):
     """One row per coin-hour that had mentions: inputs known at the END of that hour, and the
-    coin's move vs BTC over the next N hours (label; NaN while not known yet)."""
+    coin's own price move over the next N hours (label; NaN while not known yet)."""
     now_ms = now_ms or int(time.time() * 1000)
     s = sqlite3.connect(SOCIAL_DB)
     m = pd.read_sql_query("""SELECT m.coin, m.created, m.source, p.author, p.sentiment, p.score, p.comments
@@ -220,10 +221,11 @@ def build_dataset(cfg, now_ms=None):
             }
             for hh in (1, 6, 24):
                 row[f"ret_{hh}h"] = move(px, t_end, hh) - move(btc, t_end, hh)
+            row["p0"] = px.get(t_end - H, np.nan)         # entry price: close of the finished hour
             for hz in cfg["horizons_hours"]:
                 c0, c1 = px.get(t_end - H), px.get(t_end + hz * H - H)
-                b0, b1 = btc.get(t_end - H), btc.get(t_end + hz * H - H)
-                row[f"y{hz}"] = ((c1 / c0 - 1) - (b1 / b0 - 1)) * 100 if c0 and c1 and b0 and b1 else np.nan
+                row[f"p1_{hz}"] = c1 if c1 else np.nan  # exit price hz hours later
+                row[f"y{hz}"] = (c1 / c0 - 1) * 100 if c0 and c1 else np.nan
             rows.append(row)
     df = pd.DataFrame(rows).sort_values("t").reset_index(drop=True)
     df[FNAMES] = df[FNAMES].fillna(0.0)
@@ -262,9 +264,13 @@ def walk_forward(df, hz, cfg):
             continue
         w, mu, sd, b0 = fit(train[FNAMES].values, train[y].values, cfg["ridge_alpha"])
         pred = b0 + ((test[FNAMES].values - mu) / sd) @ w
-        for p, actual, t in zip(pred, test[y].values, test.t.values):
+        for p, r in zip(pred, test.itertuples()):
             if abs(p) >= cfg["signal_threshold_pct"] + cfg["cost_pct"]:
-                res.append({"t": int(t), "forecast": float(p), "net": float(np.sign(p) * actual - cfg["cost_pct"])})
+                actual = getattr(r, y)
+                res.append({"t": int(r.t), "coin": r.coin, "side": "LONG" if p > 0 else "SHORT",
+                            "forecast": round(float(p), 3), "entry": float(r.p0), "exit": float(getattr(r, f"p1_{hz}")),
+                            "actual": round(float(actual), 3),
+                            "net": round(float(np.sign(p) * actual - cfg["cost_pct"]), 3)})
     return res
 
 
@@ -274,9 +280,13 @@ def oos_summary(res, cfg):
     r = pd.DataFrame(res)
     r["week"] = pd.to_datetime(r.t, unit="ms").dt.strftime("%G-W%V")
     wk = r.groupby("week").net.agg(["mean", "size"])
-    return {"events": len(r), "avg_net": round(float(r.net.mean()), 3), "win_rate": round(float((r.net > 0).mean()), 3),
+    return {"events": len(r), "long": int((r.side == "LONG").sum()), "short": int((r.side == "SHORT").sum()),
+            "test_from": int(r.t.min()), "test_to": int(r.t.max()),
+            "dir_right": round(float((np.sign(r.forecast) == np.sign(r.actual)).mean()), 3),
+            "win_rate": round(float((r.net > 0).mean()), 3), "avg_net": round(float(r.net.mean()), 3),
             "good_weeks": int((wk["mean"] > 0).sum()), "weeks": int(len(wk)),
-            "by_week": {k: f"{v['mean']:+.2f}% ({int(v['size'])} signals)" for k, v in wk.iterrows()}}
+            "by_week": {k: f"{v['mean']:+.2f}% ({int(v['size'])} signals)" for k, v in wk.iterrows()},
+            "list": r.drop(columns=["week"]).tail(500).to_dict("records")}
 
 
 def latest_model(con, hz):
@@ -327,7 +337,8 @@ def retrain(cfg, notify=True):
             change = describe_change(old, w, oos, status, hz)
             con.execute("INSERT INTO changes VALUES (?,?,?)", (version, hz, "\n".join(change)))
         msgs.append(f"🔄 <b>{hz}h model v{old['version'] if old else 0} → v{version}</b> · trained on {len(d)} "
-                    f"coin-hours\n" + "\n".join("• " + c for c in change)
+                    f"coin-hours from {pd.to_datetime(d.t.min(), unit='ms'):%Y-%m-%d %H:%M} to "
+                    f"{pd.to_datetime(d.t.max(), unit='ms'):%Y-%m-%d %H:%M} UTC\n" + "\n".join("• " + c for c in change)
                     + f"\n📋 {record_text(oos, live_record(con, hz, cfg['cost_pct']))}")
     con.close()
     text = "\n\n".join(msgs)
@@ -340,12 +351,20 @@ def retrain(cfg, notify=True):
 def record_text(oos, live=None):
     """Plain facts: how this model's forecasts did on days it had not seen, and live so far."""
     if not oos or not oos.get("events"):
-        txt = "unseen-days test: no signals yet"
+        txt = "test on unseen days: no simulated signals yet"
     else:
-        txt = (f"unseen-days test: {oos['events']} signals · right {oos['win_rate'] * 100:.0f}% · "
-               f"avg after costs {oos['avg_net']:+.2f}% · positive weeks {oos['good_weeks']}/{oos['weeks']}")
+        span = ""
+        if oos.get("test_from"):
+            span = (f" {pd.to_datetime(oos['test_from'], unit='ms'):%m-%d}→"
+                    f"{pd.to_datetime(oos['test_to'], unit='ms'):%m-%d}")
+        txt = (f"test on unseen days{span}: {oos['events']} simulated signals"
+               + (f" ({oos.get('long', 0)} long / {oos.get('short', 0)} short)" if "long" in oos else "")
+               + (f" · direction right {oos['dir_right'] * 100:.0f}%" if "dir_right" in oos else "")
+               + f" · profitable after costs {oos['win_rate'] * 100:.0f}% · avg result after costs "
+               f"{oos['avg_net']:+.2f}% · positive weeks {oos['good_weeks']}/{oos['weeks']}")
     if live and live["n"]:
-        txt += f" | live: {live['n']} finished · right {live['right'] * 100:.0f}% · avg after costs {live['avg']:+.2f}%"
+        txt += (f" | live: {live['n']} finished · direction right {live['right'] * 100:.0f}% · profitable "
+                f"{live['profitable'] * 100:.0f}% · avg after costs {live['avg']:+.2f}%")
     return txt
 
 
@@ -355,7 +374,7 @@ def live_record(con, hz, cost):
         return {"n": 0}
     net = [np.sign(f) * o - cost for f, o in rows]
     return {"n": len(rows), "right": float(np.mean([np.sign(f) == np.sign(o) for f, o in rows])),
-            "avg": float(np.mean(net))}
+            "profitable": float(np.mean([x > 0 for x in net])), "avg": float(np.mean(net))}
 
 
 # ============================================================ signals
@@ -386,24 +405,40 @@ def make_signals(cfg):
             fc = mdl["b0"] + contrib.sum()
             if abs(fc) < cfg["signal_threshold_pct"] + cfg["cost_pct"]:
                 continue
-            direction = "UP" if fc > 0 else "DOWN"
+            side = "LONG" if fc > 0 else "SHORT"
+            entry = float(row.p0)
+            if not entry == entry:          # no price for the finished hour
+                continue
+            target = entry * (1 + fc / 100)
+            inputs = dict(zip(FNAMES, x.round(4).tolist()))
+            inputs["_entry"] = entry
             try:
                 with con:
                     con.execute("INSERT INTO signals VALUES (?,?,?,?,?,?,?,?,?,NULL)", (
-                        int(row.t), row.coin, hz, mdl["version"], float(fc), direction, mdl["status"],
-                        json.dumps(dict(zip(FNAMES, x.round(4).tolist()))),
-                        json.dumps(dict(zip(FNAMES, contrib.round(4).tolist())))))
+                        int(row.t), row.coin, hz, mdl["version"], float(fc), side, mdl["status"],
+                        json.dumps(inputs), json.dumps(dict(zip(FNAMES, contrib.round(4).tolist())))))
             except sqlite3.IntegrityError:
                 continue          # already sent for this coin/hour/horizon
             top = sorted(zip(FNAMES, x, contrib), key=lambda z: -abs(z[2]))[:4]
             why = " · ".join(f"{LABEL[f]} {v:.2f} ({c:+.2f}%)" for f, v, c in top)
-            icon = "📈" if fc > 0 else "📉"
-            sent.append(f"{icon} <b>{row.coin}</b> · next {hz}h · expect <b>{fc:+.2f}%</b> vs BTC · model "
-                        f"v{mdl['version']}\nwhy: {why}\n📋 {record_text(mdl['oos'], live_record(con, hz, cfg['cost_pct']))}")
+            icon = "🟢" if fc > 0 else "🔴"
+            t_in = pd.to_datetime(row.t, unit="ms")
+            t_out = pd.to_datetime(row.t + hz * H, unit="ms")
+            sent.append(
+                f"{icon} <b>{side} {row.coin}</b> · {hz}h\n"
+                f"entry {fmt_price(entry)} (price at {t_in:%m-%d %H:%M} UTC) → expected {fc:+.2f}% → "
+                f"<b>{fmt_price(target)}</b> by {t_out:%m-%d %H:%M} UTC\n"
+                f"model v{mdl['version']} (trained {pd.to_datetime(mdl['from'], unit='ms'):%m-%d} → "
+                f"{pd.to_datetime(mdl['to'], unit='ms'):%m-%d}, {mdl['n_train']} coin-hours)\n"
+                f"why: {why}\n📋 {record_text(mdl['oos'], live_record(con, hz, cfg['cost_pct']))}")
     con.close()
     if sent:
         telegram(cfg, "🔔 <b>Social signals</b> (alerts only, no trading)\n\n" + "\n\n".join(sent))
     return sent
+
+
+def fmt_price(p):
+    return f"{p:,.2f}" if p >= 100 else f"{p:.4f}" if p >= 1 else f"{p:.6g}"
 
 
 def fill_outcomes(cfg):
@@ -420,10 +455,10 @@ def fill_outcomes(cfg):
                 p, b = px.get(coin), px.get("BTC")
                 if p is None or b is None:
                     continue
-                c0, c1, b0, b1 = p.get(ts - H), p.get(ts + hz * H - H), b.get(ts - H), b.get(ts + hz * H - H)
-                if c0 and c1 and b0 and b1:
+                c0, c1 = p.get(ts - H), p.get(ts + hz * H - H)
+                if c0 and c1:
                     con.execute("UPDATE signals SET outcome=? WHERE ts=? AND coin=? AND horizon=?",
-                                (((c1 / c0 - 1) - (b1 / b0 - 1)) * 100, ts, coin, hz))
+                                ((c1 / c0 - 1) * 100, ts, coin, hz))
     con.close()
 
 
@@ -453,18 +488,38 @@ def report_model(cfg):
             continue
         print(f"version v{m['version']} · trained on {m['n_train']} coin-hours "
               f"({pd.to_datetime(m['from'], unit='ms'):%Y-%m-%d} → {pd.to_datetime(m['to'], unit='ms'):%Y-%m-%d})")
-        print("weights (how much 1 typical step of each input moves the forecast, in % vs BTC):")
+        print("weights (how much 1 typical step of each input moves the forecast of the price move, in %):")
         for f, w in sorted(zip(FNAMES, m["w"]), key=lambda z: -abs(z[1])):
             print(f"  {w:+.3f}  {LABEL[f]}")
         o = m["oos"]
-        print(f"unseen-days test: {o.get('events', 0)} signals · avg after costs {o.get('avg_net')}% · "
-              f"right {o.get('win_rate')} · positive weeks {o.get('good_weeks', 0)}/{o.get('weeks', 0)}")
+        print(record_text(o))
+        print("  how it is made: for every past day, a model trained ONLY on earlier days forecasts each coin-hour"
+              " of that day; a forecast beyond ±(threshold + costs) is one simulated LONG/SHORT signal, entered at"
+              " that hour's close and closed after the horizon. 'direction right' = price moved the forecast way;"
+              " 'profitable' = it also moved more than the costs. List: --unseen " + str(hz))
         for wk, txt in (o.get("by_week") or {}).items():
             print(f"    {wk}: {txt}")
         lv = live_record(con, hz, cfg["cost_pct"])
         print(f"live signals: {lv['n']} finished" + (f" · right {lv['right'] * 100:.0f}% · avg after costs "
                                                       f"{lv['avg']:+.2f}%" if lv["n"] else ""))
     con.close()
+
+
+def report_unseen(hz):
+    """Every simulated signal of the unseen-days test of the latest model for this horizon."""
+    con = db()
+    m = latest_model(con, hz)
+    con.close()
+    if not m or not m["oos"].get("list"):
+        print("no simulated signals stored for this horizon yet (run --retrain after this update)")
+        return
+    print(record_text(m["oos"]))
+    print(f"\n{'signal time':16} {'side':5} {'coin':10} {'entry':>12} {'forecast':>9} {'exit (+' + str(hz) + 'h)':>12}"
+          f" {'real':>8} {'after costs':>11}  direction")
+    for r in m["oos"]["list"]:
+        print(f"{pd.to_datetime(r['t'], unit='ms'):%Y-%m-%d %H:%M} {r['side']:5} {r['coin']:10} "
+              f"{fmt_price(r['entry']):>12} {r['forecast']:+8.2f}% {fmt_price(r['exit']):>12} {r['actual']:+7.2f}% "
+              f"{r['net']:+10.2f}%  {'right' if np.sign(r['forecast']) == np.sign(r['actual']) else 'wrong'}")
 
 
 def report_changes():
@@ -483,16 +538,26 @@ def report_signals(hours):
         print("no signals in this period")
     for ts, coin, hz, v, fc, st, contrib, out in rows:
         c = json.loads(contrib)
+        entry = (json.loads(con.execute("SELECT inputs FROM signals WHERE ts=? AND coin=? AND horizon=?",
+                                        (ts, coin, hz)).fetchone()[0]) or {}).get("_entry")
         top = sorted(c.items(), key=lambda kv: -abs(kv[1]))[:3]
-        res = "pending" if out is None else f"real {out:+.2f}% → {'✅ right' if np.sign(out) == np.sign(fc) else '❌ wrong'}"
-        print(f"{pd.to_datetime(ts, unit='ms'):%m-%d %H:%M} {coin:10} {hz:2d}h forecast {fc:+.2f}% v{v} · "
-              f"{res} · why: " + ", ".join(f"{LABEL[f]} {x:+.2f}" for f, x in top))
+        side = "LONG " if fc > 0 else "SHORT"
+        target = f" → target {fmt_price(entry * (1 + fc / 100))}" if entry else ""
+        if out is None:
+            res = f"pending until {pd.to_datetime(ts + hz * H, unit='ms'):%m-%d %H:%M}"
+        else:
+            ex = f" exit {fmt_price(entry * (1 + out / 100))}" if entry else ""
+            res = f"real {out:+.2f}%{ex} → {'✅ direction right' if np.sign(out) == np.sign(fc) else '❌ wrong'}"
+        print(f"{pd.to_datetime(ts, unit='ms'):%m-%d %H:%M} {side} {coin:10} {hz:2d}h entry "
+              f"{fmt_price(entry) if entry else '?'}{target} ({fc:+.2f}%) v{v} · {res} · why: "
+              + ", ".join(f"{LABEL[f]} {x:+.2f}" for f, x in top))
     done = [r for r in rows if r[7] is not None]
     if done:
         cfg = load_cfg()
         net = [np.sign(r[4]) * r[7] - cfg["cost_pct"] for r in done]
-        print(f"\nlive track record: {len(done)} finished · right direction {np.mean([n + cfg['cost_pct'] > 0 for n in net]):.0%}"
-              f" · avg after costs {np.mean(net):+.2f}%")
+        print(f"\nlive track record: {len(done)} finished · direction right "
+              f"{np.mean([np.sign(r[4]) == np.sign(r[7]) for r in done]):.0%} · profitable after costs "
+              f"{np.mean([n > 0 for n in net]):.0%} · avg after costs {np.mean(net):+.2f}%")
     con.close()
 
 
@@ -528,6 +593,7 @@ if __name__ == "__main__":
     ap.add_argument("--changes", action="store_true")
     ap.add_argument("--signals", type=int, metavar="HOURS")
     ap.add_argument("--retrain", action="store_true")
+    ap.add_argument("--unseen", type=int, metavar="HORIZON", help="list the simulated test signals (4 or 24)")
     a = ap.parse_args()
     c = load_cfg()
     if a.model:
@@ -536,6 +602,8 @@ if __name__ == "__main__":
         report_changes()
     elif a.signals:
         report_signals(a.signals)
+    elif a.unseen:
+        report_unseen(a.unseen)
     elif a.retrain:
         print(retrain(c, notify=False))
     else:
