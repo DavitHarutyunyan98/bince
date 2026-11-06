@@ -60,6 +60,7 @@ DEFAULTS = {
     "max_signals_per_hour": 3,
     "send_only_if_tests_positive": True,   # send a horizon's signals only if its past tests made money after costs
     "daily_summary_hour_utc": 0,
+    "status_every_hours": 6,         # short "still running" message to Telegram (0 = off)
 }
 FEATURES = [
     ("mentions", "mentions this hour (log)"),
@@ -533,6 +534,31 @@ def signals_message(sent):
     return "🔔 <b>Social signal</b> (alert only, no trading)\n\n" + "\n\n".join(cards)
 
 
+def status_ping(cfg):
+    """Short proof of life: is data arriving, are models retraining, what happened to signals."""
+    try:
+        s = sqlite3.connect(SOCIAL_DB)
+        last_post = s.execute("SELECT MAX(collected) FROM posts").fetchone()[0] or 0
+        posts_6h = s.execute("SELECT COUNT(*) FROM posts WHERE collected >= ?", (time.time() - 6 * 3600,)).fetchone()[0]
+        s.close()
+    except Exception:
+        last_post, posts_6h = 0, 0
+    con = db()
+    models = []
+    for hz in cfg["horizons_hours"]:
+        m = latest_model(con, hz)
+        if m:
+            t = con.execute("SELECT trained_at FROM models WHERE version=?", (m["version"],)).fetchone()[0]
+            models.append(f"{hz}h v{m['version']} (trained {int((time.time() - t) / 60)} min ago)")
+    since = int(time.time() * 1000) - 6 * H
+    d = dict(con.execute("SELECT status, COUNT(*) FROM signals WHERE ts >= ? GROUP BY status", (since,)).fetchall())
+    con.close()
+    telegram(cfg, f"🩺 <b>Signal engine running</b>\n"
+                  f"Posts collected last 6h: {posts_6h} (newest {int((time.time() - last_post) / 60)} min ago)\n"
+                  f"Models: {', '.join(models) or 'none yet'}\n"
+                  f"Signals last 6h: sent {d.get('sent', 0)} · held back {d.get('logged', 0)}")
+
+
 def daily_summary(cfg):
     """Plain-language summary of the last 24 hours."""
     con = db()
@@ -697,6 +723,8 @@ def run(cfg):
                     retrain(cfg, notify=False)           # new version (see --changes); no Telegram spam
                 if now.hour == cfg["daily_summary_hour_utc"]:
                     daily_summary(cfg)
+                elif cfg["status_every_hours"] and now.hour % int(cfg["status_every_hours"]) == 0:
+                    status_ping(cfg)
                 fill_outcomes(cfg)
                 n = make_signals(cfg)
                 log.info(f"hourly run: {len(n)} new signal(s)")
