@@ -27,6 +27,7 @@ import argparse
 import json
 import logging
 import math
+import re
 import sqlite3
 import time
 from datetime import datetime, timezone
@@ -44,7 +45,7 @@ H = 3_600_000
 DEFAULTS = {
     "horizons_hours": [4, 24],
     "cost_pct": 0.2,              # fees + slippage for one round trip, in %
-    "signal_threshold_pct": 0.5,  # only signal when |forecast| is at least this (after costs)
+    "signal_threshold_pct": 0.8,  # only signal when |forecast| >= this + costs (i.e. >= 1.0%)
     "min_train_days": 5,          # no model before this many days of data
     "ridge_alpha": 5.0,           # higher = more conservative weights
     "max_coins": 80,              # coins priced/considered (most mentioned)
@@ -53,6 +54,12 @@ DEFAULTS = {
     "notify_weight_change": 0.05,    # Telegram model update only if a weight moves at least this much
     "notify_record_change": 0.1,     # … or the unseen-days avg result moves at least this much (%)
     "telegram": True,
+    "crypto_only": True,             # no stock / ETF / pre-IPO perpetuals
+    "min_sources": 2,                # a signal needs >= 2 sources …
+    "min_authors": 3,                # … or >= 3 different authors in that hour
+    "max_signals_per_hour": 3,
+    "send_only_if_tests_positive": True,   # send a horizon's signals only if its past tests made money after costs
+    "daily_summary_hour_utc": 0,
 }
 FEATURES = [
     ("mentions", "mentions this hour (log)"),
@@ -394,77 +401,115 @@ def live_record(con, hz, cost):
 
 # ============================================================ signals
 
+_CRYPTO = {"t": 0, "set": set()}
+
+
+def crypto_set():
+    """Coins that are crypto (not stocks/ETFs/pre-IPO): Binance standard perpetuals + CoinGecko top 1000."""
+    if time.time() - _CRYPTO["t"] < 12 * 3600 and _CRYPTO["set"]:
+        return _CRYPTO["set"]
+    out = set()
+    try:
+        for x in requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=20).json()["symbols"]:
+            if x.get("contractType") == "PERPETUAL" and x.get("quoteAsset") == "USDT":
+                out.add(re.sub(r"^(1000000|100000|10000|1000|1M)(?=[A-Z])", "", x["baseAsset"]))
+    except Exception as e:
+        log.warning(f"crypto list Binance: {e}")
+    for page in (1, 2, 3, 4):
+        try:
+            out |= {c["symbol"].upper() for c in requests.get(
+                "https://api.coingecko.com/api/v3/coins/markets", timeout=20,
+                params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": page}).json()}
+            time.sleep(6)
+        except Exception:
+            pass
+    if out:
+        _CRYPTO.update(t=time.time(), set=out)
+    return _CRYPTO["set"]
+
+
 def make_signals(cfg):
+    """Forecast every coin of the last finished hour; keep only clear, non-conflicting crypto signals."""
     df, _ = build_dataset(cfg)
     if df.empty:
         return []
     con = db()
     now_ms = int(time.time() * 1000)
     finished = df[df.t <= now_ms]                  # only hours that are over
-    if finished.empty:
+    if finished.empty or now_ms - int(finished.t.max()) > 2 * H:
         con.close()
         return []
-    latest_t = int(finished.t.max())
-    if now_ms - latest_t > 2 * H:                  # nothing in the last finished hour
-        con.close()
-        return []
-    now = finished[finished.t == latest_t]
-    sent, records = [], {}
-    for hz in cfg["horizons_hours"]:
-        mdl = latest_model(con, hz)
-        if not mdl:
+    now = finished[finished.t == int(finished.t.max())]
+    crypto = crypto_set() if cfg["crypto_only"] else None
+    models = {hz: latest_model(con, hz) for hz in cfg["horizons_hours"]}
+    cands = {}                                     # coin -> list of candidate signals (one per horizon)
+    for row in now.itertuples():
+        if crypto is not None and row.coin not in crypto:
+            continue                               # stock / ETF / pre-IPO
+        if row.sources < cfg["min_sources"] and math.expm1(row.authors) < cfg["min_authors"] - 0.5:
+            continue                               # one post / one author is not a discussion
+        entry = float(row.p0)
+        if not entry == entry:
             continue
-        for row in now.itertuples():
-            x = np.array([getattr(row, f) for f in FNAMES], dtype=float)
+        x = np.array([getattr(row, f) for f in FNAMES], dtype=float)
+        for hz, mdl in models.items():
+            if not mdl:
+                continue
             contrib = contributions(x, mdl["w"], mdl["mu"], mdl["sd"])
             fc = mdl["b0"] + contrib.sum()
-            if abs(fc) < cfg["signal_threshold_pct"] + cfg["cost_pct"]:
-                continue
-            side = "LONG" if fc > 0 else "SHORT"
-            entry = float(row.p0)
-            if not entry == entry:          # no price for the finished hour
-                continue
-            target = entry * (1 + fc / 100)
-            inputs = dict(zip(FNAMES, x.round(4).tolist()))
-            inputs["_entry"] = entry
-            try:
-                with con:
-                    con.execute("INSERT INTO signals VALUES (?,?,?,?,?,?,?,?,?,NULL)", (
-                        int(row.t), row.coin, hz, mdl["version"], float(fc), side, mdl["status"],
-                        json.dumps(inputs), json.dumps(dict(zip(FNAMES, contrib.round(4).tolist())))))
-            except sqlite3.IntegrityError:
-                continue          # already sent for this coin/hour/horizon
-            top = sorted(zip(FNAMES, x, contrib), key=lambda z: -abs(z[2]))[:3]
-            sent.append({"side": side, "coin": row.coin, "hz": hz, "fc": fc, "entry": entry, "target": target,
-                         "t_in": int(row.t), "t_out": int(row.t + hz * H), "version": mdl["version"],
-                         "why": " · ".join(reason(f, v, c) for f, v, c in top)})
-        if any(x["hz"] == hz for x in sent):
-            records[hz] = f"{hz}h model v{mdl['version']}: {short_record(mdl['oos'])}"
+            if abs(fc) >= cfg["signal_threshold_pct"] + cfg["cost_pct"]:
+                cands.setdefault(row.coin, []).append(dict(hz=hz, fc=fc, contrib=contrib, x=x, entry=entry,
+                                                           t=int(row.t), mdl=mdl))
+    picked = []
+    for coin, cs in cands.items():
+        if len({np.sign(c["fc"]) for c in cs}) > 1:
+            continue                               # 4h and 24h disagree: no signal
+        picked.append((coin, max(cs, key=lambda c: abs(c["fc"]))))
+    picked = sorted(picked, key=lambda p: -abs(p[1]["fc"]))[:cfg["max_signals_per_hour"]]
+    sent = []
+    for coin, c in picked:
+        mdl, hz, fc = c["mdl"], c["hz"], c["fc"]
+        tests_ok = (mdl["oos"].get("avg_net") or -1) > 0
+        send = tests_ok or not cfg["send_only_if_tests_positive"]
+        side = "LONG" if fc > 0 else "SHORT"
+        inputs = dict(zip(FNAMES, c["x"].round(4).tolist()))
+        inputs["_entry"] = c["entry"]
+        try:
+            with con:
+                con.execute("INSERT INTO signals VALUES (?,?,?,?,?,?,?,?,?,NULL)", (
+                    c["t"], coin, hz, mdl["version"], float(fc), side, "sent" if send else "logged",
+                    json.dumps(inputs), json.dumps(dict(zip(FNAMES, c["contrib"].round(4).tolist())))))
+        except sqlite3.IntegrityError:
+            continue
+        if send:
+            top = sorted(zip(FNAMES, c["x"], c["contrib"]), key=lambda z: -abs(z[2]))[:2]
+            sent.append({"side": side, "coin": coin, "hz": hz, "fc": fc, "entry": c["entry"],
+                         "target": c["entry"] * (1 + fc / 100), "t_in": c["t"], "t_out": c["t"] + hz * H,
+                         "why": " · ".join(reason(f, v) for f, v, _ in top), "record": short_record(mdl["oos"])})
     con.close()
     if sent:
-        telegram(cfg, signals_message(sent, records))
+        telegram(cfg, signals_message(sent))
+    log.info(f"signals: {len(cands)} candidates, {len(picked)} picked, {len(sent)} sent")
     return sent
 
 
-def reason(f, v, c):
-    """One input in plain words with the direction it pushed the forecast (↑ = towards up, ↓ = down)."""
-    arrow = "↑" if c > 0 else "↓"
-    txt = {
-        "mentions": lambda: f"{math.expm1(v):.0f} mentions",
-        "spike": lambda: f"mentions ×{math.exp(v):.1f} normal",
-        "accel": lambda: f"mentions ×{math.exp(v):.1f} vs last hour",
-        "authors": lambda: f"{math.expm1(v):.0f} authors",
-        "sources": lambda: f"{v:.0f} sources",
-        "tone": lambda: f"tone {v:+.2f}",
+def reason(f, v):
+    """One input in plain words."""
+    return {
+        "mentions": lambda: f"{math.expm1(v):.0f} mentions this hour",
+        "spike": lambda: f"mentions {math.exp(v):.1f}× normal",
+        "accel": lambda: f"mentions {math.exp(v):.1f}× the previous hour",
+        "authors": lambda: f"{math.expm1(v):.0f} different authors",
+        "sources": lambda: f"talked about on {v:.0f} sites",
+        "tone": lambda: "posts mostly positive" if v > 0.2 else "posts mostly negative" if v < -0.2 else "neutral tone",
         "pos_share": lambda: f"{v * 100:.0f}% very positive posts",
         "neg_share": lambda: f"{v * 100:.0f}% very negative posts",
-        "engagement": lambda: f"{math.expm1(v):.0f} votes+comments",
-        "ret_1h": lambda: f"coin {v:+.1f}% vs BTC (1h)",
-        "ret_6h": lambda: f"coin {v:+.1f}% vs BTC (6h)",
-        "ret_24h": lambda: f"coin {v:+.1f}% vs BTC (24h)",
-        "btc_6h": lambda: f"BTC {v:+.1f}% (6h)",
+        "engagement": lambda: f"big discussion ({math.expm1(v):,.0f} votes/comments)",
+        "ret_1h": lambda: f"coin {'up' if v > 0 else 'down'} {abs(v):.1f}% vs BTC in the last hour",
+        "ret_6h": lambda: f"coin {'up' if v > 0 else 'down'} {abs(v):.1f}% vs BTC in 6h",
+        "ret_24h": lambda: f"coin already {'up' if v > 0 else 'down'} {abs(v):.1f}% vs BTC in 24h",
+        "btc_6h": lambda: f"BTC {'up' if v > 0 else 'down'} {abs(v):.1f}% in 6h",
     }[f]()
-    return f"{txt} {arrow}"
 
 
 def short_record(oos):
@@ -474,21 +519,43 @@ def short_record(oos):
     return f"{oos['events']} tests · {right * 100:.0f}% right · avg {oos['avg_net']:+.2f}% after costs"
 
 
-def signals_message(sent, records):
-    """One clear card per signal (strongest first), then one line of track record per model."""
+def signals_message(sent):
     sent = sorted(sent, key=lambda x: -abs(x["fc"]))
-    t_in = pd.to_datetime(sent[0]["t_in"], unit="ms")
     cards = []
     for x in sent:
         icon = "🟢" if x["fc"] > 0 else "🔴"
         cards.append(
-            f"{icon} <b>{x['side']} {x['coin']}USDT</b> · {x['hz']}h\n"
-            f"Entry <b>{fmt_price(x['entry'])}</b> → Target <b>{fmt_price(x['target'])}</b> ({x['fc']:+.1f}%)\n"
-            f"Until {pd.to_datetime(x['t_out'], unit='ms'):%m-%d %H:%M} UTC\n"
-            f"Why: {x['why']}")
-    return (f"🔔 <b>Social signals</b> · {t_in:%m-%d %H:%M} UTC\n<i>alerts only, no trading · "
-            f"futures pairs, entry = price at that time</i>\n\n" + "\n\n".join(cards)
-            + "\n\n📋 <b>Past tests</b>\n" + "\n".join(records.values()))
+            f"{icon} <b>{x['side']} {x['coin']}/USDT</b>\n"
+            f"Now {fmt_price(x['entry'])} → expected <b>{fmt_price(x['target'])}</b> ({x['fc']:+.1f}%) "
+            f"by {pd.to_datetime(x['t_out'], unit='ms'):%m-%d %H:%M} UTC\n"
+            f"Main reasons: {x['why']}\n"
+            f"<i>This model's past tests: {x['record']}</i>")
+    return "🔔 <b>Social signal</b> (alert only, no trading)\n\n" + "\n\n".join(cards)
+
+
+def daily_summary(cfg):
+    """Plain-language summary of the last 24 hours."""
+    con = db()
+    since = int(time.time() * 1000) - 24 * H
+    rows = con.execute("SELECT coin, horizon, forecast, outcome, status FROM signals WHERE ts >= ?", (since,)).fetchall()
+    sent = [r for r in rows if r[4] == "sent"]
+    logged = [r for r in rows if r[4] == "logged"]
+    done = [r for r in sent if r[3] is not None]
+    lines = ["📊 <b>Social signals · last 24 hours</b>",
+             f"Sent: {len(sent)} · held back (model's past tests not profitable): {len(logged)}"]
+    if done:
+        right = sum(np.sign(r[2]) == np.sign(r[3]) for r in done)
+        avg = np.mean([np.sign(r[2]) * r[3] - cfg["cost_pct"] for r in done])
+        lines.append(f"Finished: {len(done)} · right direction {right}/{len(done)} · avg result after costs {avg:+.2f}%")
+        for coin, hz, fc, out, _ in done[:10]:
+            ok = "✅" if np.sign(fc) == np.sign(out) else "❌"
+            lines.append(f"{ok} {'LONG' if fc > 0 else 'SHORT'} {coin} {hz}h: expected {fc:+.1f}%, real {out:+.1f}%")
+    for hz in cfg["horizons_hours"]:
+        m = latest_model(con, hz)
+        if m:
+            lines.append(f"{hz}h model (v{m['version']}) past tests: {short_record(m['oos'])}")
+    con.close()
+    telegram(cfg, "\n".join(lines))
 
 
 def fmt_price(p):
@@ -627,7 +694,9 @@ def run(cfg):
             if last_hour != (now.date(), now.hour) and now.minute >= 5:
                 last_hour = (now.date(), now.hour)
                 if now.hour % max(int(cfg["retrain_every_hours"]), 1) == 0:
-                    retrain(cfg, notify="changes")       # new version from all finished hours
+                    retrain(cfg, notify=False)           # new version (see --changes); no Telegram spam
+                if now.hour == cfg["daily_summary_hour_utc"]:
+                    daily_summary(cfg)
                 fill_outcomes(cfg)
                 n = make_signals(cfg)
                 log.info(f"hourly run: {len(n)} new signal(s)")
