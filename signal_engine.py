@@ -677,6 +677,48 @@ def report_unseen(hz):
               f"{r['net']:+10.2f}%  {'right' if np.sign(r['forecast']) == np.sign(r['actual']) else 'wrong'}")
 
 
+def report_progress(cfg):
+    """Has the model got better over time? Per day: the day's last version and its unseen-days test,
+    and the real outcome of the signals made that day."""
+    con = db()
+    for hz in cfg["horizons_hours"]:
+        rows = con.execute("SELECT version, trained_at, n_train, oos FROM models WHERE horizon=? ORDER BY version",
+                           (hz,)).fetchall()
+        if not rows:
+            print(f"\n{hz}h: no versions yet")
+            continue
+        by_day = {}
+        for v, t, n, o in rows:
+            by_day[datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%d")] = (v, n, json.loads(o or "{}"))
+        live = pd.read_sql_query("SELECT ts, forecast, outcome FROM signals WHERE horizon=? AND outcome IS NOT NULL",
+                                 con, params=(hz,))
+        if not live.empty:
+            live["day"] = pd.to_datetime(live.ts, unit="ms").dt.strftime("%Y-%m-%d")
+            live["right"] = np.sign(live.forecast) == np.sign(live.outcome)
+            live["net"] = np.sign(live.forecast) * live.outcome - cfg["cost_pct"]
+        print(f"\n===== {hz}h model: progress by day =====")
+        print(f"{'day':10} {'version':>7} {'trained on':>11} | {'unseen-days test':^34} | {'real signals made that day':^30}")
+        print(f"{'':10} {'':>7} {'coin-hours':>11} | {'tests':>6} {'right':>6} {'avg after costs':>16} | "
+              f"{'done':>5} {'right':>6} {'avg after costs':>16}")
+        for day, (v, n, o) in by_day.items():
+            right = o.get("dir_right", o.get("win_rate"))
+            test = (f"{o.get('events', 0):6d} {right * 100:5.0f}% {o.get('avg_net', 0):+15.2f}%"
+                    if o.get("events") else f"{'—':>6} {'—':>6} {'—':>16}")
+            if not live.empty and day in set(live.day):
+                d = live[live.day == day]
+                real = f"{len(d):5d} {d.right.mean() * 100:5.0f}% {d.net.mean():+15.2f}%"
+            else:
+                real = f"{'—':>5} {'—':>6} {'—':>16}"
+            print(f"{day:10} {'v' + str(v):>7} {n:11d} | {test} | {real}")
+        if not live.empty:
+            print(f"{'ALL':10} {'':>7} {'':>11} | {'':34} | {len(live):5d} {live.right.mean() * 100:5.0f}% "
+                  f"{live.net.mean():+15.2f}%")
+    print("\nHow to read: 'unseen-days test' = how that day's model did on past days it had not seen "
+          "(bigger sample, recomputed every version). 'real signals' = what actually happened after the "
+          "signals made on that day (only finished ones). Rising 'right' and 'avg after costs' = improving.")
+    con.close()
+
+
 def report_changes():
     con = db()
     for v, hz, text in con.execute("SELECT version, horizon, text FROM changes ORDER BY version DESC LIMIT 30"):
@@ -749,6 +791,7 @@ if __name__ == "__main__":
     ap.add_argument("--changes", action="store_true")
     ap.add_argument("--signals", type=int, metavar="HOURS")
     ap.add_argument("--retrain", action="store_true")
+    ap.add_argument("--progress", action="store_true", help="has the model improved over time?")
     ap.add_argument("--unseen", type=int, metavar="HORIZON", help="list the simulated test signals (4 or 24)")
     a = ap.parse_args()
     c = load_cfg()
@@ -758,6 +801,8 @@ if __name__ == "__main__":
         report_changes()
     elif a.signals:
         report_signals(a.signals)
+    elif a.progress:
+        report_progress(c)
     elif a.unseen:
         report_unseen(a.unseen)
     elif a.retrain:
