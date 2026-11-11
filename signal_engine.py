@@ -55,7 +55,8 @@ DEFAULTS = {
     "notify_weight_change": 0.05,    # Telegram model update only if a weight moves at least this much
     "notify_record_change": 0.1,     # … or the unseen-days avg result moves at least this much (%)
     "telegram": True,
-    "crypto_only": True,             # no stock / ETF / pre-IPO perpetuals
+    "crypto_only": False,            # True = crypto signals only; False = crypto, stocks/ETFs and pre-IPO (labelled)
+    "pre_ipo": ["OPENAI", "ANTHROPIC", "SPACEX", "SPCX", "XAI", "STRIPE", "DATABRICKS"],
     "min_sources": 2,                # a signal needs >= 2 sources …
     "min_authors": 3,                # … or >= 3 different authors in that hour
     "max_signals_per_hour": 3,
@@ -426,6 +427,13 @@ def crypto_set():
     return _CRYPTO["set"]
 
 
+def asset_type(coin, cfg):
+    """CRYPTO (Binance COIN-type perpetual), PRE-IPO (configured list) or STOCK (stocks, ETFs, other TradFi)."""
+    if coin in set(cfg.get("pre_ipo") or []):
+        return "PRE-IPO"
+    return "CRYPTO" if coin in crypto_set() else "STOCK"
+
+
 def make_signals(cfg):
     """Forecast every coin of the last finished hour; keep only clear, non-conflicting crypto signals."""
     df, _ = build_dataset(cfg)
@@ -481,7 +489,7 @@ def make_signals(cfg):
             continue
         if send:
             top = sorted(zip(FNAMES, c["x"], c["contrib"]), key=lambda z: -abs(z[2]))[:2]
-            sent.append({"side": side, "coin": coin, "hz": hz, "fc": fc, "entry": c["entry"],
+            sent.append({"side": side, "coin": coin, "kind": asset_type(coin, cfg), "hz": hz, "fc": fc, "entry": c["entry"],
                          "target": c["entry"] * (1 + fc / 100), "t_in": c["t"], "t_out": c["t"] + hz * H,
                          "why": " · ".join(reason(f, v) for f, v, _ in top), "record": short_record(mdl["oos"])})
     con.close()
@@ -517,13 +525,16 @@ def short_record(oos):
     return f"{oos['events']} tests · {right * 100:.0f}% right · avg {oos['avg_net']:+.2f}% after costs"
 
 
+KIND_ICON = {"CRYPTO": "🪙", "STOCK": "📈", "PRE-IPO": "🏢"}
+
+
 def signals_message(sent):
     sent = sorted(sent, key=lambda x: -abs(x["fc"]))
     cards = []
     for x in sent:
         icon = "🟢" if x["fc"] > 0 else "🔴"
         cards.append(
-            f"{icon} <b>{x['side']} {x['coin']}/USDT</b>\n"
+            f"{icon} <b>{x['side']} {x['coin']}/USDT</b> · {KIND_ICON.get(x.get('kind'), '')} {x.get('kind', '')}\n"
             f"Now {fmt_price(x['entry'])} → expected <b>{fmt_price(x['target'])}</b> ({x['fc']:+.1f}%) "
             f"by {pd.to_datetime(x['t_out'], unit='ms'):%m-%d %H:%M} UTC\n"
             f"Main reasons: {x['why']}\n"
@@ -692,7 +703,7 @@ def report_signals(hours):
         else:
             ex = f" exit {fmt_price(entry * (1 + out / 100))}" if entry else ""
             res = f"real {out:+.2f}%{ex} → {'✅ direction right' if np.sign(out) == np.sign(fc) else '❌ wrong'}"
-        print(f"{pd.to_datetime(ts, unit='ms'):%m-%d %H:%M} {side} {coin:10} {hz:2d}h entry "
+        print(f"{pd.to_datetime(ts, unit='ms'):%m-%d %H:%M} {side} {coin:10} {asset_type(coin, load_cfg()):7} {hz:2d}h entry "
               f"{fmt_price(entry) if entry else '?'}{target} ({fc:+.2f}%) v{v} · {res} · why: "
               + ", ".join(f"{LABEL[f]} {x:+.2f}" for f, x in top))
     done = [r for r in rows if r[7] is not None]
