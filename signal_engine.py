@@ -44,6 +44,7 @@ SOCIAL_DB, DB, CONFIG = "social.db", "signals.db", "signal_config.json"
 H = 3_600_000
 DEFAULTS = {
     "horizons_hours": [4, 24],
+    "send_horizons": [24],           # only these horizons' signals go to Telegram (4h keeps learning silently)
     "cost_pct": 0.2,              # fees + slippage for one round trip, in %
     "signal_threshold_pct": 0.8,  # only signal when |forecast| >= this + costs (i.e. >= 1.0%)
     "min_train_days": 5,          # no model before this many days of data
@@ -406,24 +407,20 @@ _CRYPTO = {"t": 0, "set": set()}
 
 
 def crypto_set():
-    """Coins that are crypto (not stocks/ETFs/pre-IPO): Binance standard perpetuals + CoinGecko top 1000."""
+    """Real crypto only: Binance USDT perpetuals whose underlying type is COIN
+    (Binance marks stock / ETF / commodity / pre-IPO perpetuals with other types)."""
     if time.time() - _CRYPTO["t"] < 12 * 3600 and _CRYPTO["set"]:
         return _CRYPTO["set"]
     out = set()
     try:
         for x in requests.get("https://fapi.binance.com/fapi/v1/exchangeInfo", timeout=20).json()["symbols"]:
-            if x.get("contractType") == "PERPETUAL" and x.get("quoteAsset") == "USDT":
+            if (x.get("contractType") == "PERPETUAL" and x.get("quoteAsset") == "USDT"
+                    and x.get("underlyingType", "COIN") == "COIN"
+                    and not any("tradfi" in str(t).lower() or "pre" in str(t).lower()
+                                for t in x.get("underlyingSubType") or [])):
                 out.add(re.sub(r"^(1000000|100000|10000|1000|1M)(?=[A-Z])", "", x["baseAsset"]))
     except Exception as e:
         log.warning(f"crypto list Binance: {e}")
-    for page in (1, 2, 3, 4):
-        try:
-            out |= {c["symbol"].upper() for c in requests.get(
-                "https://api.coingecko.com/api/v3/coins/markets", timeout=20,
-                params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 250, "page": page}).json()}
-            time.sleep(6)
-        except Exception:
-            pass
     if out:
         _CRYPTO.update(t=time.time(), set=out)
     return _CRYPTO["set"]
@@ -454,7 +451,7 @@ def make_signals(cfg):
             continue
         x = np.array([getattr(row, f) for f in FNAMES], dtype=float)
         for hz, mdl in models.items():
-            if not mdl:
+            if not mdl or hz not in cfg["send_horizons"]:
                 continue
             contrib = contributions(x, mdl["w"], mdl["mu"], mdl["sd"])
             fc = mdl["b0"] + contrib.sum()
